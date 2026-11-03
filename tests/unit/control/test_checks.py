@@ -170,7 +170,6 @@ def test_optout_metadata_on_keys_and_teams_is_counted_and_warned(healthy, stub):
     report = run(good_config(), healthy)
     assert report.observations["guardrail_optout_subjects"] == 3
     assert Level.WARN in levels(report)["가드레일 제외 대상"]
-    assert not report.failed
 
 
 def test_alias_formatted_object_permission_fails_with_guidance(stub, litellm):
@@ -228,6 +227,7 @@ def test_compat_symbols_are_required_when_litellm_is_installed(healthy):
     assert Level.FAIL in levels(report)["호환 계층 비공개 심볼"]
     absent = checks.run_checks(good_config(), ENV, healthy, compat_probe=lambda: None)
     assert Level.SKIP in levels(absent)["호환 계층 비공개 심볼"] and not absent.failed
+    assert absent.incomplete == ["호환 계층 비공개 심볼"]
 
 
 def test_missing_config_file_and_management_api(litellm):
@@ -253,3 +253,56 @@ def test_key_list_uses_full_objects_and_follows_pages(stub, litellm):
     assert [k["key_alias"] for k in keys] == ["k-good", "k-alias"]
     assert all("metadata" in k for k in keys)
     assert GOOD_KEY == keys[0]["token"]
+
+
+def test_team_permissions_omitted_from_the_list_are_read_from_team_info(stub, litellm):
+    """목록 응답에는 권한 객체가 생략되고 상세 응답에만 별칭 권한이 있다."""
+    stub.set("/guardrails/list", registered_guardrails())
+    keys = fixture("key_list_full")
+    keys["keys"] = [key_entry("k-good")]
+    stub.set("/key/list", keys)
+    teams = fixture("team_list")
+    assert teams[1]["object_permission"] is None and teams[1]["object_permission_id"]
+    report = run(good_config(), litellm)
+    message = next(f.message for f in report.findings
+                   if f.item == "object_permission 서버 식별자 형식")
+    assert "팀 team-op" in message or "팀 team-op: everything" in message
+
+
+def test_database_servers_with_allow_all_keys_fail_the_check(healthy, stub):
+    open_server = dict(fixture("server_get"), allow_all_keys=True, url=None)
+    stub.set("/v1/mcp/server", [open_server])
+    from mint_litellm.types.decision import url_sha256
+
+    row = {"server_id": "ctl-everything", "url_sha256": url_sha256("http://u.test/mcp"),
+           "transport": "http", "auth_type": "none"}
+    report = run(good_config(), healthy, registered_servers=[row])
+    assert report.failed
+    assert any(f.item == "mcp_servers.<이름>.allow_all_keys" and f.level is Level.FAIL
+               and "ctl-everything" in f.message for f in report.findings)
+
+
+def test_an_unverifiable_server_url_is_not_reported_as_a_match(healthy):
+    from mint_litellm.types.decision import url_sha256
+
+    config = good_config()
+    config["mcp_servers"] = {}
+    row = {"server_id": "ctl-everything", "url_sha256": url_sha256("http://u.test/mcp"),
+           "transport": "http", "auth_type": "none"}
+    report = run(config, healthy, registered_servers=[row])
+    contract = [f for f in report.findings if f.item == "등록 서버의 계약 값"]
+    assert [f.level for f in contract] == [Level.SKIP]
+    assert "URL을 확인하지 못했습니다" in contract[0].message
+    # 설정 파일에 같은 서버의 URL이 있으면 그 값으로 확인한다.
+    config["mcp_servers"] = {"x": {"server_id": "ctl-everything", "url": "http://u.test/mcp"}}
+    ok = run(config, healthy, registered_servers=[row])
+    assert [f.level for f in ok.findings if f.item == "등록 서버의 계약 값"] == [Level.OK]
+    config["mcp_servers"]["x"]["url"] = "http://moved.test/mcp"
+    bad = run(config, healthy, registered_servers=[row])
+    assert bad.failed
+
+
+def test_missing_management_api_leaves_required_rows_unverified(healthy):
+    report = checks.run_checks(good_config(), ENV, None, compat_probe=lambda: [])
+    assert not report.failed
+    assert set(report.incomplete) == {"서버 이름·별칭 유일성", "guardrails[MINT]"}

@@ -25,8 +25,13 @@ def ensure(conn: psycopg.Connection, instance_id: str) -> int | None:
     return None if row is None else row["settings_version"]
 
 
-def load(conn: psycopg.Connection, instance_id: str) -> dict:
-    row = fetchone(conn, "SELECT * FROM mint.settings WHERE instance_id = %s", (instance_id,))
+def load(conn: psycopg.Connection, instance_id: str, *, lock: bool = False) -> dict:
+    """설정 행. ``lock``이면 같은 트랜잭션이 끝날 때까지 다른 변경을 기다리게 한다."""
+    row = fetchone(
+        conn,
+        "SELECT * FROM mint.settings WHERE instance_id = %s" + (" FOR UPDATE" if lock else ""),
+        (instance_id,),
+    )
     if row is None:
         raise ControlError("설정이 없습니다. init을 먼저 실행하십시오.")
     return row
@@ -64,7 +69,7 @@ def set_mode(ctx: Context, mode: Mode, ceiling: Mode) -> None:
 def set_observable(
     ctx: Context, reasons: list[str] | None, policy_ids: list[str] | None
 ) -> None:
-    current = load(ctx.conn, ctx.instance_id)
+    current = load(ctx.conn, ctx.instance_id, lock=True)
     if reasons is None and policy_ids is None:
         raise ControlError("--reasons 또는 --policy-ids 중 하나는 지정해야 합니다.")
     allowed = {r.value for r in OBSERVATION_CANDIDATES}

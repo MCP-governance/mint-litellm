@@ -45,6 +45,7 @@ def collect(
         }
         for a in approvals.expiring_approvals(ctx, EXPIRY_WARNING)
     ]
+    alerts.extend(_mismatch_alerts(ctx))
     observations: dict[str, Any] = {}
     if litellm is not None:
         report = checks.run_checks(config, env, litellm, replicas=cfg.replicas,
@@ -74,6 +75,30 @@ def collect(
         "alerts": alerts,
         "observations": {name: observations.get(name, "확인 불가") for name in OBSERVATION_ITEMS},
     }
+
+
+def _mismatch_alerts(ctx: Context) -> list[dict[str, Any]]:
+    """플러그인이 관측한 서버 계약 불일치. 그 뒤 서버를 다시 등록하면 해소된 것으로 본다."""
+    rows = fetchall(
+        ctx.conn,
+        "SELECT DISTINCT ON (e.payload->>'server_id') e.payload->>'server_id' AS server_id,"
+        " e.payload->>'field' AS field, e.inserted_at FROM mint.events e"
+        " WHERE e.instance_id = %s AND e.kind = 'server_identity_mismatch_observed'"
+        " AND e.inserted_at > COALESCE((SELECT max(r.inserted_at) FROM mint.events r"
+        " WHERE r.instance_id = e.instance_id AND r.kind = 'server_registered'"
+        " AND r.payload->>'server_id' = e.payload->>'server_id'), '-infinity')"
+        " ORDER BY e.payload->>'server_id', e.inserted_at DESC",
+        (ctx.instance_id,),
+    )
+    return [
+        {
+            "kind": "server_identity_mismatch_observed",
+            "server_id": r["server_id"],
+            "field": r["field"],
+            "observed_at": r["inserted_at"].isoformat(),
+        }
+        for r in rows
+    ]
 
 
 def render(info: dict[str, Any]) -> str:

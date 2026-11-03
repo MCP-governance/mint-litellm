@@ -191,6 +191,7 @@ def test_full_activation_path_through_the_cli(mint):
     appr = mint.token(mint.run("operator", "add", "ap", "--role", "approver", "--user-id",
                                "human-1", token=boss)[1])
     assert mint.run("org", "add", "acme", "--name", "ACME", token=boss)[0] == 0
+    assert mint.run("org", "bind", "--org", "acme", "--user", "human-1", token=boss)[0] == 0
     code, _, err = mint.run("server", "register", "ctl-everything", token=boss)
     assert code == 1 and "--url" in err
     assert mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp",
@@ -273,6 +274,7 @@ def test_json_output_names_the_created_object_version_and_event_keys(mint):
     boss = result["token"]
     run = lambda *a: json.loads(mint.run(*a, "--json", token=boss)[1])  # noqa: E731
     org = run("org", "add", "acme", "--name", "ACME")
+    mint.run("org", "bind", "--org", "acme", "--user", "human-1", token=boss)
     assert (org["id"], org["state_version"], org["events"][0]["kind"]) == ("acme", 1, "org_created")
     mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp", token=boss)
     relation = run("relation", "add", "--org", "acme", "--server", "ctl-everything",
@@ -335,3 +337,91 @@ def test_database_errors_are_reported_without_a_traceback(mint):
     boss = bootstrap(mint)
     code, _, err = mint.run("denial", "lift", "not-a-uuid", token=boss)
     assert code == 1 and "데이터베이스 오류" in err
+
+
+def test_rerunning_init_keeps_a_cleared_default_org_and_other_changes(mint):
+    boss = bootstrap(mint)
+    run = lambda *a: mint.run(*a, token=boss)  # noqa: E731
+    assert run("settings", "default-org", "--clear")[0] == 0
+    assert run("settings", "observable", "--policy-ids", "R2")[0] == 0
+    assert mint.run("init")[0] == 0
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        row = conn.execute(
+            "SELECT default_org_id, observable_policy_ids FROM mint.settings"
+        ).fetchone()
+    assert row == (None, ["R2"])
+
+
+def test_check_exits_with_three_when_a_required_row_cannot_be_verified(mint):
+    boss = bootstrap(mint)
+    config = mint.tmp / "config.yaml"
+    mint.run("init", "--out", str(config))
+    mint.env.pop("MINT_LITELLM_URL")  # 관리 API 없이 점검한다
+    code, out, err = mint.run("--json", "check", "--config", str(config), token=boss)
+    result = json.loads(out)
+    assert code == 3 and result["ok"] is False and "서버 이름·별칭 유일성" in result["incomplete"]
+    assert "필수 검증을 모두 수행하지 못했습니다" in err
+
+
+def test_approve_flags_store_conditions_and_org_scope_is_refused(mint):
+    boss = bootstrap(mint)
+    appr = mint.token(mint.run("operator", "add", "ap", "--role", "approver", "--user-id",
+                               "human-1", token=boss)[1])
+    mint.run("org", "add", "acme", "--name", "ACME", token=boss)
+    mint.run("org", "bind", "--org", "acme", "--user", "human-1", token=boss)
+    mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp", token=boss)
+    relation = mint.run("relation", "add", "--org", "acme", "--server", "ctl-everything",
+                        "--purpose", "ops", token=boss)[1].strip()
+    base = ["approve", "--relation", relation, "--tools", "echo", "--valid-until", FAR_FUTURE,
+            "--basis", "b", "--requested-by", "x"]
+    code, _, err = mint.run(*base, "--scope", "org", "--scope-id", "acme", token=appr)
+    assert code == 1 and "MINT-UNSUPPORTED" in err and "team" in err
+    code, out, _ = mint.run(
+        *base, "--scope", "key", "--scope-id", GOOD_KEY, "--high-risk-tools", "rm,deploy",
+        "--business-hours-only", "--business-hours", "Asia/Seoul,1-5,09:00,18:00",
+        "--require-consent", "상담", "--json", token=appr)
+    assert code == 0
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        conditions = conn.execute("SELECT conditions FROM mint.approvals").fetchone()[0]
+    assert conditions["high_risk_tools"] == ["deploy", "rm"]
+    assert conditions["business_hours_only"] is True and conditions["require_consent"] == "상담"
+    code, _, err = mint.run(*base, "--scope", "key", "--scope-id", GOOD_KEY,
+                            "--business-hours", "Asia/Seoul,1-5,09:00,18:00", token=appr)
+    assert code == 1 and "함께 써야" in err
+
+
+def test_server_register_reads_the_url_from_the_litellm_config(mint):
+    boss = bootstrap(mint)
+    config = mint.tmp / "litellm.yaml"
+    config.write_text(
+        "mcp_servers:\n  everything:\n    server_id: ctl-everything\n"
+        "    url: http://u.test/mcp\n", encoding="utf-8")
+    code, out, _ = mint.run("--json", "server", "register", "ctl-everything", "--config",
+                            str(config), token=boss)
+    assert code == 0 and json.loads(out)["id"]
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        payload = conn.execute(
+            "SELECT payload FROM mint.events WHERE kind = 'server_registered'"
+        ).fetchone()[0]
+    assert payload["url_source"] == "config_file"
+
+
+def test_status_shows_observed_server_identity_mismatches_until_reregistered(mint):
+    boss = bootstrap(mint)
+    mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp", token=boss)
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        conn.execute(
+            "INSERT INTO mint.events (event_id, instance_id, kind, source_key, payload)"
+            " VALUES (gen_random_uuid(), 'clitest', 'server_identity_mismatch_observed',"
+            " 'selfcheck:run1:1:server_identity_mismatch_observed',"
+            " '{\"server_id\": \"ctl-everything\", \"field\": \"url\"}')"
+        )
+        conn.commit()
+    code, out, _ = mint.run("--json", "status", token=boss)
+    alerts = [a for a in json.loads(out)["alerts"]
+              if a["kind"] == "server_identity_mismatch_observed"]
+    assert [(a["server_id"], a["field"]) for a in alerts] == [("ctl-everything", "url")]
+    mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp", token=boss)
+    code, out, _ = mint.run("--json", "status", token=boss)
+    assert [a for a in json.loads(out)["alerts"]
+            if a["kind"] == "server_identity_mismatch_observed"] == []

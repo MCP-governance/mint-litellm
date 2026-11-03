@@ -3,6 +3,7 @@
 import json
 import re
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mint_litellm.control import operators
 from mint_litellm.control.context import Context, Operator
@@ -14,55 +15,172 @@ from mint_litellm.types.ids import new_uuid7
 
 SCOPE_TYPES = ("key", "user", "team", "org")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
-def check_object_permission(
-    litellm: LiteLLMAdmin, scope_type: str, scope_id: str, server_id: str, relation_team: str | None
-) -> list[str]:
-    """승인 대상의 LiteLLM 권한을 읽어 확인하고 운영자에게 알릴 주의 사항을 돌려준다.
+# ---------------------------------------------------------------------------
+# 승인 조건
+# ---------------------------------------------------------------------------
 
-    ``object_permission.mcp_servers``의 항목은 서버 식별자 형식이어야 한다. 별칭이나 이름은
-    새 서버가 같은 문자열을 재사용할 때 권한이 넘어가므로 거부한다.
+
+def parse_business_hours(text: str) -> dict:
+    """``시간대,요일,시작,끝`` 형식. 요일은 1(월)~7(일)이며 ``1-5`` 또는 ``1/3/5``로 쓴다."""
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 4:
+        raise ControlError(
+            "--business-hours는 시간대,요일,시작,끝 형식입니다(예: Asia/Seoul,1-5,09:00,18:00)."
+        )
+    tz, days_text, start, end = parts
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ControlError(f"알 수 없는 시간대입니다: {tz}") from None
+    days: list[int] = []
+    for chunk in days_text.split("/"):
+        low, _, high = chunk.partition("-")
+        try:
+            days.extend(range(int(low), int(high or low) + 1))
+        except ValueError:
+            raise ControlError(f"요일 형식이 올바르지 않습니다: {days_text}") from None
+    if not days or any(d not in range(1, 8) for d in days):
+        raise ControlError("요일은 1(월)부터 7(일) 사이여야 합니다.")
+    if not _TIME.fullmatch(start) or not _TIME.fullmatch(end) or start >= end:
+        raise ControlError("시작·끝은 HH:MM 형식이며 시작이 끝보다 빨라야 합니다.")
+    return {"tz": tz, "days": sorted(set(days)), "start": start, "end": end}
+
+
+def build_conditions(
+    *,
+    high_risk_tools: list[str] | None,
+    business_hours_only: bool,
+    business_hours: str | None,
+    require_consent: str | None,
+) -> dict:
+    """정책이 읽는 승인 조건. 지정하지 않은 조건은 키를 넣지 않는다."""
+    conditions: dict = {}
+    if high_risk_tools:
+        conditions["high_risk_tools"] = sorted(set(high_risk_tools))
+    if business_hours and not business_hours_only:
+        raise ControlError("--business-hours는 --business-hours-only와 함께 써야 합니다.")
+    if business_hours_only:
+        conditions["business_hours_only"] = True
+        if business_hours:
+            conditions["business_hours"] = parse_business_hours(business_hours)
+    if require_consent is not None:
+        if not 1 <= len(require_consent.strip()) <= 128:
+            raise ControlError("--require-consent의 목적은 1자 이상 128자 이하여야 합니다.")
+        conditions["require_consent"] = require_consent.strip()
+    return conditions
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM 권한 확인과 조직 범위
+# ---------------------------------------------------------------------------
+
+
+def _derive_org(ctx: Context, team_id: str | None, user_id: str | None) -> str | None:
+    """팀 바인딩(팀이 있으면 이것만), 사용자 바인딩, 기본 조직 순으로 조직을 유도한다.
+
+    닫힌 조직은 없는 것과 같다.
     """
-    notes: list[str] = []
-    if scope_type == "org":
-        return notes
-    if scope_type == "key":
-        target = litellm.get_key(scope_id)
-        label = "키"
-        if target is not None and relation_team and target.get("team_id") != relation_team:
-            raise ControlError("키가 이용 관계의 팀에 속하지 않습니다.")
-    elif scope_type == "team":
-        target = litellm.get_team(scope_id)
-        label = "팀"
-        if relation_team and scope_id != relation_team:
-            raise ControlError("승인 범위의 팀이 이용 관계의 팀과 다릅니다.")
+    org_id: str | None
+    subject = ("team", team_id) if team_id else ("user", user_id) if user_id else None
+    row = None
+    if subject:
+        row = fetchone(
+            ctx.conn,
+            "SELECT org_id FROM mint.org_bindings WHERE instance_id = %s AND subject_type = %s"
+            " AND subject_id = %s",
+            (ctx.instance_id, *subject),
+        )
+    if row:
+        org_id = row["org_id"]
     else:
-        target = litellm.get_user(scope_id)
-        label = "사용자"
-        if target is not None and relation_team:
+        default = fetchone(
+            ctx.conn,
+            "SELECT default_org_id FROM mint.settings WHERE instance_id = %s",
+            (ctx.instance_id,),
+        )
+        org_id = default["default_org_id"] if default else None
+    if org_id is None:
+        return None
+    org = fetchone(
+        ctx.conn,
+        "SELECT status FROM mint.orgs WHERE instance_id = %s AND org_id = %s",
+        (ctx.instance_id, org_id),
+    )
+    return org_id if org and org["status"] == "active" else None
+
+
+def _require_scope_in_relation(
+    ctx: Context, relation: dict, scope_type: str, scope_id: str, target: dict
+) -> None:
+    team = relation["team_id"]
+    org = relation["org_id"]
+    if scope_type == "team":
+        if team:
+            if scope_id != team:
+                raise ControlError("승인 범위의 팀이 이용 관계의 팀과 다릅니다.")
+        elif not fetchone(
+            ctx.conn,
+            "SELECT 1 AS x FROM mint.org_bindings WHERE instance_id = %s AND subject_type = 'team'"
+            " AND subject_id = %s AND org_id = %s",
+            (ctx.instance_id, scope_id, org),
+        ):
+            raise ControlError(f"팀 {scope_id}이(가) 조직 {org}에 묶여 있지 않습니다(org bind).")
+    elif scope_type == "key":
+        if team:
+            if target.get("team_id") != team:
+                raise ControlError("키가 이용 관계의 팀에 속하지 않습니다.")
+        elif _derive_org(ctx, target.get("team_id"), target.get("user_id")) != org:
+            raise ControlError(f"키의 조직 유도 결과가 이용 관계의 조직 {org}과 다릅니다.")
+    else:
+        if team:
             teams = target.get("teams") or []
             ids = {t.get("team_id") if isinstance(t, dict) else t for t in teams}
-            if relation_team not in ids:
+            if team not in ids:
                 raise ControlError("사용자가 이용 관계의 팀에 속하지 않습니다.")
+        elif _derive_org(ctx, None, scope_id) != org:
+            raise ControlError(f"사용자의 조직 유도 결과가 이용 관계의 조직 {org}과 다릅니다.")
+
+
+def check_scope_and_permission(
+    ctx: Context, litellm: LiteLLMAdmin, relation: dict, scope_type: str, scope_id: str
+) -> None:
+    """승인 범위가 이용 관계에 속하고, 그 대상에 LiteLLM 서버 권한이 있는지 읽어 확인한다.
+
+    ``object_permission.mcp_servers`` 항목은 서버 식별자 형식이어야 하고, 대상에 이 서버의 권한
+    (직접 부여 또는 서버가 속한 접근 그룹)이 있어야 승인할 수 있다. 별칭이나 이름은 새 서버가
+    같은 문자열을 재사용할 때 권한이 넘어가므로 거부한다.
+    """
+    server_id = relation["server_id"]
+    if scope_type == "key":
+        target, label = litellm.get_key(scope_id), "키"
+    elif scope_type == "team":
+        target, label = litellm.get_team(scope_id), "팀"
+    else:
+        target, label = litellm.get_user(scope_id), "사용자"
     if target is None:
         raise ControlError(f"LiteLLM에서 {label} {scope_id}을(를) 찾을 수 없습니다.")
+    _require_scope_in_relation(ctx, relation, scope_type, scope_id, target)
+    registry = {s["server_id"]: s for s in litellm.list_servers()}
     permission = target.get("object_permission") or {}
     granted = list(permission.get("mcp_servers") or [])
-    registry_ids = {s["server_id"] for s in litellm.list_servers()}
-    bad = [entry for entry in granted if entry not in registry_ids]
+    bad = [entry for entry in granted if entry not in registry]
     if bad:
         raise ControlError(
             f"{label} {scope_id}의 object_permission.mcp_servers에 서버 식별자가 아닌 항목이 "
             f"있습니다: {', '.join(bad)}. 별칭이나 이름이 아니라 server_id로 바꾼 뒤 다시 "
             "시도하십시오."
         )
-    if server_id not in granted and not permission.get("mcp_access_groups"):
-        notes.append(
-            f"주의: {label} {scope_id}에 LiteLLM에서 서버 {server_id}가 아직 부여되어 있지 "
-            "않습니다. 승인은 LiteLLM 권한을 만들지 않습니다."
+    server_groups = set((registry.get(server_id) or {}).get("mcp_access_groups") or [])
+    shared_group = server_groups & set(permission.get("mcp_access_groups") or [])
+    if server_id not in granted and not shared_group:
+        raise ControlError(
+            f"{label} {scope_id}에 LiteLLM에서 서버 {server_id}의 권한이 부여되어 있지 않아 "
+            "승인할 수 없습니다. 승인은 LiteLLM 권한을 만들지 않으므로, 먼저 LiteLLM에서 "
+            f"object_permission.mcp_servers에 {server_id}를 추가하십시오."
         )
-    return notes
 
 
 def approve(
@@ -80,7 +198,14 @@ def approve(
     requested_by: str,
     allowlist_ids: list[str],
     second: Operator | None,
+    conditions: dict | None = None,
 ) -> tuple[str, list[str]]:
+    conditions = conditions or {}
+    if scope_type == "org":
+        raise ControlError(
+            "MINT-UNSUPPORTED: org 범위 승인은 지원하지 않습니다. 같은 효과가 필요하면 "
+            "해당 조직에 묶인 팀을 --scope team으로 승인하십시오."
+        )
     if scope_type not in SCOPE_TYPES:
         raise ControlError(f"scope는 {', '.join(SCOPE_TYPES)} 중 하나여야 합니다.")
     if approval_class not in ("standard", "exception"):
@@ -109,8 +234,6 @@ def approve(
         raise ControlError(
             f"서버 {relation['server_id']}가 {server['status']} 상태라 승인할 수 없습니다."
         )
-    if scope_type == "org" and scope_id != relation["org_id"]:
-        raise ControlError("org 범위의 scope-id는 이용 관계의 조직과 같아야 합니다.")
     first_approval = server["status"] == "awaiting_approval"
     if allowlist_ids and not first_approval:
         raise ControlError("근거 허용 목록 참조는 서버의 첫 승인에서만 지정할 수 있습니다.")
@@ -118,16 +241,14 @@ def approve(
         found = fetchone(
             ctx.conn,
             "SELECT 1 AS x FROM mint.allowlists WHERE instance_id = %s AND id = %s"
-            " AND status = 'active' AND valid_until > now()"
+            " AND status = 'active' AND valid_from <= now() AND valid_until > now()"
             " AND (org_id IS NULL OR org_id = %s)",
             (ctx.instance_id, ref, relation["org_id"]),
         )
         if not found:
             raise ControlError(f"유효한 허용 목록 항목이 아닙니다: {ref}")
     second_info = operators.require_distinct_person(ctx.operator, requested_by, second, "승인")
-    notes = check_object_permission(
-        litellm, scope_type, scope_id, relation["server_id"], relation["team_id"]
-    )
+    check_scope_and_permission(ctx, litellm, relation, scope_type, scope_id)
     approval_id = new_uuid7()
     basis = {"text": basis_text, "allowlist_ids": allowlist_ids}
     if second_info:
@@ -135,12 +256,13 @@ def approve(
     row = fetchone(
         ctx.conn,
         "INSERT INTO mint.approvals (id, instance_id, org_id, relation_id, class, server_id, tools,"
-        " scope_type, scope_id, valid_from, valid_until, basis, granted_by, requested_by, status)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, 'active')"
-        " RETURNING state_version",
+        " scope_type, scope_id, valid_from, valid_until, conditions, basis, granted_by,"
+        " requested_by, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,"
+        " %s::jsonb, %s, %s, 'active') RETURNING state_version",
         (approval_id, ctx.instance_id, relation["org_id"], relation_id, approval_class,
          relation["server_id"], tools, scope_type, scope_id, valid_from, valid_until,
-         json.dumps(basis, ensure_ascii=False), ctx.operator.name, requested_by),
+         json.dumps(conditions), json.dumps(basis, ensure_ascii=False), ctx.operator.name,
+         requested_by),
     )
     ctx.emit(
         EventKind.APPROVAL_GRANTED,
@@ -160,6 +282,7 @@ def approve(
             "requested_by": requested_by,
             "granted_by": ctx.operator.name,
             "second_approver": None if second_info is None else second_info["name"],
+            "conditions": conditions,
             "basis": basis,
         },
     )
@@ -177,7 +300,7 @@ def approve(
             {"server_id": relation["server_id"], "first_approval_id": str(approval_id),
              "basis_allowlist_ids": allowlist_ids},
         )
-    return str(approval_id), notes
+    return str(approval_id), []
 
 
 def revoke(ctx: Context, approval_id: str, reason: str, deny: bool) -> None:
@@ -329,15 +452,24 @@ def call_request(
     return str(call_id)
 
 
-def _call_update(ctx: Context, call_id: str, target: str, sources: tuple[str, ...], kind: EventKind,
-                 extra_set: str = "") -> dict:
+def _call_update(
+    ctx: Context,
+    call_id: str,
+    target: str,
+    sources: tuple[str, ...],
+    kind: EventKind,
+    *,
+    approver: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    set_approver = ", approved_by = %s" if approver else ""
+    params = (target, *([approver] if approver else []), ctx.instance_id, call_id, list(sources))
     row = fetchone(
         ctx.conn,
-        f"UPDATE mint.call_approvals SET status = %s{extra_set} WHERE instance_id = %s AND id = %s"
-        " AND status = ANY(%s) AND expires_at > now()"
+        f"UPDATE mint.call_approvals SET status = %s{set_approver} WHERE instance_id = %s"
+        " AND id = %s AND status = ANY(%s) AND expires_at > now()"
         " RETURNING state_version, principal_type, principal_id, server_id, tool",
-        (target, *( [ctx.operator.name] if extra_set else [] ), ctx.instance_id, call_id,
-         list(sources)),
+        params,
     )
     if row is None:
         raise ControlError(
@@ -348,7 +480,8 @@ def _call_update(ctx: Context, call_id: str, target: str, sources: tuple[str, ..
         call_id,
         row["state_version"],
         {"call_approval_id": call_id, "server_id": row["server_id"], "tool": row["tool"],
-         "principal_type": row["principal_type"], "principal_id": row["principal_id"]},
+         "principal_type": row["principal_type"], "principal_id": row["principal_id"],
+         **(extra or {})},
     )
     return row
 
@@ -364,9 +497,15 @@ def call_approve(ctx: Context, call_id: str, second: Operator | None) -> None:
         raise ControlError(f"호출별 승인 {call_id}이(가) 없습니다.")
     if current["principal_type"] == "user" and current["principal_id"] == ctx.operator.user_id:
         raise ControlError("호출 주체와 같은 사용자의 운영자는 호출별 승인을 승인할 수 없습니다.")
-    operators.require_distinct_person(ctx.operator, current["requested_by"], second, "호출별 승인")
+    second_info = operators.require_distinct_person(
+        ctx.operator, current["requested_by"], second, "호출별 승인"
+    )
+    extra = {"approved_by": ctx.operator.name, "second_approver": None}
+    if second_info:
+        extra["second_approver"] = second_info["name"]
+        extra["second_approver_user_id"] = second_info["user_id"]
     _call_update(ctx, call_id, "approved", ("pending",), EventKind.CALL_APPROVAL_APPROVED,
-                 ", approved_by = %s")
+                 approver=ctx.operator.name, extra=extra)
 
 
 def call_reject(ctx: Context, call_id: str) -> None:
@@ -374,6 +513,20 @@ def call_reject(ctx: Context, call_id: str) -> None:
 
 
 def call_cancel(ctx: Context, call_id: str) -> None:
+    """요청자 본인이나 admin만 취소할 수 있다. 검사와 변경은 같은 트랜잭션에서 한다."""
+    current = fetchone(
+        ctx.conn,
+        "SELECT requested_by FROM mint.call_approvals WHERE instance_id = %s AND id = %s"
+        " FOR UPDATE",
+        (ctx.instance_id, call_id),
+    )
+    if current is None:
+        raise ControlError(f"호출별 승인 {call_id}이(가) 없습니다.")
+    is_requester = (
+        ctx.operator.user_id is not None and current["requested_by"] == ctx.operator.user_id
+    )
+    if ctx.operator.role != "admin" and not is_requester:
+        raise ControlError("호출별 승인은 요청자 본인이나 admin만 취소할 수 있습니다.")
     _call_update(ctx, call_id, "cancelled", ("pending", "approved"),
                  EventKind.CALL_APPROVAL_CANCELLED)
 

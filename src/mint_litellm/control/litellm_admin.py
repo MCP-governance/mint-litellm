@@ -54,9 +54,21 @@ class LiteLLMAdmin:
             body = None
         return status, body
 
-    def _ok(self, path: str, params: dict[str, Any] | None = None, *, missing_ok: bool = False):
+    def _ok(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        missing_ok: bool = False,
+        shape: type = dict,
+        key: str | None = None,
+    ):
+        """200 응답의 본문. ``shape``(와 ``key`` 안의 값)이 맞지 않으면 오류로 처리한다."""
         status, body = self._get(path, params)
         if status == 200:
+            inner = (body.get(key) if isinstance(body, dict) else None) if key else body
+            if not isinstance(body, (dict, list)) or not isinstance(inner, shape):
+                raise LiteLLMError(f"LiteLLM {path} 응답 형식이 올바르지 않습니다.")
             return body
         if status == 404 and missing_ok:
             return None
@@ -68,7 +80,7 @@ class LiteLLMAdmin:
         raise LiteLLMError(f"LiteLLM {path} 응답이 올바르지 않습니다(HTTP {status}).")
 
     def list_servers(self) -> list[dict]:
-        return self._ok("/v1/mcp/server")
+        return self._ok("/v1/mcp/server", shape=list)
 
     def get_server(self, server_id: str) -> dict | None:
         quoted = urllib.parse.quote(server_id, safe="")
@@ -76,16 +88,16 @@ class LiteLLMAdmin:
 
     def get_user(self, user_id: str) -> dict | None:
         """``user_info`` 객체. 사용자가 없으면 None."""
-        body = self._ok("/user/info", {"user_id": user_id}, missing_ok=True)
-        return None if body is None else body.get("user_info")
+        body = self._ok("/user/info", {"user_id": user_id}, missing_ok=True, key="user_info")
+        return None if body is None else body["user_info"]
 
     def get_key(self, key_id: str) -> dict | None:
-        body = self._ok("/key/info", {"key": key_id}, missing_ok=True)
-        return None if body is None else body.get("info")
+        body = self._ok("/key/info", {"key": key_id}, missing_ok=True, key="info")
+        return None if body is None else body["info"]
 
     def get_team(self, team_id: str) -> dict | None:
-        body = self._ok("/team/info", {"team_id": team_id}, missing_ok=True)
-        return None if body is None else body.get("team_info")
+        body = self._ok("/team/info", {"team_id": team_id}, missing_ok=True, key="team_info")
+        return None if body is None else body["team_info"]
 
     def list_keys(self) -> list[dict]:
         """메타데이터와 객체 권한을 포함한 전체 객체. ``return_full_object``가 필요하다."""
@@ -93,7 +105,10 @@ class LiteLLMAdmin:
         page = 1
         while True:
             body = self._ok(
-                "/key/list", {"return_full_object": "true", "size": PAGE_SIZE, "page": page}
+                "/key/list",
+                {"return_full_object": "true", "size": PAGE_SIZE, "page": page},
+                key="keys",
+                shape=list,
             )
             keys.extend(k for k in body["keys"] if isinstance(k, dict))
             if page >= body.get("total_pages", 1):
@@ -101,7 +116,7 @@ class LiteLLMAdmin:
             page += 1
 
     def list_teams(self) -> list[dict]:
-        return self._ok("/team/list")
+        return self._ok("/team/list", shape=list)
 
     def list_guardrails(self) -> list[dict]:
-        return self._ok("/guardrails/list")["guardrails"]
+        return self._ok("/guardrails/list", key="guardrails", shape=list)["guardrails"]

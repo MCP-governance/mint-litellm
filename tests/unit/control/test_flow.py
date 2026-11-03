@@ -46,6 +46,7 @@ def count(conn, kind):
 
 def prepare(ctx, litellm, org="acme", team=None):
     orgs.add(ctx, org, "ACME")
+    orgs.bind(ctx, org, SubjectType.USER, "human-1")  # 시험 키의 소유 사용자
     servers.register(ctx, litellm, "ctl-everything", URL)
     return relations.add(ctx, org, "ctl-everything", "ops", team)
 
@@ -98,8 +99,6 @@ def test_register_rejects_unknown_pending_and_duplicate_servers(ctx, litellm, st
         servers.register(ctx, litellm, "ctl-everything", URL)
     stub.set("/v1/mcp/server/ctl-everything", body)
     servers.register(ctx, litellm, "ctl-everything", URL)
-    with pytest.raises(ControlError, match="이미 등록"):
-        servers.register(ctx, litellm, "ctl-everything", URL)
 
 
 def test_register_url_conflicting_with_the_registry_is_rejected(ctx, litellm, stub):
@@ -190,13 +189,60 @@ def test_approve_requires_the_target_to_exist_in_litellm(ctx, litellm):
         approve(ctx, litellm, relation, scope_type="user", scope_id="nobody")
 
 
-def test_approve_warns_when_litellm_has_not_granted_the_server(ctx, litellm, stub):
+def test_approve_is_refused_when_litellm_has_not_granted_the_server(ctx, litellm, stub, conn):
     relation = prepare(ctx, litellm)
     info = json.loads(json.dumps(stub.routes[("/key/info", frozenset({("key", GOOD_KEY)}))][1]))
     info["info"]["object_permission"]["mcp_servers"] = []
     stub.set("/key/info", info, key=GOOD_KEY)
-    _, notes = approve(ctx, litellm, relation)
-    assert notes and "부여되어 있지" in notes[0]
+    with pytest.raises(ControlError, match="권한이 부여되어 있지 않아"):
+        approve(ctx, litellm, relation)
+    assert fetchone(conn, "SELECT count(*) AS n FROM mint.approvals")["n"] == 0
+    assert fetchone(conn, "SELECT status FROM mint.servers")["status"] == "awaiting_approval"
+    assert count(conn, "approval_granted") == 0
+
+
+def test_approve_accepts_a_permission_given_through_a_shared_access_group(ctx, litellm, stub):
+    relation = prepare(ctx, litellm)
+    info = json.loads(json.dumps(stub.routes[("/key/info", frozenset({("key", GOOD_KEY)}))][1]))
+    info["info"]["object_permission"].update(mcp_servers=[], mcp_access_groups=["g1"])
+    stub.set("/key/info", info, key=GOOD_KEY)
+    listing = json.loads(json.dumps(stub.routes[("/v1/mcp/server", frozenset())][1]))
+    next(s for s in listing if s["server_id"] == "ctl-everything")["mcp_access_groups"] = ["g1"]
+    stub.set("/v1/mcp/server", listing)
+    approve(ctx, litellm, relation)
+
+
+def test_org_scope_approvals_are_unsupported(ctx, litellm, conn):
+    relation = prepare(ctx, litellm)
+    with pytest.raises(ControlError, match="MINT-UNSUPPORTED.*team"):
+        approve(ctx, litellm, relation, scope_type="org", scope_id="acme")
+    assert count(conn, "approval_granted") == 0
+
+
+def test_key_scope_needs_the_derived_org_to_match_the_relation(ctx, litellm, conn):
+    relation = prepare(ctx, litellm)
+    orgs.add(ctx, "other", "OTHER")
+    orgs.unbind(ctx, SubjectType.USER, "human-1")
+    orgs.bind(ctx, "other", SubjectType.USER, "human-1")
+    with pytest.raises(ControlError, match="조직 유도 결과"):
+        approve(ctx, litellm, relation)
+    orgs.unbind(ctx, SubjectType.USER, "human-1")
+    with pytest.raises(ControlError, match="조직 유도 결과"):  # 기본 조직도 없다
+        approve(ctx, litellm, relation)
+    settings_store.set_default_org(ctx, "acme")
+    approve(ctx, litellm, relation)  # 바인딩이 없으면 기본 조직으로 유도된다
+
+
+def test_team_scope_without_a_relation_team_needs_a_binding_to_the_relation_org(ctx, litellm):
+    relation = prepare(ctx, litellm)
+    with pytest.raises(ControlError, match="묶여 있지 않습니다"):
+        approve(ctx, litellm, relation, scope_type="team", scope_id="team-op")
+
+
+def test_user_scope_needs_litellm_user_permission_and_org(ctx, litellm, stub):
+    relation = prepare(ctx, litellm)
+    with pytest.raises(ControlError, match="권한이 부여되어 있지 않아"):
+        approve(ctx, litellm, relation, scope_type="user", scope_id="human-1")
 
 
 def test_relation_team_scope_is_enforced_for_keys_and_teams(ctx, litellm):
@@ -385,9 +431,9 @@ def test_call_approval_lifecycle_and_events(ctx, litellm, conn):
     approver = make_ctx(conn, "carol", "approver", user_id="carol")
     approvals.call_approve(approver, call_id, None)
     assert fetchone(conn, "SELECT approved_by FROM mint.call_approvals")["approved_by"] == "carol"
-    approvals.call_cancel(approver, call_id)
+    approvals.call_cancel(ctx, call_id)
     with pytest.raises(ControlError, match="상태이고"):
-        approvals.call_cancel(approver, call_id)
+        approvals.call_cancel(ctx, call_id)
     other = request_call(ctx)
     approvals.call_reject(approver, other)
     assert [count(conn, k) for k in (

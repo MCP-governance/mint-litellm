@@ -67,6 +67,7 @@ class Run:
     text: list[str] = field(default_factory=list)
     data: dict[str, Any] = field(default_factory=dict)
     failure: str | None = None
+    failure_code: int = 1
 
     def context(self) -> Context:
         assert self.ctx is not None
@@ -132,13 +133,13 @@ def _init(run: Run) -> None:
                 "observable_policy_ids": list(settings_store.DEFAULT_OBSERVABLE_POLICY_IDS),
             },
         )
-    if not fetchone(
-        run.conn,
-        "SELECT 1 AS x FROM mint.orgs WHERE instance_id = %s AND org_id = %s",
-        (cfg.instance_id, args.org_id),
-    ):
-        orgs.add(ctx, args.org_id, args.org_name)
-    if settings_store.load(run.conn, cfg.instance_id)["default_org_id"] is None:
+        # 처음 만든 설정에서만 기본 조직을 정한다. 이후 재실행은 운영자가 바꾼 값을 건드리지 않는다.
+        if not fetchone(
+            run.conn,
+            "SELECT 1 AS x FROM mint.orgs WHERE instance_id = %s AND org_id = %s",
+            (cfg.instance_id, args.org_id),
+        ):
+            orgs.add(ctx, args.org_id, args.org_name)
         settings_store.set_default_org(ctx, args.org_id)
     text = litellm_config.snippet(servers_arg, no_spend_logs=args.no_spend_logs)
     run.data.update(migrations=applied, login_roles=configured_roles)
@@ -210,8 +211,12 @@ def _check(run: Run) -> None:
         observations=report.observations,
     )
     run.say(report.render())
+    run.data["incomplete"] = report.incomplete
     if report.failed:
         run.failure = "필수 설정 점검에 실패했습니다."
+    elif report.incomplete:
+        run.failure = "필수 검증을 모두 수행하지 못했습니다: " + ", ".join(report.incomplete)
+        run.failure_code = 3
 
 
 def _status(run: Run) -> None:
@@ -262,7 +267,7 @@ def _created(run: Run, object_id: str) -> None:
 
 def _approve(run: Run) -> None:
     a = run.args
-    approval_id, notes = approvals.approve(
+    approval_id, _ = approvals.approve(
         run.context(),
         run.litellm(),
         relation_id=a.relation,
@@ -276,10 +281,13 @@ def _approve(run: Run) -> None:
         requested_by=a.requested_by,
         allowlist_ids=a.allowlist_ref or [],
         second=_second(run),
+        conditions=approvals.build_conditions(
+            high_risk_tools=a.high_risk_tools,
+            business_hours_only=a.business_hours_only,
+            business_hours=a.business_hours,
+            require_consent=a.require_consent,
+        ),
     )
-    for note in notes:
-        print(note, file=sys.stderr)
-    run.data["notes"] = notes
     _created(run, approval_id)
 
 
@@ -330,6 +338,16 @@ def _policy_activate(run: Run) -> None:
     if row:
         run.extra_events.append(row)
     run.data["id"] = a.version
+
+
+def _server_register(run: Run) -> None:
+    servers.register(
+        run.context(),
+        run.litellm(),
+        run.args.server_id,
+        run.args.url,
+        litellm_config.load_config(_config_path(run)),
+    )
 
 
 def _done(call: Callable[..., Any], *names: str) -> Handler:
@@ -418,9 +436,7 @@ HANDLERS: dict[str, Handler] = {
     "status": _status,
     "operator add": _operator_add,
     "operator bootstrap": _operator_bootstrap,
-    "server register": lambda r: servers.register(
-        r.context(), r.litellm(), r.args.server_id, r.args.url
-    ),
+    "server register": _server_register,
     "server suspend": _done(servers.suspend, "server_id"),
     "server resume": _done(servers.resume, "server_id"),
     "relation add": lambda r: _created(
@@ -497,7 +513,8 @@ ARGUMENTS: dict[str, list[Any]] = {
     "operator bootstrap": [_a("--name", required=True), _a("--user-id", required=True)],
     "server register": [
         _SERVER_ID,
-        _a("--url", help="레지스트리가 URL을 응답하지 않을 때 계약 값에 쓸 서버 URL"),
+        _a("--url", help="계약 값에 쓸 서버 URL(제어 평면 키는 레지스트리 URL을 읽을 수 없다)"),
+        _CONFIG,
     ],
     "server suspend": [_SERVER_ID],
     "server resume": [_SERVER_ID],
@@ -520,6 +537,11 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--basis", required=True, help="승인 근거"),
         _a("--requested-by", required=True, help="신청자의 LiteLLM 사용자 식별자"),
         _a("--allowlist-ref", action="append", help="근거 허용 목록 항목 식별자(첫 승인에서만)"),
+        _a("--high-risk-tools", type=_csv, help="이 승인에서 호출별 승인을 요구할 도구(쉼표 구분)"),
+        _a("--business-hours-only", action="store_true", help="업무 시간 밖의 호출을 차단"),
+        _a("--business-hours",
+           help="업무 시간 재정의: 시간대,요일,시작,끝 (예: Asia/Seoul,1-5,09:00,18:00)"),
+        _a("--require-consent", help="이 목적의 동의가 있어야 호출 허용"),
         _SECOND,
     ],
     "deny": [
@@ -699,7 +721,7 @@ def run_command(args: argparse.Namespace, environ: dict[str, str]) -> None:
         for line in run.text:
             print(line)
     if run.failure:
-        raise ControlError(run.failure)
+        raise ControlError(run.failure, run.failure_code)
 
 
 def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = None) -> int:

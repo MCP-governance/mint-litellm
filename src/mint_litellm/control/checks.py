@@ -12,6 +12,7 @@ from typing import Any
 
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
 from mint_litellm.control.litellm_config import GUARDRAIL_MODES
+from mint_litellm.types.decision import normalize_auth_type, url_sha256
 from mint_litellm.types.settings import OBSERVATION_ITEMS, SETTINGS_TABLE, SettingGrade
 
 _DISCOVERY_AUTH = frozenset({"oauth2", "true_passthrough", "oauth_delegate"})
@@ -51,6 +52,17 @@ class Report:
     @property
     def failed(self) -> bool:
         return any(f.level is Level.FAIL for f in self.findings)
+
+    @property
+    def incomplete(self) -> list[str]:
+        """확인하지 못한 필수 행. 실패는 아니지만 점검이 끝났다고 말할 수 없다."""
+        return [
+            f.item
+            for f in self.findings
+            if f.level is Level.SKIP
+            and f.item in _ROWS
+            and _ROWS[f.item].grade is SettingGrade.REQUIRED
+        ]
 
     def render(self) -> str:
         lines = [f"[{f.level.value}] {f.item}" + (f": {f.message}" if f.message else "")
@@ -124,13 +136,16 @@ def run_checks(
 
     # 관리 API 기반 행
     if litellm is not None:
-        _check_registry_rows(report, judge, litellm, registered_servers or [])
+        _check_registry_rows(report, judge, litellm, registered_servers or [], config)
         _check_keys_and_teams(report, judge, litellm)
         if not file_missing:
             _check_guardrail_registered(report, litellm, config)
     else:
         for key in ("서버 이름·별칭 유일성", "사용자·팀에 결속되지 않은 키"):
             report.add(key, Level.SKIP, "LiteLLM 관리 API가 설정되어 있지 않습니다.")
+        if not file_missing:
+            report.add("guardrails[MINT]", Level.SKIP,
+                       "실행 중인 LiteLLM의 가드레일 등록을 확인하지 못했습니다(관리 API 없음).")
 
     missing = compat_probe()
     if missing is None:
@@ -233,7 +248,9 @@ def _check_env_rows(judge, general, env) -> None:
           "true이면 MCP 분당 호출 한도가 집행되지 않습니다.")
 
 
-def _check_registry_rows(report, judge, litellm: LiteLLMAdmin, registered: list[dict]) -> None:
+def _check_registry_rows(
+    report, judge, litellm: LiteLLMAdmin, registered: list[dict], config: Mapping[str, Any]
+) -> None:
     listing = litellm.list_servers()
     names: dict[str, int] = {}
     for entry in listing:
@@ -242,23 +259,58 @@ def _check_registry_rows(report, judge, litellm: LiteLLMAdmin, registered: list[
     duplicated = sorted(n for n, c in names.items() if c > 1)
     judge("서버 이름·별칭 유일성", not duplicated, "중복된 이름·별칭: " + ", ".join(duplicated))
     by_id = {e["server_id"]: e for e in listing}
-    problems = []
+    problems: list[str] = []
+    unverified: list[str] = []
+    open_servers: list[str] = []
     for row in registered:
         entry = by_id.get(row["server_id"])
         if entry is None:
             problems.append(f"{row['server_id']}: 레지스트리에 없음")
             continue
-        from mint_litellm.types.decision import normalize_auth_type, url_sha256
-
+        if _truthy(entry.get("allow_all_keys")):
+            open_servers.append(row["server_id"])
         if (entry.get("transport"), normalize_auth_type(entry.get("auth_type"))) != (
             row["transport"], row["auth_type"]
-        ) or (entry.get("url") and url_sha256(entry["url"]) != row["url_sha256"]):
-            problems.append(f"{row['server_id']}: 계약 값(URL 해시·전송·인증 방식) 불일치")
-    if registered:
-        if problems:
-            report.add("등록 서버의 계약 값", Level.FAIL, "; ".join(problems))
-        else:
-            report.add("등록 서버의 계약 값", Level.OK)
+        ):
+            problems.append(f"{row['server_id']}: 전송·인증 방식 불일치")
+            continue
+        # 제어 평면 키에는 레지스트리 URL이 응답되지 않으므로 설정 파일의 URL로 대신 확인한다.
+        url = entry.get("url") or _config_server_url(config, row["server_id"])
+        if not url:
+            unverified.append(row["server_id"])
+        elif url_sha256(url) != row["url_sha256"]:
+            problems.append(f"{row['server_id']}: URL 해시 불일치")
+    if open_servers:
+        report.add("mcp_servers.<이름>.allow_all_keys", Level.FAIL,
+                   "allow_all_keys가 true인 등록 서버: " + ", ".join(open_servers))
+    if not registered:
+        return
+    if problems:
+        report.add("등록 서버의 계약 값", Level.FAIL, "; ".join(problems))
+    elif unverified:
+        report.add("등록 서버의 계약 값", Level.SKIP,
+                   "URL을 확인하지 못했습니다(제어 평면 키에는 레지스트리 URL이 응답되지 않고 설정 "
+                   "파일에도 없음): " + ", ".join(unverified))
+    else:
+        report.add("등록 서버의 계약 값", Level.OK)
+
+
+def _config_server_url(config: Mapping[str, Any], server_id: str) -> str | None:
+    for server in (config.get("mcp_servers") or {}).values():
+        if isinstance(server, Mapping) and server.get("server_id") == server_id:
+            return server.get("url") or None
+    return None
+
+
+def _permission_of(litellm: LiteLLMAdmin, kind: str, obj: Mapping[str, Any]) -> Mapping[str, Any]:
+    """목록 응답에 권한 객체가 생략된 키·팀은 상세 조회로 보충한다."""
+    permission = obj.get("object_permission")
+    if permission or not obj.get("object_permission_id"):
+        return permission or {}
+    detail = (
+        litellm.get_team(obj["team_id"]) if kind == "team" else litellm.get_key(obj["token"])
+    )
+    return (detail or {}).get("object_permission") or {}
 
 
 def _check_keys_and_teams(report, judge, litellm: LiteLLMAdmin) -> None:
@@ -284,10 +336,9 @@ def _check_keys_and_teams(report, judge, litellm: LiteLLMAdmin) -> None:
         report.add("가드레일 제외 대상", Level.WARN,
                    f"가드레일 제외 메타데이터를 가진 키·팀이 {subjects}개 있습니다.")
     bad: list[str] = []
-    for owner, objects in (("키", keys), ("팀", teams)):
+    for owner, kind, objects in (("키", "key", keys), ("팀", "team", teams)):
         for obj in objects:
-            permission = obj.get("object_permission") or {}
-            for entry in permission.get("mcp_servers") or []:
+            for entry in _permission_of(litellm, kind, obj).get("mcp_servers") or []:
                 if entry not in registry_ids:
                     label = obj.get("key_alias") or obj.get("team_alias") or obj.get("token") or ""
                     bad.append(f"{owner} {label}: {entry}")
