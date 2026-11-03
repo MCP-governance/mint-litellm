@@ -6,7 +6,6 @@ import io
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -19,6 +18,7 @@ from mint_litellm.plugin.buffer import (
 )
 from mint_litellm.plugin.config import PluginConfig
 from mint_litellm.plugin.pipeline import CallRequest, PipelineDeps
+from mint_litellm.plugin.policy.opa_client import Evaluation, PolicyOutput
 from mint_litellm.plugin.snapshot import (
     AllowlistRow,
     ApprovalRow,
@@ -58,6 +58,7 @@ def config(tmp_path: Path | None = None, **override: Any) -> PluginConfig:
     base = PluginConfig(
         instance_id=INSTANCE,
         database_url="postgresql://unused",
+        opa_url="http://opa.invalid:8181",
         buffer_dir=tmp_path if tmp_path is not None else Path("unused"),
         fingerprint_key=FP_KEY,
         decision_budget_seconds=1.0,
@@ -281,21 +282,24 @@ def evaluator(
     failure: StageResult | None = None,
     calls: list[dict[str, Any]] | None = None,
 ):
+    """정책 클라이언트 대역. 운영의 ``OPAClient.evaluate``와 같은 반환 형태를 돌려준다."""
+
     async def evaluate(policy_input, *, policy_version_id, bundle_sha256):
         if calls is not None:
             calls.append(policy_input)
         if failure is not None:
-            return SimpleNamespace(output=None, failure=failure)
-        output = SimpleNamespace(
-            decision=decision,
-            policy_ids=list(policy_ids),
-            policy_version_id=version,
-            bundle_sha256=bundle,
-            obligations=list(obligations),
-            observable=observable,
-            missing_inputs=list(missing_inputs),
+            return Evaluation(failure=failure)
+        return Evaluation(
+            output=PolicyOutput(
+                decision=decision,
+                policy_ids=list(policy_ids),
+                policy_version_id=version,
+                bundle_sha256=bundle,
+                obligations=list(obligations),
+                observable=observable,
+                missing_inputs=list(missing_inputs),
+            )
         )
-        return SimpleNamespace(output=output, failure=None)
 
     return evaluate
 

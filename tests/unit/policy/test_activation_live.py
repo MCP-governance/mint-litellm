@@ -69,25 +69,37 @@ def test_real_activation_and_recovery(live_database):
 
     async def run():
         async with await psycopg.AsyncConnection.connect(live_database) as conn:
+
             async def publish(data):
                 publish_bundle(bundle_dir / "mint.tar.gz", data)
 
             async def activate(bundle):
                 await activate_bundle(
-                    conn, instance_id="test", actor="operator", bundle=bundle,
-                    publish=publish, opa_url=opa_url, timeout_seconds=30,
+                    conn,
+                    instance_id="test",
+                    actor="operator",
+                    bundle=bundle,
+                    publish=publish,
+                    opa_url=opa_url,
+                    timeout_seconds=30,
                 )
 
             async def snapshot():
-                rows = await (await conn.execute(
-                    "SELECT id, status, state_version FROM mint.policy_versions ORDER BY id"
-                )).fetchall()
-                epoch = await (await conn.execute(
-                    "SELECT epoch FROM mint.state_epoch WHERE instance_id = %s", ("test",)
-                )).fetchone()
-                events = await (await conn.execute(
-                    "SELECT count(*) FROM mint.events WHERE kind = %s", ("policy_activated",)
-                )).fetchone()
+                rows = await (
+                    await conn.execute(
+                        "SELECT id, status, state_version FROM mint.policy_versions ORDER BY id"
+                    )
+                ).fetchall()
+                epoch = await (
+                    await conn.execute(
+                        "SELECT epoch FROM mint.state_epoch WHERE instance_id = %s", ("test",)
+                    )
+                ).fetchone()
+                events = await (
+                    await conn.execute(
+                        "SELECT count(*) FROM mint.events WHERE kind = %s", ("policy_activated",)
+                    )
+                ).fetchone()
                 await conn.commit()
                 return rows, epoch[0], events[0]
 
@@ -103,14 +115,17 @@ def test_real_activation_and_recovery(live_database):
             await activate(second)
             after_second, after_epoch, after_events = await snapshot()
             assert [row[:2] for row in after_second] == [
-                ("first", "superseded"), ("second", "active")
+                ("first", "superseded"),
+                ("second", "active"),
             ]
             assert after_second[0][2] > before_second[0][2]
             assert after_second[1][2] == before_second[1][2] + 2
             assert after_epoch > before_epoch and after_events == before_events + 1
-            active = await (await conn.execute(
-                "SELECT id, bundle_sha256 FROM mint.policy_versions WHERE status = 'active'"
-            )).fetchone()
+            active = await (
+                await conn.execute(
+                    "SELECT id, bundle_sha256 FROM mint.policy_versions WHERE status = 'active'"
+                )
+            ).fetchone()
             await conn.commit()
             async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.post(f"{opa_url}/v1/data/mint/decision", json={"input": {}})
@@ -126,8 +141,13 @@ def test_real_activation_and_recovery(live_database):
 
             with pytest.raises(TimeoutError):
                 await activate_bundle(
-                    conn, instance_id="test", actor="operator", bundle=third,
-                    publish=publish_wrong, opa_url=opa_url, timeout_seconds=2,
+                    conn,
+                    instance_id="test",
+                    actor="operator",
+                    bundle=third,
+                    publish=publish_wrong,
+                    opa_url=opa_url,
+                    timeout_seconds=2,
                 )
             assert await snapshot() == before_failure
 
@@ -147,18 +167,30 @@ def test_real_activation_and_recovery(live_database):
 
             with pytest.raises(TimeoutError):
                 await activate_bundle(
-                    conn, instance_id="test", actor="operator", bundle=third,
-                    publish=publish_then_wait, opa_url=opa_url, timeout_seconds=15,
+                    conn,
+                    instance_id="test",
+                    actor="operator",
+                    bundle=third,
+                    publish=publish_then_wait,
+                    opa_url=opa_url,
+                    timeout_seconds=15,
                 )
             assert loaded.is_set()
             assert await snapshot() == before_failure
             await retry_activation(
-                conn, instance_id="test", actor="operator", bundle=third,
-                publish=publish, opa_url=opa_url, timeout_seconds=30,
+                conn,
+                instance_id="test",
+                actor="operator",
+                bundle=third,
+                publish=publish,
+                opa_url=opa_url,
+                timeout_seconds=30,
             )
             final, final_epoch, final_events = await snapshot()
             assert [row[:2] for row in final] == [
-                ("first", "superseded"), ("second", "superseded"), ("third", "active")
+                ("first", "superseded"),
+                ("second", "superseded"),
+                ("third", "active"),
             ]
             assert final_epoch > before_failure[1] and final_events == before_failure[2] + 1
 

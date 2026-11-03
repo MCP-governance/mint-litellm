@@ -274,12 +274,17 @@ class EvidenceRecorder:
         self._replaying: asyncio.Task[None] | None = None
 
     async def try_database(
-        self, event: Event, consume: ConsumeRequest | None = None
+        self,
+        event: Event,
+        consume: ConsumeRequest | None = None,
+        *,
+        timeout: float | None = None,
     ) -> DatabaseResult:
+        """DB에 쓴다. 시간 초과는 커밋 여부가 불명이라 실패로 다루고, 다음 위치에 다시 쓴다."""
         if self._store is None:
             return DatabaseResult(stored=False)
         try:
-            async with asyncio.timeout(self._budget):
+            async with asyncio.timeout(self._budget if timeout is None else timeout):
                 inserted = await self._store.insert_event(event, consume)
         except ConsumptionLost:
             return DatabaseResult(stored=False, consumption_lost=True)

@@ -46,8 +46,10 @@ def test_activation_verifies_loaded_metadata_before_database_activation():
             metadata = {"policy_version_id": "version", "bundle_sha256": "a" * 64}
             body = json.dumps({"result": metadata}).encode()
             writer.write(
-                b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
-                + b"\r\nConnection: close\r\n\r\n" + body
+                b"HTTP/1.1 200 OK\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+                + body
             )
             await writer.drain()
             writer.close()
@@ -57,8 +59,13 @@ def test_activation_verifies_loaded_metadata_before_database_activation():
         try:
             port = server.sockets[0].getsockname()[1]
             await activate_bundle(
-                conn, instance_id="instance", actor="operator", bundle=bundle,
-                publish=publish, opa_url=f"http://localhost:{port}", timeout_seconds=3,
+                conn,
+                instance_id="instance",
+                actor="operator",
+                bundle=bundle,
+                publish=publish,
+                opa_url=f"http://localhost:{port}",
+                timeout_seconds=3,
             )
         finally:
             server.close()

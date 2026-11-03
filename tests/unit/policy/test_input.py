@@ -8,8 +8,13 @@ from mint_litellm.types.identity import Principal, PrincipalType, Provenance
 
 def make_input(**overrides):
     principal = Principal(
-        instance_id="i", principal_type=PrincipalType.USER, principal_id="u", key_id="k",
-        org_id="o", org_source="user", provenance={"org_id": Provenance.DERIVED},
+        instance_id="i",
+        principal_type=PrincipalType.USER,
+        principal_id="u",
+        key_id="k",
+        org_id="o",
+        org_source="user",
+        provenance={"org_id": Provenance.DERIVED},
     )
     values = {
         "principal": principal,

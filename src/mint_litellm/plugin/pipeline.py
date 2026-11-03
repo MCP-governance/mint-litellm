@@ -8,11 +8,11 @@
 from __future__ import annotations
 
 import asyncio
-import calendar
 import hashlib
 import hmac
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -28,6 +28,8 @@ from mint_litellm.plugin.obligations import (
     RequireConsent,
     normalize_policy_output,
 )
+from mint_litellm.plugin.policy.input import policy_input as make_policy_input
+from mint_litellm.plugin.policy.opa_client import Evaluation
 from mint_litellm.plugin.snapshot import (
     ApprovalRow,
     CallApprovalRow,
@@ -71,23 +73,18 @@ log = logging.getLogger("mint_litellm.pipeline")
 _SCOPE_RANK = {"key": 0, "user": 1, "team": 2, "org": 3}
 
 
-class PolicyOutput(Protocol):
-    decision: str
-    policy_ids: Sequence[str]
-    policy_version_id: str
-    bundle_sha256: str
-    obligations: Sequence[Mapping[str, Any]]
-    observable: bool
-    missing_inputs: Sequence[str]
+PolicyEvaluate = Callable[..., Awaitable[Evaluation]]
+"""``evaluate(policy_input, *, policy_version_id, bundle_sha256)``. 운영은 OPAClient."""
 
 
-class PolicyEvaluation(Protocol):
-    output: PolicyOutput | None
-    failure: StageResult | None
+class Deadline:
+    """한 판정의 단일 시간 예산. DB와 정책 엔진 호출은 남은 시간만큼만 기다린다."""
 
+    def __init__(self, budget_seconds: float) -> None:
+        self._end = time.monotonic() + budget_seconds
 
-PolicyEvaluate = Callable[..., Awaitable[PolicyEvaluation]]
-"""``evaluate(policy_input, *, policy_version_id, bundle_sha256)``."""
+    def remaining(self) -> float:
+        return max(0.0, self._end - time.monotonic())
 
 
 class SnapshotSource(Protocol):
@@ -307,19 +304,14 @@ class InputError(Exception):
     """정책 입력으로 만들 수 없는 승인 조건."""
 
 
-def _argument_summary(arguments: Mapping[str, Any]) -> dict[str, Any]:
+def _argument_sizes(arguments: Mapping[str, Any]) -> dict[str, int]:
     sizes: dict[str, int] = {}
     for key, value in arguments.items():
         raw = (
             value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
         )
         sizes[str(key)] = len(raw.encode("utf-8"))
-    return {"keys": sorted(str(k) for k in arguments), "sizes": sizes}
-
-
-def _epoch_ns(moment: datetime) -> int:
-    utc = moment.astimezone(UTC)
-    return calendar.timegm(utc.utctimetuple()) * 1_000_000_000 + utc.microsecond * 1000
+    return sizes
 
 
 def build_policy_input(
@@ -373,26 +365,19 @@ def build_policy_input(
         else:
             raise InputError("require_consent must be a purpose string")
 
-    return {
-        "principal": {
-            "type": principal.principal_type.value,
-            "id": principal.principal_id,
-            "key_id": principal.key_id,
-            "org_id": principal.org_id,
-            "org_source": principal.org_source.value if principal.org_source else None,
-            "team_id": principal.team_id,
-            "claimed_end_user_id": principal.claimed_end_user_id,
-        },
-        "server": server_doc,
-        "tool": {"name": tool},
-        "arguments": _argument_summary(arguments),
-        "approval": approval,
-        "consent": consent,
-        "time": {"iso": now.astimezone(UTC).isoformat(), "ns": _epoch_ns(now)},
-        "settings": {"high_risk_tools": sorted(high_risk_tools)},
-        "mode": mode.value,
-        "operation": operation.value,
-    }
+    return make_policy_input(
+        principal=principal,
+        server=server_doc,
+        tool={"name": tool},
+        argument_keys=sorted(str(k) for k in arguments),
+        argument_sizes=_argument_sizes(arguments),
+        approval=approval,
+        consent=consent,
+        now=now,
+        high_risk_tools=sorted(high_risk_tools),
+        mode=mode.value,
+        operation=operation.value,
+    )
 
 
 @dataclass(frozen=True)
@@ -411,11 +396,12 @@ async def policy_stage(
     deps: PipelineDeps,
     snapshot: Snapshot,
     policy_input: dict[str, Any],
+    timeout: float,
 ) -> PolicyStageResult:
     def stopped(result: StageResult, dependency: Dependency | None = None) -> PolicyStageResult:
-        return PolicyStageResult(
-            [(Stage.POLICY, result)], False, None, (), (), None, None, dependency
-        )
+        # 정책 엔진이 의무를 지원하지 못한다고 답한 경우는 의무 확인 단계의 중단이다.
+        stage = Stage.OBLIGATIONS if result.reason_code == Reason.UNSUPPORTED else Stage.POLICY
+        return PolicyStageResult([(stage, result)], False, None, (), (), None, None, dependency)
 
     version = snapshot.policy_version
     if version is None:
@@ -425,7 +411,7 @@ async def policy_stage(
             StageResult.stop(Reason.DEPENDENCY_FAILURE, detail="no policy engine"), Dependency.OPA
         )
     try:
-        async with asyncio.timeout(deps.config.decision_budget_seconds):
+        async with asyncio.timeout(timeout):
             evaluation = await deps.evaluate(
                 policy_input, policy_version_id=version.id, bundle_sha256=version.bundle_sha256
             )
@@ -591,6 +577,7 @@ class _Run:
     principal: Principal
     mode: Mode
     evaluated_at: datetime
+    deadline: Deadline
     current: Stage = Stage.CONTEXT
     snapshot: Snapshot | None = None
     selected: ApprovalRow | None = None
@@ -707,7 +694,7 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
         team_id=principal.team_id,
     )
     try:
-        async with asyncio.timeout(config.decision_budget_seconds):
+        async with asyncio.timeout(run.deadline.remaining()):
             snapshot = await deps.snapshots.read_snapshot(query)
     except Exception:
         stages.dependency = Dependency.DB
@@ -761,7 +748,7 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
     except InputError as exc:
         stages.add(Stage.POLICY, StageResult.stop(Reason.SCHEMA_ERROR, detail=str(exc)[:200]))
         return
-    run.policy = await policy_stage(deps, snapshot, policy_input)
+    run.policy = await policy_stage(deps, snapshot, policy_input, run.deadline.remaining())
     stages.dependency = run.policy.dependency
     for stage, result in run.policy.results:
         stages.add(stage, result)
@@ -807,6 +794,7 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
         principal=req.principal,
         mode=effective_mode(deps.config.mode_ceiling, Mode.ENFORCE),
         evaluated_at=deps.clock(),
+        deadline=Deadline(deps.config.decision_budget_seconds),
     )
     try:
         await _run_stages(run, deps)
@@ -826,14 +814,14 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
     )
     consume = run.consume if conclusion.enforced_action is Action.ALLOW else None
     event = decision_event(_decision_snapshot(run, conclusion, consume))
-    stored = await deps.recorder.try_database(event, consume)
+    stored = await deps.recorder.try_database(event, consume, timeout=run.deadline.remaining())
     evidence = Evidence.DB
     if not stored.stored:
         if stored.consumption_lost:
             conclusion = _block_with(conclusion, StageResult.stop(Reason.CALL_APPROVAL_REQUIRED))
             consume = None
             event = decision_event(_decision_snapshot(run, conclusion, None))
-            retry = await deps.recorder.try_database(event)
+            retry = await deps.recorder.try_database(event, timeout=run.deadline.remaining())
             if not retry.stored:
                 evidence = await deps.recorder.fallback(event)
         else:

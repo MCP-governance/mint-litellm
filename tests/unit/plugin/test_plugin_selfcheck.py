@@ -13,7 +13,6 @@ from mint_litellm.plugin.selfcheck import (
     PluginRuntime,
     check_items,
     collect_view,
-    load_policy_evaluator,
 )
 from mint_litellm.plugin.snapshot import RegisteredServer
 from mint_litellm.types.decision import url_sha256
@@ -376,20 +375,29 @@ def test_view_reports_missing_symbols_when_litellm_is_absent_or_other(monkeypatc
     )
 
 
-def test_policy_evaluator_is_absent_without_an_opa_url(tmp_path):
-    assert load_policy_evaluator(config(tmp_path)) is None
+def test_the_runtime_is_built_from_the_environment_with_the_policy_client(tmp_path, monkeypatch):
+    from mint_litellm.plugin import selfcheck
+    from mint_litellm.plugin.policy.opa_client import OPAClient
+
+    monkeypatch.setattr(selfcheck, "_runtime", None)
+    env = {
+        "MINT_INSTANCE_ID": "prod",
+        "MINT_DATABASE_URL": "postgresql://mint@db/mint",
+        "MINT_OPA_URL": "http://opa:8181",
+        "MINT_BUFFER_DIR": str(tmp_path / "buffer"),
+        "MINT_DECISION_BUDGET_MS": "250",
+    }
+    runtime = selfcheck.get_runtime(env)
+    assert runtime is selfcheck.get_runtime(env)
+    assert runtime.config.decision_budget_seconds == 0.25
+    assert isinstance(runtime.evaluate.__self__, OPAClient)
+    assert runtime.database.acquire_timeout == 0.25 and runtime.verified is False
+    monkeypatch.setattr(selfcheck, "_runtime", None)
 
 
-def test_a_configured_opa_url_without_the_client_raises_runtime_error(tmp_path, monkeypatch):
-    import builtins
+def test_a_runtime_without_the_required_environment_raises_runtime_error(monkeypatch):
+    from mint_litellm.plugin import selfcheck
 
-    real_import = builtins.__import__
-
-    def deny(name, *args, **kwargs):
-        if name.endswith("opa_client"):
-            raise ImportError(name)
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", deny)
+    monkeypatch.setattr(selfcheck, "_runtime", None)
     with pytest.raises(RuntimeError):
-        load_policy_evaluator(config(tmp_path, opa_url="http://opa:8181"))
+        selfcheck.get_runtime({})

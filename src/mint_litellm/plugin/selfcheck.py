@@ -33,6 +33,7 @@ from mint_litellm.plugin.pipeline import (
     build_request,
     evaluate_request,
 )
+from mint_litellm.plugin.policy.opa_client import OPAClient
 from mint_litellm.plugin.result import ResultDeps
 from mint_litellm.plugin.snapshot import PluginDatabase, RegisteredServer
 from mint_litellm.types.decision import OperationType
@@ -241,16 +242,6 @@ async def wait_for_readiness(url: str, timeout: float) -> bool:
     return False
 
 
-def load_policy_evaluator(config: PluginConfig) -> PolicyEvaluate | None:
-    if config.opa_url is None:
-        return None
-    try:
-        from mint_litellm.plugin.policy.opa_client import OPAClient
-    except ImportError as exc:
-        raise RuntimeError("MINT_OPA_URL is set but the policy client is not installed") from exc
-    return OPAClient(config.opa_url, config.decision_budget_seconds).evaluate
-
-
 @dataclass
 class PluginRuntime:
     """한 워커 프로세스의 플러그인 상태. 로거와 가드레일이 공유한다."""
@@ -424,6 +415,6 @@ def get_runtime(env: Mapping[str, str] | None = None) -> PluginRuntime:
             config=config,
             database=database,
             recorder=recorder,
-            evaluate=load_policy_evaluator(config),
+            evaluate=OPAClient(config.opa_url, config.decision_budget_seconds).evaluate,
         )
     return _runtime

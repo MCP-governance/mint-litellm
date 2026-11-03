@@ -27,6 +27,7 @@ MIN_FINGERPRINT_KEY_BYTES = 16
 class PluginConfig:
     instance_id: str
     database_url: str
+    opa_url: str
     mode_ceiling: Mode = Mode.ENFORCE
     required: bool = True
     high_risk_tools: frozenset[str] = frozenset()
@@ -36,7 +37,6 @@ class PluginConfig:
     decision_budget_seconds: float = DEFAULT_DECISION_BUDGET_MS / 1000
     fingerprint_key: bytes | None = None
     fingerprint_key_version: int = 1
-    opa_url: str | None = None
     readiness_url: str | None = None
     selfcheck_grace_seconds: float = 30.0
 
@@ -58,6 +58,7 @@ class PluginConfig:
         return cls(
             instance_id=instance_id,
             database_url=_required(env, "MINT_DATABASE_URL"),
+            opa_url=_required(env, "MINT_OPA_URL"),
             mode_ceiling=ceiling,
             required=_boolean(env, "MINT_REQUIRED", True),
             high_risk_tools=frozenset(
@@ -72,7 +73,6 @@ class PluginConfig:
             / 1000,
             fingerprint_key=key.encode("utf-8") if key is not None else None,
             fingerprint_key_version=_integer(env, "MINT_FINGERPRINT_KEY_VERSION", 1, 1),
-            opa_url=env.get("MINT_OPA_URL") or None,
             readiness_url=env.get("MINT_READINESS_URL") or None,
             selfcheck_grace_seconds=float(_integer(env, "MINT_SELFCHECK_GRACE_SECONDS", 30, 0)),
         )

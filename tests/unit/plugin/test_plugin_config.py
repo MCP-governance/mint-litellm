@@ -5,7 +5,11 @@ import pytest
 from mint_litellm.plugin.config import PluginConfig
 from mint_litellm.types.settings import Mode
 
-BASE = {"MINT_INSTANCE_ID": "prod-1", "MINT_DATABASE_URL": "postgresql://mint@db/mint"}
+BASE = {
+    "MINT_INSTANCE_ID": "prod-1",
+    "MINT_DATABASE_URL": "postgresql://mint@db/mint",
+    "MINT_OPA_URL": "http://opa:8181",
+}
 
 
 def test_defaults():
@@ -16,7 +20,7 @@ def test_defaults():
     assert config.buffer_dir == Path("/var/lib/mint/buffer")
     assert config.buffer_max_bytes == 50 * 1024 * 1024
     assert config.decision_budget_seconds == 0.3
-    assert config.fingerprint_key is None and config.opa_url is None
+    assert config.fingerprint_key is None and config.opa_url == "http://opa:8181"
 
 
 def test_every_setting_can_be_given():
@@ -31,7 +35,6 @@ def test_every_setting_can_be_given():
         "MINT_DECISION_BUDGET_MS": "500",
         "MINT_FINGERPRINT_KEY": "k" * 32,
         "MINT_FINGERPRINT_KEY_VERSION": "3",
-        "MINT_OPA_URL": "http://opa:8181",
         "MINT_READINESS_URL": "http://localhost:4000/health/readiness",
         "MINT_SELFCHECK_GRACE_SECONDS": "5",
     }
@@ -68,7 +71,7 @@ def test_invalid_values_raise_runtime_error_only(override):
         PluginConfig.from_env({**BASE, **override})
 
 
-@pytest.mark.parametrize("missing", ["MINT_INSTANCE_ID", "MINT_DATABASE_URL"])
+@pytest.mark.parametrize("missing", ["MINT_INSTANCE_ID", "MINT_DATABASE_URL", "MINT_OPA_URL"])
 def test_required_settings(missing):
     env = {k: v for k, v in BASE.items() if k != missing}
     with pytest.raises(RuntimeError, match=missing):

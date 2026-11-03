@@ -25,11 +25,13 @@ from plugin_helpers import (
 )
 
 from mint_litellm.plugin.pipeline import (
+    Deadline,
     argument_fingerprint,
     blocking_reason,
     build_policy_input,
     evaluate_request,
 )
+from mint_litellm.plugin.policy.input import has_only_policy_fields
 from mint_litellm.plugin.snapshot import RelationRow, SettingsRow
 from mint_litellm.types.decision import (
     Action,
@@ -962,3 +964,84 @@ class TestDiscoveryOperation:
         h = harness(tmp_path, verified=False)
         outcome = decide(h, request(operation=OperationType.RUNTIME_DISCOVERY))
         assert code(outcome) == "MINT-ENFORCEMENT-UNVERIFIED"
+
+
+class TestDecisionBudget:
+    """판정 하나의 시간 예산을 상태 조회, 정책 평가, 선기록이 나눠 쓴다."""
+
+    def test_the_deadline_only_runs_down(self):
+        deadline = Deadline(0.05)
+        first = deadline.remaining()
+        time_left = [first]
+        for _ in range(3):
+            asyncio.run(asyncio.sleep(0.02))
+            time_left.append(deadline.remaining())
+        assert time_left == sorted(time_left, reverse=True) and time_left[-1] == 0.0
+
+    def test_the_policy_engine_only_gets_what_the_snapshot_left(self, tmp_path):
+        cfg = config(tmp_path, decision_budget_seconds=0.3)
+        seen = {}
+
+        async def evaluate(policy_input, *, policy_version_id, bundle_sha256):
+            started = asyncio.get_running_loop().time()
+            try:
+                await asyncio.sleep(0.25)
+            finally:
+                seen["waited"] = asyncio.get_running_loop().time() - started
+            raise AssertionError("must have been cancelled")
+
+        h = harness(tmp_path, evaluate=evaluate, cfg=cfg)
+        original = h.snapshots.read_snapshot
+
+        async def slow_snapshot(query):
+            await asyncio.sleep(0.15)
+            return await original(query)
+
+        h.snapshots.read_snapshot = slow_snapshot
+        outcome = decide(h)
+        assert code(outcome) == "MINT-DEPENDENCY-OPA"
+        assert seen["waited"] < 0.2
+
+    def test_an_insert_that_outlives_the_remaining_budget_is_unknown_and_blocks_the_call(
+        self, tmp_path
+    ):
+        cfg = config(tmp_path, decision_budget_seconds=0.2)
+        h = harness(tmp_path, cfg=cfg)
+        h.deps.recorder._budget = 5.0
+
+        async def slow_insert(event, consume=None):
+            await asyncio.sleep(1)
+
+        h.store.insert_event = slow_insert
+        outcome = decide(h)
+        assert code(outcome) == "MINT-AUDIT-FAILURE" and outcome.evidence.value == "buffer"
+        (event,) = buffered(h)
+        assert event.source_key.endswith(":decision_evaluated")
+        assert event.payload["stop"]["reason_code"] == "AUDIT_FAILURE"
+
+    def test_an_unsupported_answer_from_the_policy_engine_is_an_obligation_stage_stop(
+        self, tmp_path
+    ):
+        failure = StageResult.stop(Reason.UNSUPPORTED)
+        outcome = decide(harness(tmp_path, evaluate=evaluator(failure=failure)))
+        assert code(outcome) == "MINT-UNSUPPORTED"
+        stages = {e.stage: e for e in outcome.snapshot.stages}
+        assert stages[Stage.OBLIGATIONS].status is StageStatus.STOP
+
+
+def test_the_policy_input_passes_the_policy_modules_own_field_check(tmp_path):
+    calls: list = []
+    assert decide(harness(tmp_path, evaluate=evaluator(calls=calls))).allowed
+    assert has_only_policy_fields(calls[0])
+    unregistered = snapshot(server=None, approvals=())
+    decide(harness(tmp_path, unregistered, evaluate=evaluator(calls=calls)))
+    assert has_only_policy_fields(calls[1]) and calls[1]["approval"] == {"present": False}
+
+
+def test_missing_principal_values_are_left_out_of_the_policy_input(tmp_path):
+    calls: list = []
+    principal = user_principal(user_id=None, claimed_end_user_id=None)
+    assert decide(harness(tmp_path, evaluate=evaluator(calls=calls)), request(principal)).allowed
+    sent = calls[0]["principal"]
+    assert sent["type"] == "team_key" and sent["id"] == "k" * 64
+    assert sent["claimed_end_user_id"] is None and sent["team_id"] == "t1"

@@ -20,8 +20,10 @@ def test_bundle_hash_excludes_metadata_and_covers_paths_and_contents(tmp_path, m
     assert first.bundle_sha256 == second.bundle_sha256
     bundle_root = tmp_path / "policy/bundle"
     files = sorted(
-        path for path in bundle_root.rglob("*")
-        if path.is_file() and path.suffix in {".rego", ".json"}
+        path
+        for path in bundle_root.rglob("*")
+        if path.is_file()
+        and path.suffix in {".rego", ".json"}
         and path.relative_to(bundle_root).as_posix() != "mint/meta/data.json"
     )
     content = b"".join(
