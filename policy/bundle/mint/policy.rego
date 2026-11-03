@@ -3,179 +3,230 @@ package mint.policy
 import rego.v1
 
 required := {
-    "principal.type": ["principal", "type"],
-    "principal.id": ["principal", "id"],
-    "principal.key_id": ["principal", "key_id"],
-    "principal.org_id": ["principal", "org_id"],
-    "principal.org_source": ["principal", "org_source"],
-    "server.id": ["server", "id"],
-    "server.status": ["server", "status"],
-    "server.transport": ["server", "transport"],
-    "server.auth_type": ["server", "auth_type"],
-    "server.provider_allowed": ["server", "provider_allowed"],
-    "server.auth_server_allowed": ["server", "auth_server_allowed"],
-    "tool.name": ["tool", "name"],
-    "arguments.keys": ["arguments", "keys"],
-    "arguments.sizes": ["arguments", "sizes"],
-    "approval.present": ["approval", "present"],
-    "consent.status": ["consent", "status"],
-    "time.iso": ["time", "iso"],
-    "time.ns": ["time", "ns"],
-    "settings.high_risk_tools": ["settings", "high_risk_tools"],
-    "mode": ["mode"],
-    "operation": ["operation"],
+	"principal.type": ["principal", "type"],
+	"principal.id": ["principal", "id"],
+	"principal.key_id": ["principal", "key_id"],
+	"principal.org_id": ["principal", "org_id"],
+	"principal.org_source": ["principal", "org_source"],
+	"server.id": ["server", "id"],
+	"server.status": ["server", "status"],
+	"server.transport": ["server", "transport"],
+	"server.auth_type": ["server", "auth_type"],
+	"server.provider_allowed": ["server", "provider_allowed"],
+	"server.auth_server_allowed": ["server", "auth_server_allowed"],
+	"tool.name": ["tool", "name"],
+	"arguments.keys": ["arguments", "keys"],
+	"arguments.sizes": ["arguments", "sizes"],
+	"approval.present": ["approval", "present"],
+	"consent.status": ["consent", "status"],
+	"time.iso": ["time", "iso"],
+	"settings.high_risk_tools": ["settings", "high_risk_tools"],
+	"mode": ["mode"],
+	"operation": ["operation"],
 }
 
 missing contains name if {
-    some name, path in required
-    object.get(input, path, null) == null
+	some name, path in required
+	object.get(input, path, null) == null
 }
+
 string_fields := {
-    "principal.type", "principal.id", "principal.key_id", "principal.org_id", "principal.org_source",
-    "server.id", "server.status", "server.transport", "server.auth_type", "tool.name", "time.iso",
-}
-missing contains name if {
-    some name in string_fields
-    value := object.get(input, required[name], null)
-    not valid_text(value)
-}
-valid_text(value) if { is_string(value); count(value) > 0 }
-
-missing contains name if {
-    some name in {"principal.team_id", "principal.claimed_end_user_id", "consent.source"}
-    parts := split(name, ".")
-    obj := object.get(input, parts[0], {})
-    not parts[1] in object.keys(obj)
+	"principal.type", "principal.id", "principal.key_id", "principal.org_id", "principal.org_source",
+	"server.id", "server.status", "server.transport", "server.auth_type", "tool.name", "time.iso",
 }
 
 missing contains name if {
-    input.approval.present == true
-    some key in {"id", "class", "scope_type", "expires_in_days", "conditions"}
-    object.get(input.approval, key, null) == null
-    name := sprintf("approval.%s", [key])
+	some name in string_fields
+	value := object.get(input, required[name], null)
+	not valid_text(value)
 }
 
-missing contains "approval.present" if { not is_boolean(input.approval.present) }
-missing contains "time.ns" if { not valid_ns }
-valid_ns if { is_number(input.time.ns); input.time.ns == floor(input.time.ns) }
-missing contains "settings.high_risk_tools" if { not valid_strings(input.settings.high_risk_tools) }
-missing contains "arguments.keys" if { not valid_strings(input.arguments.keys) }
-missing contains "arguments.sizes" if { not valid_sizes(input.arguments.sizes) }
-valid_strings(values) if { is_array(values); every value in values { is_string(value) } }
+valid_text(value) if {
+	is_string(value)
+	count(value) > 0
+}
+
+missing contains name if {
+	some name in {"principal.team_id", "principal.claimed_end_user_id", "consent.source"}
+	parts := split(name, ".")
+	obj := object.get(input, parts[0], {})
+	not parts[1] in object.keys(obj)
+}
+
+missing contains name if {
+	input.approval.present == true
+	some key in {"id", "class", "scope_type", "expires_in_days", "conditions"}
+	object.get(input.approval, key, null) == null
+	name := sprintf("approval.%s", [key])
+}
+
+missing contains "approval.present" if not is_boolean(input.approval.present)
+
+missing contains "time.ns" if {
+	object.get(conditions, "business_hours_only", false) == true
+	not valid_ns
+}
+
+missing contains "time.ns" if {
+	"ns" in object.keys(object.get(input, "time", {}))
+	not valid_ns
+}
+
+valid_ns if {
+	is_number(input.time.ns)
+	input.time.ns == floor(input.time.ns)
+}
+
+missing contains "settings.high_risk_tools" if not valid_strings(input.settings.high_risk_tools)
+missing contains "arguments.keys" if not valid_strings(input.arguments.keys)
+missing contains "arguments.sizes" if not valid_sizes(input.arguments.sizes)
+
+valid_strings(values) if {
+	is_array(values)
+	every value in values { is_string(value) }
+}
+
 valid_sizes(values) if {
-    is_object(values)
-    every key, value in values { is_string(key); is_number(value); value >= 0; value == floor(value) }
+	is_object(values)
+	every key, value in values { is_string(key); is_number(value); value >= 0; value == floor(value)}
 }
-missing contains "server.provider_allowed" if { not is_boolean(input.server.provider_allowed) }
-missing contains "server.auth_server_allowed" if { not is_boolean(input.server.auth_server_allowed) }
-missing contains "principal.type" if { not input.principal.type in {"user", "team_key", "service_account"} }
-missing contains "principal.org_source" if { not input.principal.org_source in {"team", "user", "default"} }
-missing contains "mode" if { not input.mode in {"enforce", "observe"} }
-missing contains "operation" if { not input.operation in {"tool_call", "runtime_discovery"} }
+
+missing contains "server.provider_allowed" if not is_boolean(input.server.provider_allowed)
+missing contains "server.auth_server_allowed" if not is_boolean(input.server.auth_server_allowed)
+missing contains "principal.type" if not input.principal.type in {"user", "team_key", "service_account"}
+missing contains "principal.org_source" if not input.principal.org_source in {"team", "user", "default"}
+missing contains "mode" if not input.mode in {"enforce", "observe"}
+missing contains "operation" if not input.operation in {"tool_call", "runtime_discovery"}
 missing contains "consent.status" if {
-    not input.consent.status in {"granted", "absent", "expired", "revoked", "not_applicable"}
+	not input.consent.status in {"granted", "absent", "expired", "revoked", "not_applicable"}
 }
+
 missing contains "consent.source" if {
-    source := object.get(input.consent, "source", null)
-    not source in {null, "self_service", "operator_attested"}
+	source := object.get(input.consent, "source", null)
+	not source in {null, "self_service", "operator_attested"}
 }
+
 missing contains "approval.class" if {
-    input.approval.present == true
-    not input.approval.class in {"standard", "exception"}
+	input.approval.present == true
+	not input.approval.class in {"standard", "exception"}
 }
+
 missing contains "approval.scope_type" if {
-    input.approval.present == true
-    not input.approval.scope_type in {"key", "user", "team", "org"}
+	input.approval.present == true
+	not input.approval.scope_type in {"key", "user", "team", "org"}
 }
+
 missing contains "approval.id" if {
-    input.approval.present == true
-    not valid_text(input.approval.id)
+	input.approval.present == true
+	not valid_text(input.approval.id)
 }
+
 missing contains "approval.expires_in_days" if {
-    input.approval.present == true
-    not is_number(input.approval.expires_in_days)
+	input.approval.present == true
+	not is_number(input.approval.expires_in_days)
 }
+
 missing contains "approval.conditions" if {
-    input.approval.present == true
-    not is_object(input.approval.conditions)
+	input.approval.present == true
+	not is_object(input.approval.conditions)
 }
+
 missing contains "approval.conditions.high_risk_tools" if {
-    tools := object.get(conditions, "high_risk_tools", [])
-    not valid_strings(tools)
+	tools := object.get(conditions, "high_risk_tools", [])
+	not valid_strings(tools)
 }
+
 missing contains "approval.conditions.require_consent" if {
-    "require_consent" in object.keys(conditions)
-    not valid_purpose
+	"require_consent" in object.keys(conditions)
+	not valid_purpose
 }
+
 valid_purpose if {
-    purpose := conditions.require_consent
-    is_string(purpose)
-    regex.match(`\S`, purpose)
-    count(purpose) <= 128
+	purpose := conditions.require_consent
+	is_string(purpose)
+	regex.match(`\S`, purpose)
+	count(purpose) <= 128
 }
+
 missing contains "approval.conditions.business_hours_only" if {
-    value := object.get(conditions, "business_hours_only", false)
-    not is_boolean(value)
+	value := object.get(conditions, "business_hours_only", false)
+	not is_boolean(value)
 }
+
 missing contains "business_hours" if {
-    object.get(conditions, "business_hours_only", false) == true
-    not valid_hours
+	object.get(conditions, "business_hours_only", false) == true
+	not valid_hours
 }
+
 valid_hours if {
-    is_object(hours)
-    is_string(hours.tz)
-    time.clock([input.time.ns, hours.tz])
-    is_array(hours.days)
-    count(hours.days) > 0
-    every day in hours.days { is_number(day); day == floor(day); day >= 1; day <= 7 }
-    regex.match(`^([01][0-9]|2[0-3]):[0-5][0-9]$`, hours.start)
-    regex.match(`^([01][0-9]|2[0-3]):[0-5][0-9]$`, hours.end)
-    hours.start < hours.end
+	is_object(hours)
+	is_string(hours.tz)
+	time.clock([input.time.ns, hours.tz])
+	is_array(hours.days)
+	count(hours.days) > 0
+	every day in hours.days { is_number(day); day == floor(day); day >= 1; day <= 7}
+	regex.match(`^([01][0-9]|2[0-3]):[0-5][0-9]$`, hours.start)
+	regex.match(`^([01][0-9]|2[0-3]):[0-5][0-9]$`, hours.end)
+	hours.start < hours.end
 }
 
 conditions := object.get(object.get(input, "approval", {}), "conditions", {})
 
-applied contains "R1" if { input.approval.present == false }
-applied contains "R2" if { input.tool.name in input.settings.high_risk_tools }
-applied contains "R2" if { input.tool.name in object.get(conditions, "high_risk_tools", []) }
+applied contains "R1" if input.approval.present == false
+applied contains "R2" if input.tool.name in input.settings.high_risk_tools
+applied contains "R2" if input.tool.name in object.get(conditions, "high_risk_tools", [])
+
 applied contains "R3" if {
-    object.get(conditions, "business_hours_only", false) == true
-    not within_business_hours
+	object.get(conditions, "business_hours_only", false) == true
+	not within_business_hours
 }
+
 applied contains "R4" if {
-    purpose := object.get(conditions, "require_consent", "")
-    is_string(purpose)
-    purpose != ""
-    input.consent.status != "granted"
+	purpose := object.get(conditions, "require_consent", "")
+	is_string(purpose)
+	purpose != ""
+	input.consent.status != "granted"
 }
 
 hours := object.get(conditions, "business_hours", data.mint.business_hours)
+
 within_business_hours if {
-    weekday := time.weekday([input.time.ns, hours.tz])
-    day := {"Monday": 1, "Tuesday": 2, "Wednesday": 3, "Thursday": 4,
-            "Friday": 5, "Saturday": 6, "Sunday": 7}[weekday]
-    day in hours.days
-    clock := time.clock([input.time.ns, hours.tz])
-    current := clock[0] * 60 + clock[1]
-    start := split(hours.start, ":")
-    end := split(hours.end, ":")
-    current >= to_number(start[0]) * 60 + to_number(start[1])
-    current < to_number(end[0]) * 60 + to_number(end[1])
+	weekday := time.weekday([input.time.ns, hours.tz])
+	day := {
+		"Monday": 1, "Tuesday": 2, "Wednesday": 3, "Thursday": 4,
+		"Friday": 5, "Saturday": 6, "Sunday": 7,
+	}[weekday]
+	day in hours.days
+	clock := time.clock([input.time.ns, hours.tz])
+	current := (clock[0] * 60) + clock[1]
+	start := split(hours.start, ":")
+	end := split(hours.end, ":")
+	current >= (to_number(start[0]) * 60) + to_number(start[1])
+	current < (to_number(end[0]) * 60) + to_number(end[1])
 }
 
 block_observable := {"R1": true, "R3": true}
 block_rules := {id | some id in {"R1", "R3"}; id in applied}
-default verdict := "Allow"
-verdict := "Block" if { count(block_rules) > 0 } else := "RequireApproval" if { "R2" in applied }
 
-observable if { count(block_rules) > 0; every id in block_rules { block_observable[id] == true } }
+default verdict := "Allow"
+
+verdict := "Block" if count(block_rules) > 0
+
+else := "RequireApproval" if "R2" in applied
+
+decision_ids := sort([id | some id in block_rules]) if {
+	verdict == "Block"
+} else := ["R2"] if {
+	verdict == "RequireApproval"
+} else := []
+
+observable if {
+	count(block_rules) > 0
+	every id in block_rules { block_observable[id] == true }
+}
+
 default observable := false
 
-obligations := array.concat(approval_obligations, consent_obligations)
-approval_obligations := [{"type": "require_call_approval"}] if {
-    verdict == "Block"
-    "R2" in applied
-} else := []
-consent_obligations := [{"type": "require_consent", "purpose": conditions.require_consent}] if {
-    "R4" in applied
+obligations := [{"type": "require_consent", "purpose": conditions.require_consent}] if {
+	"R4" in applied
 } else := []

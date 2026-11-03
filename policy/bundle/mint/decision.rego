@@ -1,10 +1,10 @@
 package mint.decision
 
-import rego.v1
 import data.mint.policy
+import rego.v1
 
 decision := policy.verdict
-policy_ids := sort([id | some id; policy.applied[id]])
+policy_ids := policy.decision_ids
 obligations := policy.obligations
 observable := policy.observable
 policy_version_id := data.mint.meta.policy_version_id
