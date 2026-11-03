@@ -105,6 +105,7 @@ def error_for_reason(
 
 def record_failed_error(reference: str) -> MintError:
     """전송 뒤 기록에 실패한 경우."""
+    # 도구 결과를 검사하는 전송 뒤 경로에서만 쓰며, 전송 전에 끝나는 호출 판정에서는 쓰지 않는다.
     return MintError(
         code="MINT-RECORD-FAILED",
         dispatch_state=DispatchState.DISPATCHED_UNKNOWN,
