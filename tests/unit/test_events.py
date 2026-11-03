@@ -52,6 +52,7 @@ def test_call_source_key_rule():
         (EventKind.CONSENT_GRANTED, "consent"),
         (EventKind.RELATION_CREATED, "relation"),
         (EventKind.SERVER_SUSPENDED, "server"),
+        (EventKind.RELATION_TERMINATING, "relation"),
         (EventKind.SETTINGS_CHANGED, "settings"),
         (EventKind.POLICY_ACTIVATED, "policy_version"),
         (EventKind.ORG_BINDING_CREATED, "org_binding"),
