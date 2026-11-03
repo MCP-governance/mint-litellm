@@ -3,6 +3,7 @@
 import pytest
 
 pytest.importorskip("litellm")
+pytest.importorskip("fastapi")
 
 from litellm.constants import LITELLM_PROXY_MASTER_KEY_ALIAS  # noqa: E402
 from litellm.proxy._experimental.mcp_server.mcp_server_manager import (  # noqa: E402

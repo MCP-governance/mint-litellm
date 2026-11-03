@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-litellm = ["litellm==1.106.6", "psycopg[binary,pool]>=3.2"]
+litellm = ["litellm[proxy]==1.106.6", "psycopg[binary,pool]>=3.2"]
 dev = [
     "pytest>=8",
     "ruff>=0.6",

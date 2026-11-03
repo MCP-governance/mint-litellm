@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("litellm")
+pytest.importorskip("fastapi")
 
 from fastapi import HTTPException  # noqa: E402
 from litellm.integrations.custom_guardrail import CustomGuardrail  # noqa: E402
