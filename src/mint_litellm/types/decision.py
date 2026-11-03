@@ -10,8 +10,9 @@ from enum import StrEnum
 from typing import Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from mint_litellm.types.frozen import FrozenDict
 from mint_litellm.types.identity import Principal
 from mint_litellm.types.reason_codes import (
     OBSERVATION_CANDIDATES,
@@ -463,6 +464,11 @@ class DecisionSnapshot(BaseModel):
     revoked_after_snapshot: bool | None = None
     revocation_check: RevocationCheck | None = None
     missing_reasons: dict[str, str] = {}
+
+    @field_validator("missing_reasons", mode="after")
+    @classmethod
+    def _freeze_missing_reasons(cls, value: dict[str, str]) -> FrozenDict:
+        return FrozenDict(value)
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:

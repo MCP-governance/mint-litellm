@@ -9,9 +9,10 @@ from enum import StrEnum
 from typing import Any, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from mint_litellm.types.decision import DecisionSnapshot, OperationType, RevocationCheck
+from mint_litellm.types.frozen import json_value
 from mint_litellm.types.ids import new_uuid7
 
 
@@ -153,6 +154,11 @@ class Event(BaseModel):
     subject: dict[str, Any] | None = None
     payload: dict[str, Any]
     evidence: Evidence = Evidence.DB
+
+    @field_validator("subject", "payload", mode="after")
+    @classmethod
+    def _json_only(cls, value: dict[str, Any] | None) -> Any:
+        return None if value is None else json_value(value)
 
     @model_validator(mode="after")
     def _source_key_matches(self) -> Self:

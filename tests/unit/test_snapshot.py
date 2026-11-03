@@ -234,3 +234,12 @@ def test_missing_reason_must_match_completely():
     base = snapshot().missing_reasons
     with pytest.raises(ValidationError):
         snapshot(missing_reasons={**base, "consumed_call_approval_id": "not_applicable\n"})
+
+
+def test_snapshot_missing_reasons_cannot_be_cleared_after_validation():
+    snap = snapshot()
+    with pytest.raises(TypeError):
+        snap.missing_reasons.clear()
+    with pytest.raises(TypeError):
+        snap.missing_reasons["state_epoch"] = "not_reached"
+    assert "revoked_after_snapshot" in snap.missing_reasons

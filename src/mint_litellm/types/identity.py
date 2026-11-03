@@ -4,7 +4,9 @@ from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+from mint_litellm.types.frozen import FrozenDict
 
 
 class PrincipalType(StrEnum):
@@ -56,6 +58,11 @@ class Principal(BaseModel):
     team_id: str | None = None
     claimed_end_user_id: str | None = None
     provenance: dict[str, Provenance] = {}
+
+    @field_validator("provenance", mode="after")
+    @classmethod
+    def _freeze_provenance(cls, value: dict[str, "Provenance"]) -> FrozenDict:
+        return FrozenDict(value)
 
     @property
     def user_id(self) -> str | None:
@@ -200,6 +207,7 @@ def with_org(principal: Principal, derivation: OrgDerivation) -> Principal:
         provenance.pop("org_id", None)
     else:
         provenance["org_id"] = Provenance.DERIVED
+    provenance = FrozenDict(provenance)
     return principal.model_copy(
         update={
             "org_id": derivation.org_id,
