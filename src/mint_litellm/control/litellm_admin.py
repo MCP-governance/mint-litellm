@@ -1,0 +1,107 @@
+"""LiteLLM 관리 API 읽기 전용 클라이언트.
+
+제어 평면 키는 ``allowed_routes``로 읽기 경로만 열려 있고, 이 클라이언트는 GET만 보낸다.
+응답에서 자격 열은 수신 즉시 버린다.
+"""
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+from mint_litellm.control.errors import ControlError
+from mint_litellm.types.cli_commands import LITELLM_CREDENTIAL_FIELDS
+
+_CREDENTIALS = frozenset(LITELLM_CREDENTIAL_FIELDS)
+PAGE_SIZE = 100
+
+
+class LiteLLMError(ControlError):
+    pass
+
+
+def scrub(value: Any) -> Any:
+    """자격 열을 모든 깊이에서 제거한 사본."""
+    if isinstance(value, dict):
+        return {k: scrub(v) for k, v in value.items() if k not in _CREDENTIALS}
+    if isinstance(value, list):
+        return [scrub(v) for v in value]
+    return value
+
+
+class LiteLLMAdmin:
+    def __init__(self, base_url: str, api_key: str, timeout: float = 10.0) -> None:
+        self._base = base_url.rstrip("/")
+        self._key = api_key
+        self._timeout = timeout
+
+    def _get(self, path: str, params: dict[str, Any] | None = None) -> tuple[int, Any]:
+        query = f"?{urllib.parse.urlencode(params)}" if params else ""
+        request = urllib.request.Request(
+            f"{self._base}{path}{query}", headers={"Authorization": f"Bearer {self._key}"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                status, raw = response.status, response.read()
+        except urllib.error.HTTPError as error:
+            status, raw = error.code, error.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise LiteLLMError(f"LiteLLM 관리 API에 연결할 수 없습니다: {error}") from None
+        try:
+            body = scrub(json.loads(raw)) if raw else None
+        except ValueError:
+            body = None
+        return status, body
+
+    def _ok(self, path: str, params: dict[str, Any] | None = None, *, missing_ok: bool = False):
+        status, body = self._get(path, params)
+        if status == 200:
+            return body
+        if status == 404 and missing_ok:
+            return None
+        if status in (401, 403):
+            raise LiteLLMError(
+                f"제어 평면 키로 {path}를 읽을 수 없습니다(HTTP {status}). "
+                "키의 allowed_routes와 proxy_admin 권한을 확인하십시오."
+            )
+        raise LiteLLMError(f"LiteLLM {path} 응답이 올바르지 않습니다(HTTP {status}).")
+
+    def list_servers(self) -> list[dict]:
+        return self._ok("/v1/mcp/server")
+
+    def get_server(self, server_id: str) -> dict | None:
+        quoted = urllib.parse.quote(server_id, safe="")
+        return self._ok(f"/v1/mcp/server/{quoted}", missing_ok=True)
+
+    def get_user(self, user_id: str) -> dict | None:
+        """``user_info`` 객체. 사용자가 없으면 None."""
+        body = self._ok("/user/info", {"user_id": user_id}, missing_ok=True)
+        return None if body is None else body.get("user_info")
+
+    def get_key(self, key_id: str) -> dict | None:
+        body = self._ok("/key/info", {"key": key_id}, missing_ok=True)
+        return None if body is None else body.get("info")
+
+    def get_team(self, team_id: str) -> dict | None:
+        body = self._ok("/team/info", {"team_id": team_id}, missing_ok=True)
+        return None if body is None else body.get("team_info")
+
+    def list_keys(self) -> list[dict]:
+        """메타데이터와 객체 권한을 포함한 전체 객체. ``return_full_object``가 필요하다."""
+        keys: list[dict] = []
+        page = 1
+        while True:
+            body = self._ok(
+                "/key/list", {"return_full_object": "true", "size": PAGE_SIZE, "page": page}
+            )
+            keys.extend(k for k in body["keys"] if isinstance(k, dict))
+            if page >= body.get("total_pages", 1):
+                return keys
+            page += 1
+
+    def list_teams(self) -> list[dict]:
+        return self._ok("/team/list")
+
+    def list_guardrails(self) -> list[dict]:
+        return self._ok("/guardrails/list")["guardrails"]
