@@ -64,7 +64,7 @@ COMMANDS: tuple[CliCommand, ...] = (
     CliCommand(
         path=("init",),
         summary="LiteLLM 설정 조각(권장 설정 포함)을 만들고 기본 조직을 준비한다. "
-        "--no-spend-logs를 주면 disable_spend_logs: true를 포함한다.",
+        "`--no-spend-logs`를 주면 `disable_spend_logs: true`를 포함한다.",
         roles=frozenset(),
         unauthenticated=True,
     ),
@@ -83,8 +83,8 @@ COMMANDS: tuple[CliCommand, ...] = (
     ),
     CliCommand(
         path=("operator", "add"),
-        summary="운영자를 등록하고 토큰을 발급한다. admin·approver는 LiteLLM 사용자 식별자 "
-        "결속이 필수이다.",
+        summary="운영자를 등록하고 토큰을 발급한다. `admin`·`approver`는 LiteLLM 사용자 식별자 "
+        "(`--user-id`) 결속이 필수이다.",
         roles=ADMIN_ONLY,
         litellm_reads=("/user/info",),
         events=(EventKind.OPERATOR_ADDED,),
@@ -129,14 +129,14 @@ COMMANDS: tuple[CliCommand, ...] = (
         events=(EventKind.DENIAL_CREATED,),
     ),
     CliCommand(
-        path=("deny", "lift"),
+        path=("denial", "lift"),
         summary="거부를 해제한다.",
         roles=APPROVER_UP,
         events=(EventKind.DENIAL_LIFTED,),
     ),
     CliCommand(
         path=("revoke",),
-        summary="승인을 철회한다. --deny를 주면 같은 범위의 거부를 함께 만든다.",
+        summary="승인을 철회한다. `--deny`를 주면 같은 범위의 거부를 함께 만든다.",
         roles=APPROVER_UP,
         events=(EventKind.APPROVAL_REVOKED, EventKind.DENIAL_CREATED),
     ),

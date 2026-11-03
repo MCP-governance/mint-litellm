@@ -105,13 +105,13 @@ class SelfCheckItem(IntEnum):
 
 SELF_CHECK_DESCRIPTIONS: dict[SelfCheckItem, str] = {
     SelfCheckItem.CALLBACK_REGISTERED: "MINT 로거가 LiteLLM 콜백에 등록되어 있다.",
-    SelfCheckItem.GUARDRAIL_MODES: "MINT 가드레일이 두 모드로 등록되어 있고 default_on이다.",
+    SelfCheckItem.GUARDRAIL_MODES: "MINT 가드레일이 두 모드로 등록되어 있고 `default_on`이다.",
     SelfCheckItem.GUARDRAIL_ORDER: "MINT 가드레일이 사전 훅 순서의 마지막이다.",
     SelfCheckItem.KEY_ACCESS_STRICT: (
-        "통제 서버가 allow_all_keys: false이고 require_key_mcp_access_defined가 true이다."
+        "통제 서버가 `allow_all_keys: false`이고 `require_key_mcp_access_defined`가 true이다."
     ),
     SelfCheckItem.SERVER_REGISTRY_MATCH: (
-        "통제 서버의 server_id가 레지스트리에 있고 계약 값(URL 해시·전송 방식·인증 방식)과 같다."
+        "통제 서버의 `server_id`가 레지스트리에 있고 계약 값(URL 해시·전송 방식·인증 방식)과 같다."
     ),
     SelfCheckItem.NAME_ALIAS_UNIQUE: "설정과 DB를 합친 서버의 이름·별칭이 전역에서 유일하다.",
     SelfCheckItem.COMPAT_SYMBOLS: "호환 계층이 쓰는 LiteLLM 비공개 심볼이 모두 존재한다.",
