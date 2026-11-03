@@ -1,0 +1,29 @@
+# 첫 up에서 config/litellm.config.yaml로 복사된다. 통제할 MCP 서버는 server_id를 명시해 추가한다.
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+  require_key_mcp_access_defined: true
+  mcp_allow_all_keys_respects_mcp_scope: true
+  store_prompts_in_spend_logs: false
+
+guardrails:
+  - guardrail_name: mint
+    litellm_params:
+      guardrail: mint_litellm.plugin.guardrail.MintGuardrail
+      mode: [pre_mcp_call, post_mcp_call]
+      default_on: true
+
+litellm_settings:
+  callbacks: [mint_litellm.plugin.logger.mint_logger]
+  user_url_validation: true
+  key_generation_settings:
+    personal_key_generation:
+      allowed_user_roles: [proxy_admin]
+
+# mcp_servers:
+#   docs:
+#     server_id: docs
+#     url: https://docs.example.com/mcp
+#     transport: http
+#     allow_all_keys: false

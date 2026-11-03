@@ -1,0 +1,15 @@
+# LiteLLM 공식 이미지(판본·다이제스트 고정)에 MINT를 설치한 이미지.
+ARG LITELLM_IMAGE=ghcr.io/berriai/litellm-database@sha256:7ef0e78fe00ad5ea7ea45666cc1d1f02cb7076aee69091543bf397de52db33ce
+
+FROM python:3.13-slim AS build
+COPY pyproject.toml README.md LICENSE /src/
+COPY src /src/src
+RUN pip wheel --no-deps --wheel-dir /wheels /src
+
+FROM ${LITELLM_IMAGE}
+COPY --from=build /wheels /tmp/wheels
+# 의존 패키지(pydantic, psycopg, pyyaml)는 LiteLLM 이미지에 이미 있다.
+RUN python -m ensurepip \
+    && python -m pip install --no-deps --no-index /tmp/wheels/*.whl \
+    && python -m pip uninstall -y pip \
+    && rm -rf /tmp/wheels
