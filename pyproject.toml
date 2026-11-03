@@ -17,6 +17,8 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.7,<3",
+    "psycopg[binary]>=3.2",
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +32,9 @@ dev = [
 
 [project.urls]
 Repository = "https://github.com/MCP-governance/mint-litellm"
+
+[project.scripts]
+mint-litellm = "mint_litellm.cli:main"
 
 [tool.hatch.version]
 path = "src/mint_litellm/__init__.py"
