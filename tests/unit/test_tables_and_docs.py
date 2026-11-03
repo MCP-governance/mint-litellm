@@ -173,6 +173,7 @@ def test_limits_doc_covers_the_declared_limitations():
         "서비스 계정 표식",
         "unbound_keys",
         "확인하지 않았다",
+        "정규화하지 않음",
     ):
         assert needle in doc, needle
 

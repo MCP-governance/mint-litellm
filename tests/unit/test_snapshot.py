@@ -1,4 +1,6 @@
+import hashlib
 from datetime import UTC, datetime
+from enum import Enum
 from uuid import UUID
 
 import pytest
@@ -16,6 +18,8 @@ from mint_litellm.types.decision import (
     PolicyDecision,
     ResolvedServer,
     StageResult,
+    normalize_auth_type,
+    url_sha256,
 )
 from mint_litellm.types.events import EventKind, decision_event
 from mint_litellm.types.identity import Principal, PrincipalType, Provenance
@@ -243,3 +247,69 @@ def test_snapshot_missing_reasons_cannot_be_cleared_after_validation():
     with pytest.raises(TypeError):
         snap.missing_reasons["state_epoch"] = "not_reached"
     assert "revoked_after_snapshot" in snap.missing_reasons
+
+
+def test_url_hash_is_the_unnormalized_utf8_sha256():
+    assert url_sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    base = "https://example.com/mcp"
+    hashes = {url_sha256(u) for u in (base, base + "/", base.upper(), "https://EXAMPLE.com/mcp")}
+    assert len(hashes) == 4
+    assert (
+        url_sha256("https://예시.kr/mcp")
+        == hashlib.sha256("https://예시.kr/mcp".encode()).hexdigest()
+    )
+
+
+class _AuthType(str, Enum):  # noqa: UP042 - LiteLLM의 인증 방식 열거형과 같은 정의
+    NONE = "none"
+    API_KEY = "api_key"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "none"),
+        ("bearer_token", "bearer_token"),
+        ("API_KEY", "API_KEY"),
+        ("none", "none"),
+        (_AuthType.API_KEY, "api_key"),
+        (_AuthType.NONE, "none"),
+    ],
+)
+def test_auth_type_normalization(value, expected):
+    assert normalize_auth_type(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", 3])
+def test_auth_type_rejects_empty_or_non_string_values(value):
+    with pytest.raises(ValueError):
+        normalize_auth_type(value)
+
+
+def test_resolved_server_contract_comparison_needs_all_three_values():
+    resolved = ResolvedServer(
+        server_id="s",
+        url_sha256=url_sha256("https://example.com/mcp"),
+        transport="http",
+        auth_type=normalize_auth_type(None),
+        candidates_with_same_name=1,
+    )
+    same = {
+        "url_sha256": url_sha256("https://example.com/mcp"),
+        "transport": "http",
+        "auth_type": "none",
+    }
+    assert resolved.matches_contract(**same)
+    assert not resolved.matches_contract(
+        **{**same, "url_sha256": url_sha256("https://example.com/mcp/")}
+    )
+    assert not resolved.matches_contract(**{**same, "transport": "sse"})
+    assert not resolved.matches_contract(**{**same, "auth_type": "bearer_token"})
+    with pytest.raises(ValidationError):
+        ResolvedServer(
+            server_id="s",
+            url_sha256="XYZ",
+            transport="http",
+            auth_type="none",
+            candidates_with_same_name=1,
+        )

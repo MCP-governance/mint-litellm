@@ -120,7 +120,9 @@ CREATE TABLE mint.org_bindings (
 -- ---------------------------------------------------------------------------
 
 -- server_id는 LiteLLM 서버 식별자이고 id는 MINT 행 식별자(사건 키에 쓴다).
--- url_sha256·transport·auth_type은 승인된 배포 계약 값이다.
+-- url_sha256·transport·auth_type은 승인된 배포 계약 값이다. url_sha256은 레지스트리 url
+-- 문자열(UTF-8)의 SHA-256을 정규화 없이 쓰고, transport·auth_type은 LiteLLM 값 그대로이며
+-- 인증이 없는 서버의 auth_type은 문자열 none이다.
 CREATE TABLE mint.servers (
     id                  uuid PRIMARY KEY,
     instance_id         mint.ident NOT NULL,

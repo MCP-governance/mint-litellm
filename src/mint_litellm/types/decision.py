@@ -4,9 +4,10 @@
 불가 사유만 ``stop``으로 이후 단계를 건너뛴다. 최종 집행은 ``conclude``가 정한다.
 """
 
+import hashlib
 import re
 from collections.abc import Iterable
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Self
 from uuid import UUID
 
@@ -372,19 +373,47 @@ class RevocationCheck(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+def url_sha256(url: str) -> str:
+    """서버 계약 값의 URL 해시: 레지스트리 ``url`` 문자열의 UTF-8 바이트에 대한 SHA-256.
+
+    끝 슬래시와 대소문자를 포함해 정규화하지 않는다. 호환 계층과 서버 등록이 같은 함수를 쓴다.
+    """
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def normalize_auth_type(value: str | Enum | None) -> str:
+    """서버 계약 값의 인증 방식. 무인증(``None``)은 문자열 ``none``이고 나머지는 그대로이다."""
+    if value is None:
+        return "none"
+    text = value.value if isinstance(value, Enum) else value
+    if not isinstance(text, str) or not text:
+        raise ValueError("auth_type must be a non-empty string or None")
+    return text
+
+
 class ResolvedServer(BaseModel):
     """호환 계층이 실행 단계와 같은 해석 함수로 얻은 서버.
 
     ``candidates_with_same_name``이 2 이상이면 같은 이름·별칭의 서버가 여럿이라는 뜻이다.
+    ``url_sha256``은 ``url_sha256()``, ``auth_type``은 ``normalize_auth_type()``의 결과이고
+    ``transport``는 LiteLLM 값 그대로이다.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    server_id: str
-    url_sha256: str
-    transport: str
-    auth_type: str
+    server_id: str = Field(min_length=1)
+    url_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    transport: str = Field(min_length=1)
+    auth_type: str = Field(min_length=1)
     candidates_with_same_name: int = Field(ge=1)
+
+    def matches_contract(self, *, url_sha256: str, transport: str, auth_type: str) -> bool:
+        """저장된 계약 값과 세 값이 모두 같은지. 하나라도 다르면 서버 식별 불일치이다."""
+        return (self.url_sha256, self.transport, self.auth_type) == (
+            url_sha256,
+            transport,
+            auth_type,
+        )
 
 
 class MintContext(BaseModel):
