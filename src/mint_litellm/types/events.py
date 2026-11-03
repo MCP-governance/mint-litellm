@@ -108,9 +108,10 @@ CONTROL_ENTITY: dict[EventKind, str] = {
     EventKind.OPERATOR_ADDED: "operator",
 }
 
-_ENTITY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ENTITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _CONTROL_KEY = re.compile(
-    r"^(?P<entity>[a-z_]+):(?P<id>[A-Za-z0-9][A-Za-z0-9._-]{0,127}):(?P<version>\d+):(?P<kind>[a-z_]+)$"
+    r"(?P<entity>[a-z_]+):(?P<id>[A-Za-z0-9][A-Za-z0-9._-]{0,127}):"
+    r"(?P<version>[0-9]+):(?P<kind>[a-z_]+)"
 )
 
 
@@ -126,7 +127,7 @@ def control_source_key(kind: EventKind, entity_id: str, state_version: int) -> s
     entity = CONTROL_ENTITY.get(kind)
     if entity is None:
         raise ValueError(f"{kind.value} is not a control event")
-    if not _ENTITY_ID.match(entity_id):
+    if not _ENTITY_ID.fullmatch(entity_id):
         raise ValueError(f"invalid entity id {entity_id!r}")
     if state_version < 0:
         raise ValueError("state_version must not be negative")
@@ -162,7 +163,7 @@ class Event(BaseModel):
             if self.source_key != expected:
                 raise ValueError(f"source_key must be {expected}")
             return self
-        match = _CONTROL_KEY.match(self.source_key)
+        match = _CONTROL_KEY.fullmatch(self.source_key)
         if (
             match is None
             or match["entity"] != CONTROL_ENTITY[self.kind]

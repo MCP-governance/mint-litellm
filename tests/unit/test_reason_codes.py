@@ -103,3 +103,11 @@ def test_observation_candidate_follows_the_family():
     assert is_observation_candidate("APPROVAL_ABSENT")
     assert not is_observation_candidate("APPROVAL_REVOKED")
     assert not is_observation_candidate("SERVER_IDENTITY_AMBIGUOUS")
+
+
+@pytest.mark.parametrize("code", ["POLICY_DETECT_POL-E-07\n", "POLICY_DETECT_POL-E-07\r\n"])
+def test_trailing_line_breaks_are_not_part_of_a_qualifier(code):
+    with pytest.raises(ValueError):
+        parse_reason_code(code)
+    with pytest.raises(ValueError):
+        make_reason_code(Reason.POLICY_DETECT, "POL-E-07\n")

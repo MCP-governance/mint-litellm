@@ -228,3 +228,9 @@ def test_a_pass_placed_in_the_stop_slot_is_rejected():
             evaluated_decision=Action.BLOCK,
             enforced_action=Action.BLOCK,
         )
+
+
+def test_missing_reason_must_match_completely():
+    base = snapshot().missing_reasons
+    with pytest.raises(ValidationError):
+        snapshot(missing_reasons={**base, "consumed_call_approval_id": "not_applicable\n"})

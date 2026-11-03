@@ -203,3 +203,31 @@ def test_bootstrap_operator_event_uses_the_bootstrap_actor():
         payload={},
     )
     assert event.actor == "bootstrap"
+
+
+@pytest.mark.parametrize("bad_id", ["orgA\n", "orgA\r", "org\nA", "٣٣"])
+def test_identifiers_must_match_completely(bad_id):
+    with pytest.raises(ValueError):
+        control_source_key(EventKind.ORG_CREATED, bad_id, 1)
+
+
+def test_a_trailing_newline_in_a_stored_key_is_rejected():
+    key = control_source_key(EventKind.APPROVAL_GRANTED, "a1", 1)
+    with pytest.raises(ValidationError):
+        Event(
+            instance_id="i",
+            inserted_at=NOW,
+            kind=EventKind.APPROVAL_GRANTED,
+            source_key=key + "\n",
+            actor="alice",
+            payload={},
+        )
+    with pytest.raises(ValidationError):
+        Event(
+            instance_id="i",
+            inserted_at=NOW,
+            kind=EventKind.APPROVAL_GRANTED,
+            source_key=key.replace(":1:", ":١:"),
+            actor="alice",
+            payload={},
+        )

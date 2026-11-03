@@ -64,13 +64,13 @@ OBSERVATION_CANDIDATES: frozenset[Reason] = frozenset(
 
 NON_CONVERTIBLE_REASONS: frozenset[Reason] = frozenset(Reason) - OBSERVATION_CANDIDATES
 
-_QUALIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_QUALIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def make_reason_code(reason: Reason, qualifier: str | None = None) -> str:
     """계열 사유와 한정자로 구체 사유 코드를 만든다. 고정 사유에는 한정자를 붙일 수 없다."""
     if reason in PARAMETERIZED_REASONS:
-        if qualifier is None or not _QUALIFIER.match(qualifier):
+        if qualifier is None or not _QUALIFIER.fullmatch(qualifier):
             raise ValueError(f"{reason.value} requires a valid qualifier")
         return f"{reason.value}_{qualifier}"
     if qualifier is not None:
@@ -92,7 +92,7 @@ def parse_reason_code(code: str) -> tuple[Reason, str | None]:
         prefix = f"{family.value}_"
         if code.startswith(prefix):
             qualifier = code[len(prefix) :]
-            if not _QUALIFIER.match(qualifier):
+            if not _QUALIFIER.fullmatch(qualifier):
                 raise ValueError(f"invalid qualifier in reason code {code!r}")
             return family, qualifier
     raise ValueError(f"unknown reason code {code!r}")

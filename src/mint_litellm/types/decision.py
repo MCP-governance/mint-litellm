@@ -420,7 +420,7 @@ MISSING_REASON_FIELDS: tuple[str, ...] = (
     "revocation_check",
 )
 
-_MISSING_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_MISSING_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 
 class DecisionSnapshot(BaseModel):
@@ -488,6 +488,6 @@ class DecisionSnapshot(BaseModel):
         for name, reason in self.missing_reasons.items():
             if name not in MISSING_REASON_FIELDS:
                 raise ValueError(f"missing_reason for unknown field {name}")
-            if not _MISSING_REASON.match(reason):
+            if not _MISSING_REASON.fullmatch(reason):
                 raise ValueError(f"invalid missing_reason for {name}")
         return self
