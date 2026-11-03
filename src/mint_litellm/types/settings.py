@@ -273,11 +273,18 @@ SETTINGS_TABLE: tuple[SettingRow, ...] = (
         reason="없으면 OAuth 메타데이터와 콜백의 기준 주소가 요청의 Host 헤더를 따른다.",
     ),
     SettingRow(
-        key="MCP_TRUSTED_REDIRECT_ORIGINS, use_x_forwarded_for, mcp_trusted_proxy_ranges",
+        key="MCP_TRUSTED_REDIRECT_ORIGINS",
         location=SettingLocation.ENVIRONMENT,
         value="배치에 맞게 설정",
         grade=SettingGrade.RECOMMENDED,
-        reason="리다이렉트 수신처와 역프록시 뒤의 클라이언트 주소 판별을 제한한다.",
+        reason="OAuth 리다이렉트를 받을 수 있는 출처를 제한한다.",
+    ),
+    SettingRow(
+        key="use_x_forwarded_for, mcp_trusted_proxy_ranges",
+        location=SettingLocation.GENERAL_SETTINGS,
+        value="역프록시 뒤라면 함께 설정",
+        grade=SettingGrade.RECOMMENDED,
+        reason="역프록시 뒤에서 클라이언트 주소를 판별할 때 신뢰할 프록시 범위를 제한한다.",
     ),
     SettingRow(
         key="mcp_servers.<이름>.issuer",

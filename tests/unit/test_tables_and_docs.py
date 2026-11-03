@@ -19,6 +19,7 @@ from mint_litellm.types.settings import (
     SETTINGS_TABLE,
     SelfCheckItem,
     SettingGrade,
+    SettingLocation,
 )
 
 ROOT = Path(mint_litellm.__file__).resolve().parents[2]
@@ -52,7 +53,7 @@ def test_row_counts_by_grade():
     counts = {g: sum(r.grade is g for r in SETTINGS_TABLE) for g in SettingGrade}
     assert counts == {
         SettingGrade.REQUIRED: 11,
-        SettingGrade.RECOMMENDED: 9,
+        SettingGrade.RECOMMENDED: 10,
         SettingGrade.OBSERVATION: 1,
     }
 
@@ -211,3 +212,11 @@ def test_observation_items_used_by_rows_are_declared():
     used = {r.observation_item for r in SETTINGS_TABLE if r.observation_item}
     assert used <= set(OBSERVATION_ITEMS)
     assert {"auth_cache_shared", "spend_log_arguments_stored", "unbound_keys"} <= used
+
+
+def test_each_setting_row_has_one_location():
+    by_key = {r.key: r.location for r in SETTINGS_TABLE}
+    assert by_key["MCP_TRUSTED_REDIRECT_ORIGINS"] is SettingLocation.ENVIRONMENT
+    assert (
+        by_key["use_x_forwarded_for, mcp_trusted_proxy_ranges"] is SettingLocation.GENERAL_SETTINGS
+    )
