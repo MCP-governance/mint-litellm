@@ -291,9 +291,7 @@ async def main() -> None:
     servers = [
         uvicorn.Server(uvicorn.Config(mcp_app, host="", port=MCP_PORT, log_level="warning")),
         uvicorn.Server(
-            uvicorn.Config(
-                control_app(server), host="", port=CONTROL_PORT, log_level="warning"
-            )
+            uvicorn.Config(control_app(server), host="", port=CONTROL_PORT, log_level="warning")
         ),
     ]
     await asyncio.gather(*(s.serve() for s in servers))

@@ -1,0 +1,7 @@
+services:
+  litellm1:
+    volumes:
+      - mint-buffer-ro:/var/lib/mint/buffer:ro
+
+volumes:
+  mint-buffer-ro: {}

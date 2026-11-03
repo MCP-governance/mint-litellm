@@ -39,9 +39,10 @@ def url(port: int, path: str = "") -> str:
     return f"http://{HOST}:{port}{path}"
 
 
-def compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+def compose(*args: str, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [*shlex.split(COMPOSE), *args],
+        env={**os.environ, **env} if env else None,
         capture_output=True,
         text=True,
         check=check,

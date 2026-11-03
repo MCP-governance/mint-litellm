@@ -103,3 +103,42 @@ def toxics(stack):
     for toxic in created:
         toxic.clear()
         toxic.enable()
+
+
+@pytest.fixture(scope="session")
+def world(stack):
+    """MINT 플러그인과 제어 평면이 붙은 스택에서 첫 관리자와 제어 평면 키를 만든다."""
+    import scenario
+
+    mint = scenario.Mint()
+    helper = scenario.World(mint)
+    admin_user = helper.litellm_user()
+    mint.token = mint.data("operator", "bootstrap", "--name", "it-admin", "--user-id", admin_user)[
+        "token"
+    ]
+    proxy_admin = httpx.post(
+        support.url(support.LITELLM_PORTS[0], "/user/new"),
+        headers=support.master_headers(),
+        json={"user_id": "it-control", "user_role": "proxy_admin"},
+        timeout=30,
+    )
+    proxy_admin.raise_for_status()
+    routes = [
+        "/v1/mcp/server",
+        "/key/info",
+        "/team/info",
+        "/user/info",
+        "/key/list",
+        "/team/list",
+        "/guardrails/list",
+    ]
+    reply = httpx.post(
+        support.url(support.LITELLM_PORTS[0], "/key/generate"),
+        headers=support.master_headers(),
+        json={"user_id": "it-control", "key_alias": "it-control-key", "allowed_routes": routes},
+        timeout=30,
+    )
+    reply.raise_for_status()
+    mint.env["MINT_LITELLM_KEY"] = reply.json()["key"]
+    helper.control_key = reply.json()["key"]
+    return helper
