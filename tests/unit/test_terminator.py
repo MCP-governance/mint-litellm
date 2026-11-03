@@ -7,9 +7,12 @@ from pydantic import ValidationError
 import mint_litellm
 from mint_litellm.types.decision import (
     SERVER_STATUSES,
+    UNSUPPORTED_STAGE,
     Action,
+    Conclusion,
     PolicyDecision,
     Stage,
+    StageEntry,
     StageResult,
     StageStatus,
     apply_record_failure,
@@ -243,3 +246,81 @@ def test_relation_state_enforcement():
         relation_state_result("paused")
     with pytest.raises(ValueError):
         server_state_result("paused")
+
+
+def test_conclusion_rejects_misplaced_results_and_inconsistent_outcomes():
+    finding = StageResult.finding(Reason.APPROVAL_ABSENT)
+    stop = StageResult.stop(Reason.DENIED)
+    with pytest.raises(ValidationError):
+        Conclusion(evaluated_decision=Action.BLOCK, enforced_action=Action.ALLOW, findings=(stop,))
+    with pytest.raises(ValidationError):
+        Conclusion(
+            evaluated_decision=Action.BLOCK, enforced_action=Action.BLOCK, stop=StageResult.passed()
+        )
+    with pytest.raises(ValidationError):
+        Conclusion(
+            evaluated_decision=Action.ALLOW, enforced_action=Action.ALLOW, findings=(finding,)
+        )
+    with pytest.raises(ValidationError):
+        Conclusion(evaluated_decision=Action.BLOCK, enforced_action=Action.ALLOW, stop=stop)
+    Conclusion(evaluated_decision=Action.BLOCK, enforced_action=Action.ALLOW, findings=(finding,))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"status": StageStatus.PASS, "reason_code": "DENIED"},
+        {"status": StageStatus.SKIPPED, "reason_code": "DENIED", "missing_reason": "x"},
+        {"status": StageStatus.FINDING},
+        {"status": StageStatus.FINDING, "reason_code": "DENIED"},
+        {"status": StageStatus.STOP, "reason_code": "APPROVAL_ABSENT"},
+        {"status": StageStatus.STOP},
+        {"status": StageStatus.PASS, "missing_reason": "not_reached"},
+        {"status": StageStatus.SKIPPED},
+    ],
+)
+def test_stage_entry_rejects_inconsistent_status_and_reason(kwargs):
+    with pytest.raises(ValidationError):
+        StageEntry(stage=Stage.POLICY, **kwargs)
+
+
+def test_stage_entry_accepts_the_legal_shapes():
+    StageEntry(stage=Stage.POLICY, status=StageStatus.PASS)
+    StageEntry(stage=Stage.POLICY, status=StageStatus.FINDING, reason_code="APPROVAL_ABSENT")
+    StageEntry(stage=Stage.POLICY, status=StageStatus.STOP, reason_code="DENIED")
+    StageEntry(stage=Stage.CONTRACT, status=StageStatus.SKIPPED, missing_reason="after_stop")
+
+
+def test_unsupported_contract_stage_is_recorded_without_stopping_the_pipeline():
+    entries = entries_from_results(
+        [
+            (Stage.CONTEXT, StageResult.passed()),
+            (Stage.SNAPSHOT, StageResult.passed()),
+            (Stage.STATE, StageResult.passed()),
+            (Stage.DENIAL_APPROVAL, StageResult.finding(Reason.APPROVAL_ABSENT)),
+            (Stage.CONTRACT, UNSUPPORTED_STAGE),
+            (Stage.POLICY, StageResult.passed()),
+            (Stage.OBLIGATIONS, StageResult.passed()),
+        ]
+    )
+    by_stage = {e.stage: e for e in entries}
+    assert [e.stage for e in entries] == list(Stage)
+    assert by_stage[Stage.CONTRACT].status is StageStatus.SKIPPED
+    assert by_stage[Stage.CONTRACT].missing_reason == "unsupported_stage"
+    assert by_stage[Stage.POLICY].status is StageStatus.PASS
+    assert by_stage[Stage.DENIAL_APPROVAL].status is StageStatus.FINDING
+
+
+def test_explicit_skip_and_stop_together_do_not_duplicate_stages():
+    entries = entries_from_results(
+        [
+            (Stage.CONTEXT, StageResult.passed()),
+            (Stage.CONTRACT, UNSUPPORTED_STAGE),
+            (Stage.STATE, StageResult.stop(Reason.SERVER_SUSPENDED)),
+        ]
+    )
+    stages = [e.stage for e in entries]
+    assert len(stages) == len(set(stages))
+    by_stage = {e.stage: e for e in entries}
+    assert by_stage[Stage.CONTRACT].missing_reason == "unsupported_stage"
+    assert by_stage[Stage.POLICY].missing_reason == "after_stop"

@@ -91,6 +91,22 @@ class Stage(StrEnum):
 STAGE_ORDER: tuple[Stage, ...] = tuple(Stage)
 
 
+def _check_status_reason(status: StageStatus, reason_code: str | None) -> None:
+    """상태와 사유 코드의 조합 검사. finding은 전환 후보, stop은 전환 불가 사유만 가진다."""
+    if status in (StageStatus.PASS, StageStatus.SKIPPED):
+        if reason_code is not None:
+            raise ValueError(f"{status.value} carries no reason_code")
+        return
+    if reason_code is None:
+        raise ValueError(f"{status.value} requires reason_code")
+    family, _ = parse_reason_code(reason_code)
+    candidate = family in OBSERVATION_CANDIDATES
+    if status is StageStatus.FINDING and not candidate:
+        raise ValueError(f"{reason_code} cannot be a finding; use stop")
+    if status is StageStatus.STOP and candidate:
+        raise ValueError(f"{reason_code} cannot be a stop; use finding")
+
+
 class StageResult(BaseModel):
     """한 단계의 결과.
 
@@ -108,18 +124,7 @@ class StageResult(BaseModel):
     def _check(self) -> Self:
         if self.status is StageStatus.SKIPPED:
             raise ValueError("skipped is recorded per stage, not returned by a stage")
-        if self.status is StageStatus.PASS:
-            if self.reason_code is not None:
-                raise ValueError("pass carries no reason_code")
-            return self
-        if self.reason_code is None:
-            raise ValueError(f"{self.status.value} requires reason_code")
-        family, _ = parse_reason_code(self.reason_code)
-        candidate = family in OBSERVATION_CANDIDATES
-        if self.status is StageStatus.FINDING and not candidate:
-            raise ValueError(f"{self.reason_code} cannot be a finding; use stop")
-        if self.status is StageStatus.STOP and candidate:
-            raise ValueError(f"{self.reason_code} cannot be a stop; use finding")
+        _check_status_reason(self.status, self.reason_code)
         return self
 
     @classmethod
@@ -193,20 +198,47 @@ class StageEntry(BaseModel):
     missing_reason: str | None = None
 
     @model_validator(mode="after")
-    def _skipped_explains(self) -> Self:
-        if self.status is StageStatus.SKIPPED and self.missing_reason is None:
-            raise ValueError("skipped stage requires missing_reason")
+    def _consistent(self) -> Self:
+        _check_status_reason(self.status, self.reason_code)
+        skipped = self.status is StageStatus.SKIPPED
+        if skipped != (self.missing_reason is not None):
+            raise ValueError("missing_reason is set exactly when the stage is skipped")
         return self
 
 
-def entries_from_results(results: Iterable[tuple[Stage, StageResult]]) -> tuple[StageEntry, ...]:
-    """단계 결과 목록을 스냅숏 기록으로 바꾼다. ``stop`` 뒤의 단계는 ``skipped``로 채운다."""
+class SkippedStage(BaseModel):
+    """파이프라인이 처음부터 수행하지 않는 단계. 사유와 함께 ``skipped``로 기록된다."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    missing_reason: str
+
+
+UNSUPPORTED_STAGE = SkippedStage(missing_reason="unsupported_stage")
+
+
+def entries_from_results(
+    results: Iterable[tuple[Stage, StageResult | SkippedStage]],
+) -> tuple[StageEntry, ...]:
+    """단계 결과 목록을 스냅숏 기록으로 바꾼다.
+
+    ``SkippedStage``(예: 계약 단계의 ``UNSUPPORTED_STAGE``)는 그대로 ``skipped``로 기록하고
+    진행을 멈추지 않는다. ``stop`` 뒤에 남은 단계는 ``after_stop``으로 ``skipped`` 처리한다.
+    """
     entries: list[StageEntry] = []
     stopped = False
     done: set[Stage] = set()
     for stage, result in results:
         if stopped:
             break
+        if isinstance(result, SkippedStage):
+            entries.append(
+                StageEntry(
+                    stage=stage, status=StageStatus.SKIPPED, missing_reason=result.missing_reason
+                )
+            )
+            done.add(stage)
+            continue
         entries.append(
             StageEntry(
                 stage=stage,
@@ -226,6 +258,24 @@ def entries_from_results(results: Iterable[tuple[Stage, StageResult]]) -> tuple[
     return tuple(entries)
 
 
+def _check_outcome(
+    findings: tuple[StageResult, ...],
+    stop: StageResult | None,
+    evaluated: Action,
+    enforced: Action,
+) -> None:
+    """finding·stop 슬롯의 상태와 평가·집행 결과의 일관성 검사."""
+    if any(f.status is not StageStatus.FINDING for f in findings):
+        raise ValueError("every finding must have status finding")
+    if stop is not None and stop.status is not StageStatus.STOP:
+        raise ValueError("stop must have status stop")
+    blocked = stop is not None or bool(findings)
+    if (evaluated is Action.BLOCK) != blocked:
+        raise ValueError("evaluated_decision disagrees with findings and stop")
+    if stop is not None and enforced is Action.ALLOW:
+        raise ValueError("a stop cannot be enforced as allow")
+
+
 class Conclusion(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -233,6 +283,11 @@ class Conclusion(BaseModel):
     enforced_action: Action
     findings: tuple[StageResult, ...] = ()
     stop: StageResult | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        _check_outcome(self.findings, self.stop, self.evaluated_decision, self.enforced_action)
+        return self
 
 
 def _is_converted(
@@ -419,11 +474,7 @@ class DecisionSnapshot(BaseModel):
         ):
             raise ValueError("decision_ref does not match invocation_id and attempt_id")
 
-        blocked = self.stop is not None or bool(self.findings)
-        if (self.evaluated_decision is Action.BLOCK) != blocked:
-            raise ValueError("evaluated_decision disagrees with findings and stop")
-        if self.stop is not None and self.enforced_action is Action.ALLOW:
-            raise ValueError("a stop cannot be enforced as allow")
+        _check_outcome(self.findings, self.stop, self.evaluated_decision, self.enforced_action)
         if self.findings and self.enforced_action is Action.ALLOW and self.mode is Mode.ENFORCE:
             raise ValueError("findings cannot be enforced as allow in enforce mode")
 

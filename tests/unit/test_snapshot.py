@@ -194,3 +194,37 @@ def test_decision_event_for_discovery_is_per_tool_with_attempt_one():
                 decision_ref=ctx.decision_ref,
             )
         )
+
+
+def test_a_stop_placed_in_the_findings_slot_is_rejected():
+    stop = StageResult.stop(Reason.DENIED)
+    with pytest.raises(ValidationError):
+        snapshot(
+            mode=Mode.OBSERVE,
+            findings=(stop,),
+            stop=None,
+            evaluated_decision=Action.BLOCK,
+            enforced_action=Action.ALLOW,
+        )
+
+
+def test_a_pass_placed_in_the_stop_slot_is_rejected():
+    with pytest.raises(ValidationError):
+        snapshot(
+            stop=StageResult.passed(),
+            evaluated_decision=Action.BLOCK,
+            enforced_action=Action.BLOCK,
+        )
+    with pytest.raises(ValidationError):
+        snapshot(
+            findings=(StageResult.passed(),),
+            evaluated_decision=Action.BLOCK,
+            enforced_action=Action.BLOCK,
+        )
+    with pytest.raises(ValidationError):
+        snapshot(
+            findings=(StageResult.finding(Reason.APPROVAL_ABSENT),),
+            stop=StageResult.finding(Reason.APPROVAL_ABSENT),
+            evaluated_decision=Action.BLOCK,
+            enforced_action=Action.BLOCK,
+        )
