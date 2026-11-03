@@ -89,6 +89,37 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         source=SettingSource.ENV,
         rule="호출별 승인을 요구할 고위험 도구 목록. 저장된 설정으로 덮지 않는다.",
     ),
+    MintSettingRow(
+        key="MINT_DECISION_BUDGET_MS",
+        source=SettingSource.ENV,
+        rule=(
+            "판정 하나의 시간 예산(밀리초, 기본 300). 상태 조회·정책 평가·선기록은 남은 시간만큼만 "
+            "기다리고, 시간 초과는 결과 불명으로 다룬다. 저장된 설정으로 덮지 않는다."
+        ),
+    ),
+    MintSettingRow(
+        key="MINT_SELFCHECK_GRACE_SECONDS",
+        source=SettingSource.ENV,
+        rule=(
+            "기동 뒤 준비 상태와 자가 점검 8항목을 마쳐야 하는 시간(초, 기본 120, 범위 10~600). "
+            "범위 밖이면 기동을 거부하고, 시간 안에 마치지 못하면 사건을 남기고 기동을 중단한다."
+        ),
+    ),
+    MintSettingRow(
+        key="MINT_FINGERPRINT_KEY",
+        source=SettingSource.ENV,
+        rule=(
+            "호출별 승인 인자 지문의 키(32바이트 이상 무작위 값의 base64url). `init`이 만들어 "
+            "저장소 밖 비밀 파일(권한 0600)에 기록한다. 없으면 호출별 승인을 충족할 수 없다."
+        ),
+    ),
+    MintSettingRow(
+        key="MINT_FINGERPRINT_KEY_VERSION",
+        source=SettingSource.ENV,
+        rule=(
+            "지문 키의 판본(기본 1). 승인에 기록된 판본과 다르면 호출별 승인이 다시 필요하다."
+        ),
+    ),
 )
 
 
@@ -111,7 +142,8 @@ SELF_CHECK_DESCRIPTIONS: dict[SelfCheckItem, str] = {
         "통제 서버가 `allow_all_keys: false`이고 `require_key_mcp_access_defined`가 true이다."
     ),
     SelfCheckItem.SERVER_REGISTRY_MATCH: (
-        "통제 서버의 `server_id`가 레지스트리에 있고 계약 값(URL 해시·전송 방식·인증 방식)과 같다."
+        "통제 서버의 `server_id`가 레지스트리에 있다. 계약 값(URL 해시·전송 방식·인증 방식)이 "
+        "다르면 기동은 계속하고 사건으로 남기며, 그 서버의 호출은 차단한다."
     ),
     SelfCheckItem.NAME_ALIAS_UNIQUE: "설정과 DB를 합친 서버의 이름·별칭이 전역에서 유일하다.",
     SelfCheckItem.COMPAT_SYMBOLS: "호환 계층이 쓰는 LiteLLM 비공개 심볼이 모두 존재한다.",
