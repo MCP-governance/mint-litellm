@@ -9,7 +9,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -49,7 +49,13 @@ def _validate_hours(hours: object) -> None:
         raise ValueError("business start must precede end")
 
 
-def prepare_bundle(root: Path, policy_version_id: str, *, opa: str = "opa") -> PreparedBundle:
+def prepare_bundle(
+    root: Path,
+    policy_version_id: str,
+    *,
+    opa: str | Sequence[str] = "opa",
+    opa_policy_path: str | None = None,
+) -> PreparedBundle:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", policy_version_id):
         raise ValueError("invalid policy version")
     root = root.resolve()
@@ -71,7 +77,12 @@ def prepare_bundle(root: Path, policy_version_id: str, *, opa: str = "opa") -> P
     catalog_data = json.loads(catalog)
     if {rule["id"] for rule in catalog_data["rules"]} != {"R1", "R2", "R3", "R4"}:
         raise ValueError("invalid catalog")
-    subprocess.run([opa, "test", str(root / "policy")], check=True, capture_output=True)
+    command = [opa] if isinstance(opa, str) else list(opa)
+    subprocess.run(
+        [*command, "test", opa_policy_path or str(root / "policy")],
+        check=True,
+        capture_output=True,
+    )
     if any((root / name).read_bytes() != content for name, content in contents):
         raise ValueError("bundle changed during validation")
     if (root / "policy" / "catalog.json").read_bytes() != catalog:
@@ -182,3 +193,25 @@ async def activate_bundle(
                 source_key, actor, payload,
             ),
         )
+
+
+async def retry_activation(
+    conn,
+    *,
+    instance_id: str,
+    actor: str,
+    bundle: PreparedBundle,
+    publish: Callable[[bytes], Awaitable[None]],
+    opa_url: str,
+    timeout_seconds: float,
+) -> None:
+    """게시 후 DB 전환이 실패한 validated 판본을 다시 게시하고 활성화한다."""
+    await activate_bundle(
+        conn,
+        instance_id=instance_id,
+        actor=actor,
+        bundle=bundle,
+        publish=publish,
+        opa_url=opa_url,
+        timeout_seconds=timeout_seconds,
+    )
