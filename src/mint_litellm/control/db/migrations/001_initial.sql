@@ -460,6 +460,27 @@ CREATE TRIGGER servers_1_status BEFORE INSERT OR UPDATE ON mint.servers
 CREATE TRIGGER servers_2_frozen BEFORE UPDATE ON mint.servers
     FOR EACH ROW EXECUTE FUNCTION mint.freeze_columns('instance_id', 'server_id');
 
+-- 배열 열은 외래 키를 걸 수 없으므로, 승인 근거로 저장한 허용 목록 항목이 같은 배치에
+-- 실제로 있는지 저장 때 확인한다.
+CREATE FUNCTION mint.check_basis_allowlists() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    wanted uuid[];
+BEGIN
+    SELECT array_agg(DISTINCT ref) INTO wanted FROM unnest(NEW.basis_allowlist_ids) AS ref;
+    IF wanted IS NOT NULL AND cardinality(wanted) <> (
+        SELECT count(*) FROM mint.allowlists a
+        WHERE a.instance_id = NEW.instance_id AND a.id = ANY (wanted)
+    ) THEN
+        RAISE EXCEPTION 'basis_allowlist_ids must reference allowlists of the same instance'
+            USING ERRCODE = 'foreign_key_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER servers_3_basis BEFORE INSERT OR UPDATE OF basis_allowlist_ids ON mint.servers
+    FOR EACH ROW EXECUTE FUNCTION mint.check_basis_allowlists();
+
 CREATE TRIGGER usage_relations_1_status BEFORE INSERT OR UPDATE ON mint.usage_relations
     FOR EACH ROW EXECUTE FUNCTION mint.check_status(
         'active', 'active>terminating,terminating>terminated');

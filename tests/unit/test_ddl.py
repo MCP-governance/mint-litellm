@@ -883,3 +883,42 @@ def test_control_plane_keeps_every_legal_call_approval_transition(db, base, role
         db.execute("RESET ROLE")
     statuses = db.execute("SELECT status FROM mint.call_approvals ORDER BY id").fetchall()
     assert sorted(s[0] for s in statuses) == ["cancelled", "rejected"]
+
+
+def add_allowlist(conn, instance=I, value="example.com"):
+    aid = new_uuid7()
+    conn.execute(
+        "INSERT INTO mint.allowlists (id, instance_id, kind, value, valid_from, valid_until,"
+        " created_by) VALUES (%s, %s, 'provider', %s, %s, %s, 'alice')",
+        (aid, instance, value, NOW, NOW + timedelta(days=30)),
+    )
+    return aid
+
+
+def test_server_basis_must_reference_allowlists_of_its_own_instance(db):
+    own = add_allowlist(db)
+    other = add_allowlist(db, instance="inst2")
+
+    def insert(server_id, basis):
+        db.execute(
+            "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256, transport,"
+            " auth_type, registered_by, basis_allowlist_ids)"
+            " VALUES (%s, %s, %s, 'pending', %s, 'http', 'none', 'alice', %s)",
+            (new_uuid7(), I, server_id, HEX, basis),
+        )
+
+    insert("s-none", [])
+    insert("s-own", [own, own])
+    for index, bad in enumerate(([other], [new_uuid7()], [own, other], [None])):
+        with fails(db, errors.ForeignKeyViolation):
+            insert(f"s-bad-{index}", bad)
+
+
+def test_server_basis_is_checked_again_on_update(db):
+    own = add_allowlist(db)
+    other = add_allowlist(db, instance="inst2")
+    sid = add_server(db)
+    db.execute("UPDATE mint.servers SET basis_allowlist_ids = %s WHERE id = %s", ([own], sid))
+    with fails(db, errors.ForeignKeyViolation):
+        db.execute("UPDATE mint.servers SET basis_allowlist_ids = %s WHERE id = %s", ([other], sid))
+    db.execute("UPDATE mint.servers SET transport = 'sse' WHERE id = %s", (sid,))
