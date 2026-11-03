@@ -561,7 +561,7 @@ def test_server_scoped_denial_must_name_the_server(db, base):
 # ---- 세대와 버전 -------------------------------------------------------------------------
 
 
-def test_every_enforcement_relevant_change_advances_the_epoch(db):
+def test_epoch_advances_for_organization_and_server_changes(db):
     assert epoch(db) == 0
     add_org(db)
     assert epoch(db) == 1
@@ -922,3 +922,143 @@ def test_server_basis_is_checked_again_on_update(db):
     with fails(db, errors.ForeignKeyViolation):
         db.execute("UPDATE mint.servers SET basis_allowlist_ids = %s WHERE id = %s", ([other], sid))
     db.execute("UPDATE mint.servers SET transport = 'sse' WHERE id = %s", (sid,))
+
+
+ENFORCEMENT_TABLES = {
+    "orgs",
+    "org_bindings",
+    "servers",
+    "usage_relations",
+    "allowlists",
+    "policy_versions",
+    "settings",
+    "approvals",
+    "denials",
+    "call_approvals",
+    "consents",
+}
+
+
+def _insert_binding(c, ids):
+    c.execute(
+        "INSERT INTO mint.org_bindings (id, instance_id, org_id, subject_type, subject_id,"
+        " created_by) VALUES (%s, %s, 'orgA', 'team', 'tX', 'alice')",
+        (new_uuid7(), I),
+    )
+
+
+def _insert_denial(c, ids):
+    c.execute(
+        "INSERT INTO mint.denials (id, instance_id, scope_type, scope_id, reason, created_by)"
+        " VALUES (%s, %s, 'user', 'epoch', 'incident', 'alice')",
+        (new_uuid7(), I),
+    )
+
+
+# 표마다 (삽입, 수정, 삭제). 각 함수는 (연결, 기본 데이터)를 받는다.
+EPOCH_CASES = {
+    "orgs": (
+        lambda c, ids: add_org(c, "orgX"),
+        lambda c, ids: c.execute("UPDATE mint.orgs SET name = 'renamed' WHERE org_id = 'orgX'"),
+        lambda c, ids: c.execute("DELETE FROM mint.orgs WHERE org_id = 'orgX'"),
+    ),
+    "org_bindings": (
+        _insert_binding,
+        lambda c, ids: c.execute(
+            "UPDATE mint.org_bindings SET state_version = 1 WHERE subject_id = 'tX'"
+        ),
+        lambda c, ids: c.execute("DELETE FROM mint.org_bindings WHERE subject_id = 'tX'"),
+    ),
+    "servers": (
+        lambda c, ids: add_server(c, "srv-x"),
+        lambda c, ids: c.execute(
+            "UPDATE mint.servers SET transport = 'sse' WHERE server_id = 'srv-x'"
+        ),
+        lambda c, ids: c.execute("DELETE FROM mint.servers WHERE server_id = 'srv-x'"),
+    ),
+    "usage_relations": (
+        lambda c, ids: add_relation(c, purpose="epoch"),
+        lambda c, ids: c.execute(
+            "UPDATE mint.usage_relations SET status = 'terminating' WHERE purpose = 'epoch'"
+        ),
+        lambda c, ids: c.execute("DELETE FROM mint.usage_relations WHERE purpose = 'epoch'"),
+    ),
+    "allowlists": (
+        lambda c, ids: add_allowlist(c, value="epoch.example"),
+        lambda c, ids: c.execute(
+            "UPDATE mint.allowlists SET status = 'lifted' WHERE value = 'epoch.example'"
+        ),
+        lambda c, ids: c.execute("DELETE FROM mint.allowlists WHERE value = 'epoch.example'"),
+    ),
+    "policy_versions": (
+        lambda c, ids: add_policy_version(c, "pv-x"),
+        lambda c, ids: c.execute(
+            "UPDATE mint.policy_versions SET status = 'staged' WHERE id = 'pv-x'"
+        ),
+        lambda c, ids: c.execute("DELETE FROM mint.policy_versions WHERE id = 'pv-x'"),
+    ),
+    "settings": (
+        lambda c, ids: c.execute("INSERT INTO mint.settings (instance_id) VALUES (%s)", (I,)),
+        lambda c, ids: c.execute("UPDATE mint.settings SET mode = 'observe'"),
+        lambda c, ids: c.execute("DELETE FROM mint.settings"),
+    ),
+    "approvals": (
+        lambda c, ids: add_approval(c, ids["relation"], scope_id="epoch"),
+        lambda c, ids: c.execute(
+            "UPDATE mint.approvals SET status = 'expired' WHERE scope_id = 'epoch'"
+        ),
+        lambda c, ids: c.execute("DELETE FROM mint.approvals WHERE scope_id = 'epoch'"),
+    ),
+    "denials": (
+        _insert_denial,
+        lambda c, ids: c.execute(
+            "UPDATE mint.denials SET lifted_at = now(), lifted_by = 'alice'"
+            " WHERE scope_id = 'epoch'"
+        ),
+        lambda c, ids: c.execute("DELETE FROM mint.denials WHERE scope_id = 'epoch'"),
+    ),
+    "call_approvals": (
+        lambda c, ids: add_call_approval(c, fp="e" * 64),
+        lambda c, ids: c.execute(
+            "UPDATE mint.call_approvals SET status = 'approved', approved_by = 'alice'"
+            " WHERE args_fp = %s",
+            ("e" * 64,),
+        ),
+        lambda c, ids: c.execute("DELETE FROM mint.call_approvals WHERE args_fp = %s", ("e" * 64,)),
+    ),
+    "consents": (
+        lambda c, ids: add_consent(c),
+        lambda c, ids: c.execute("UPDATE mint.consents SET revoked_at = now()"),
+        lambda c, ids: c.execute("DELETE FROM mint.consents"),
+    ),
+}
+
+
+def test_epoch_cases_cover_the_enforcement_tables():
+    assert set(EPOCH_CASES) == ENFORCEMENT_TABLES
+
+
+def test_epoch_triggers_exist_on_exactly_the_enforcement_tables(db):
+    rows = db.execute(
+        "SELECT DISTINCT c.relname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid"
+        " JOIN pg_namespace n ON n.oid = c.relnamespace"
+        " WHERE n.nspname = 'mint' AND right(t.tgname, 6) = '_epoch' AND NOT t.tgisinternal"
+    ).fetchall()
+    assert {r[0] for r in rows} == ENFORCEMENT_TABLES
+
+
+@pytest.mark.parametrize("operation", ["insert", "update", "delete"])
+@pytest.mark.parametrize("table", sorted(EPOCH_CASES))
+def test_epoch_follows_each_change_and_is_undone_by_its_rollback(db, base, table, operation):
+    insert, update, delete = EPOCH_CASES[table]
+    if operation != "insert":
+        insert(db, base)
+    run = {"insert": insert, "update": update, "delete": delete}[operation]
+    before = epoch(db)
+    with db.transaction() as tx:
+        run(db, base)
+        assert epoch(db) == before + 1
+        raise psycopg.Rollback(tx)
+    assert epoch(db) == before
+    run(db, base)
+    assert epoch(db) == before + 1
