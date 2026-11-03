@@ -89,6 +89,14 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         source=SettingSource.ENV,
         rule="호출별 승인을 요구할 고위험 도구 목록. 저장된 설정으로 덮지 않는다.",
     ),
+    MintSettingRow(
+        key="MINT_DECISION_BUDGET_MS",
+        source=SettingSource.ENV,
+        rule=(
+            "판정 하나의 시간 예산(밀리초, 기본 300). 상태 조회·정책 평가·선기록이 남은 시간만큼만 "
+            "기다리며, 시간 초과는 결과 불명으로 다룬다. 저장된 설정으로 덮지 않는다."
+        ),
+    ),
 )
 
 
