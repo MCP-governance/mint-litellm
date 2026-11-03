@@ -145,6 +145,42 @@ class StageResult(BaseModel):
         )
 
 
+_SERVER_STATE: dict[str | None, tuple[StageStatus, Reason | None]] = {
+    None: (StageStatus.FINDING, Reason.SERVER_UNREGISTERED),
+    "pending": (StageStatus.FINDING, Reason.SERVER_NOT_APPROVED),
+    "validating": (StageStatus.FINDING, Reason.SERVER_NOT_APPROVED),
+    "awaiting_approval": (StageStatus.FINDING, Reason.SERVER_NOT_APPROVED),
+    "rejected": (StageStatus.STOP, Reason.SERVER_REJECTED),
+    "approved": (StageStatus.PASS, None),
+    "suspended": (StageStatus.STOP, Reason.SERVER_SUSPENDED),
+    "terminating": (StageStatus.STOP, Reason.SERVER_TERMINATED),
+    "terminated": (StageStatus.STOP, Reason.SERVER_TERMINATED),
+}
+
+SERVER_STATUSES: frozenset[str] = frozenset(k for k in _SERVER_STATE if k is not None)
+
+
+def server_state_result(status: str | None) -> StageResult:
+    """서버 상태 집행표. ``None``은 MINT에 등록되지 않은 서버이다."""
+    try:
+        kind, reason = _SERVER_STATE[status]
+    except KeyError:
+        raise ValueError(f"unknown server status {status!r}") from None
+    if kind is StageStatus.PASS or reason is None:
+        return StageResult.passed()
+    make = StageResult.finding if kind is StageStatus.FINDING else StageResult.stop
+    return make(reason)
+
+
+def relation_state_result(status: str) -> StageResult:
+    """이용 관계가 종료 중이거나 종료된 경우, 그 관계의 승인이 주체 범위와 매칭될 때 적용한다."""
+    if status == "active":
+        return StageResult.passed()
+    if status in ("terminating", "terminated"):
+        return StageResult.stop(Reason.RELATION_TERMINATED)
+    raise ValueError(f"unknown relation status {status!r}")
+
+
 class StageEntry(BaseModel):
     """판정 스냅숏에 남기는 단계별 기록. 건너뛴 단계도 ``skipped``로 남는다."""
 
@@ -375,9 +411,12 @@ class DecisionSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
-        if self.decision_ref != MintContext(
-            invocation_id=self.invocation_id, attempt_id=self.attempt_id
-        ).decision_ref:
+        if (
+            self.decision_ref
+            != MintContext(
+                invocation_id=self.invocation_id, attempt_id=self.attempt_id
+            ).decision_ref
+        ):
             raise ValueError("decision_ref does not match invocation_id and attempt_id")
 
         blocked = self.stop is not None or bool(self.findings)
@@ -385,11 +424,7 @@ class DecisionSnapshot(BaseModel):
             raise ValueError("evaluated_decision disagrees with findings and stop")
         if self.stop is not None and self.enforced_action is Action.ALLOW:
             raise ValueError("a stop cannot be enforced as allow")
-        if (
-            self.findings
-            and self.enforced_action is Action.ALLOW
-            and self.mode is Mode.ENFORCE
-        ):
+        if self.findings and self.enforced_action is Action.ALLOW and self.mode is Mode.ENFORCE:
             raise ValueError("findings cannot be enforced as allow in enforce mode")
 
         for name in MISSING_REASON_FIELDS:
