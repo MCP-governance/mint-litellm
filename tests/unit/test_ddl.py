@@ -353,7 +353,7 @@ def test_policy_version_chain_and_single_active(db, base):
             "UPDATE mint.policy_versions SET status = 'active', activated_at = now(),"
             " activated_by = 'alice' WHERE id = 'pv-2'"
         )
-    db.execute("UPDATE mint.policy_versions SET status = 'rolled_back' WHERE id = 'pv-1'")
+    db.execute("UPDATE mint.policy_versions SET status = 'superseded' WHERE id = 'pv-1'")
     db.execute(
         "UPDATE mint.policy_versions SET status = 'active', activated_at = now(),"
         " activated_by = 'alice' WHERE id = 'pv-2'"

@@ -185,7 +185,7 @@ CREATE TABLE mint.policy_versions (
     catalog_sha256 text NOT NULL CHECK (catalog_sha256 ~ '^[0-9a-f]{64}$'),
     bundle_sha256  text NOT NULL CHECK (bundle_sha256 ~ '^[0-9a-f]{64}$'),
     status         text NOT NULL DEFAULT 'validated'
-                   CHECK (status IN ('validated', 'staged', 'active', 'rolled_back')),
+                   CHECK (status IN ('validated', 'staged', 'active', 'superseded')),
     activated_at   timestamptz,
     activated_by   text,
     state_version  bigint NOT NULL DEFAULT 1,
@@ -465,7 +465,7 @@ CREATE TRIGGER allowlists_2_frozen BEFORE UPDATE ON mint.allowlists
 
 CREATE TRIGGER policy_versions_1_status BEFORE INSERT OR UPDATE ON mint.policy_versions
     FOR EACH ROW EXECUTE FUNCTION mint.check_status(
-        'validated', 'validated>staged,staged>active,active>rolled_back');
+        'validated', 'validated>staged,staged>active,active>superseded');
 CREATE TRIGGER policy_versions_2_frozen BEFORE UPDATE ON mint.policy_versions
     FOR EACH ROW EXECUTE FUNCTION mint.freeze_columns(
         'instance_id', 'id', 'catalog_sha256', 'bundle_sha256');
