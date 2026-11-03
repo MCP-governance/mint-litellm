@@ -108,8 +108,8 @@ def test_command_table_is_unique_and_documented():
         assert f"`mint-litellm {command.name}`" in doc, command.name
 
 
-def test_only_init_runs_without_a_token():
-    assert [c.name for c in COMMANDS if c.unauthenticated] == ["init"]
+def test_only_first_setup_commands_run_without_a_token():
+    assert [c.name for c in COMMANDS if c.unauthenticated] == ["init", "operator bootstrap"]
     for command in COMMANDS:
         assert command.unauthenticated == (not command.roles)
 
@@ -191,3 +191,14 @@ def test_schema_defaults_use_the_same_observation_families_as_the_types():
 @pytest.mark.parametrize("kind", list(EventKind))
 def test_event_kinds_satisfy_the_column_check(kind):
     assert re.fullmatch(r"[a-z][a-z_]*", kind.value)
+
+
+def test_bootstrap_and_relation_terminate_commands():
+    by_name = {c.name: c for c in COMMANDS}
+    bootstrap = by_name["operator bootstrap"]
+    assert bootstrap.unauthenticated and bootstrap.roles == frozenset()
+    assert bootstrap.events == (EventKind.OPERATOR_ADDED,)
+    assert bootstrap.litellm_reads == ()
+    terminate = by_name["relation terminate"]
+    assert terminate.roles == frozenset({OperatorRole.ADMIN})
+    assert terminate.events == (EventKind.RELATION_TERMINATING,)

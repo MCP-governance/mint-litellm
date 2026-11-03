@@ -191,3 +191,15 @@ def test_response_observation_rules():
         ResponseObservation(
             is_error=False, revocation_check=RevocationCheck.UNCHANGED, revoked_after_snapshot=True
         )
+
+
+def test_bootstrap_operator_event_uses_the_bootstrap_actor():
+    event = Event(
+        instance_id="i",
+        inserted_at=NOW,
+        kind=EventKind.OPERATOR_ADDED,
+        source_key=control_source_key(EventKind.OPERATOR_ADDED, "first-admin", 1),
+        actor="bootstrap",
+        payload={},
+    )
+    assert event.actor == "bootstrap"

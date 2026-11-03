@@ -90,6 +90,15 @@ COMMANDS: tuple[CliCommand, ...] = (
         events=(EventKind.OPERATOR_ADDED,),
     ),
     CliCommand(
+        path=("operator", "bootstrap"),
+        summary="`operators` 표가 비어 있을 때만 토큰 없이 첫 `admin` 운영자를 만들고 토큰을 "
+        "발급한다. `--name`과 `--user-id`가 필요하며 행위자는 `bootstrap`으로 기록한다. "
+        "운영자가 이미 있으면 거부한다.",
+        roles=frozenset(),
+        unauthenticated=True,
+        events=(EventKind.OPERATOR_ADDED,),
+    ),
+    CliCommand(
         path=("server", "register"),
         summary="LiteLLM에 등록된 서버를 승인 대기 상태로 등록한다.",
         roles=ADMIN_ONLY,
@@ -113,6 +122,13 @@ COMMANDS: tuple[CliCommand, ...] = (
         summary="조직·팀·목적·서버를 묶는 이용 관계를 만든다.",
         roles=ADMIN_ONLY,
         events=(EventKind.RELATION_CREATED,),
+    ),
+    CliCommand(
+        path=("relation", "terminate"),
+        summary="이용 관계를 종료 중으로 바꾼다. 그 관계에 속한 승인과 매칭되는 호출은 "
+        "`RELATION_TERMINATED`로 차단된다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.RELATION_TERMINATING,),
     ),
     CliCommand(
         path=("approve",),

@@ -1,6 +1,6 @@
 # CLI
 
-`mint-litellm`은 운영자용 명령줄 도구이다. `init`을 제외한 모든 명령은 운영자 토큰으로 인증하며, 변경의 행위자는 토큰에 결속된 운영자 이름이다. 모든 변경은 원장에 사건으로 남는다. CLI는 LiteLLM에 쓰지 않는다. LiteLLM 관리 API는 읽기 확인에만 쓴다.
+`mint-litellm`은 운영자용 명령줄 도구이다. `init`과 `operator bootstrap`을 제외한 모든 명령은 운영자 토큰으로 인증하며, 변경의 행위자는 토큰에 결속된 운영자 이름이다. 모든 변경은 원장에 사건으로 남는다. CLI는 LiteLLM에 쓰지 않는다. LiteLLM 관리 API는 읽기 확인에만 쓴다.
 
 ## 역할
 
@@ -10,7 +10,7 @@
 | `approver` | 승인·거부·철회·호출별 승인과 조회 |
 | `viewer` | 조회 |
 
-`admin`과 `approver`는 LiteLLM 사람 사용자 식별자(`--user-id`)에 결속되어야 하고, 등록 시 사용자가 존재하는지 확인한다. 직무 분리는 이 식별자로 판정한다. `approve`는 신청·요청자와 같은 사용자의 운영자가 승인할 수 없고(`--second-approver`로 다른 운영자의 토큰을 함께 제시하면 두 사람 모두 기록하고 허용), 호출별 승인은 호출 주체와 같은 사용자의 운영자가 승인할 수 없다. 같은 사람이 토큰을 여러 개 가져도 사용자 식별자가 같으면 한 사람으로 본다.
+`admin`과 `approver`는 LiteLLM 사람 사용자 식별자(`--user-id`)에 결속되어야 하고, 등록 시 사용자가 존재하는지 확인한다. 직무 분리는 이 식별자로 판정한다. `approve`는 신청·요청자와 같은 사용자의 운영자가 승인할 수 없고(`--second-approver`로 다른 운영자의 토큰을 함께 제시하면 두 사람 모두 기록하고 허용), 호출별 승인은 호출 주체와 같은 사용자의 운영자가 승인할 수 없다. 같은 사람이 토큰을 여러 개 가져도 사용자 식별자가 같으면 한 사람으로 본다. 첫 `admin`은 `operator bootstrap`으로 만든다. 이 명령은 `operators` 표가 비어 있을 때만 토큰 없이 실행되며 그 뒤에는 거부된다.
 
 ## 명령
 
@@ -20,10 +20,12 @@
 | `mint-litellm check` | 모든 역할 | 필수 설정 위반이 있으면 종료 코드 0이 아닌 값으로 끝나고, 권장 설정은 경고하며, 관측 항목 3가지를 출력한다. | `/v1/mcp/server`, `/key/list`, `/team/list`, `/guardrails/list` | - |
 | `mint-litellm status` | 모든 역할 | 모드, 정책 판본, 경보, 관측 항목을 표시한다. | `/v1/mcp/server`, `/key/list`, `/team/list` | - |
 | `mint-litellm operator add` | `admin` | 운영자를 등록하고 토큰을 발급한다. `admin`·`approver`는 LiteLLM 사용자 식별자 (`--user-id`) 결속이 필수이다. | `/user/info` | `operator_added` |
+| `mint-litellm operator bootstrap` | 토큰 불필요 | `operators` 표가 비어 있을 때만 토큰 없이 첫 `admin` 운영자를 만들고 토큰을 발급한다. `--name`과 `--user-id`가 필요하며 행위자는 `bootstrap`으로 기록한다. 운영자가 이미 있으면 거부한다. | - | `operator_added` |
 | `mint-litellm server register` | `admin` | LiteLLM에 등록된 서버를 승인 대기 상태로 등록한다. | `/v1/mcp/server/{server_id}` | `server_registered` |
 | `mint-litellm server suspend` | `admin` | 서버를 중지한다. 중지된 서버의 호출은 차단된다. | - | `server_suspended` |
 | `mint-litellm server resume` | `admin` | 중지한 서버를 다시 승인 상태로 되돌린다. | - | `server_resumed` |
 | `mint-litellm relation add` | `admin` | 조직·팀·목적·서버를 묶는 이용 관계를 만든다. | - | `relation_created` |
+| `mint-litellm relation terminate` | `admin` | 이용 관계를 종료 중으로 바꾼다. 그 관계에 속한 승인과 매칭되는 호출은 `RELATION_TERMINATED`로 차단된다. | - | `relation_terminating` |
 | `mint-litellm approve` | `admin`, `approver` | 이용 관계에 속한 승인을 등록한다. 근거와 유효 기간이 필수이며, 대상 권한이 LiteLLM에 서버 식별자 형식으로 있는지 읽어 확인한다. | `/key/info`, `/team/info` | `approval_granted`, `server_approved` |
 | `mint-litellm deny` | `admin`, `approver` | 주체 또는 서버에 대한 거부를 만든다. 거부는 모든 승인보다 우선한다. | - | `denial_created` |
 | `mint-litellm denial lift` | `admin`, `approver` | 거부를 해제한다. | - | `denial_lifted` |
