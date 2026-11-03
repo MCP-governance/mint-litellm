@@ -171,6 +171,7 @@ def test_limits_doc_covers_the_declared_limitations():
         "guardrail_optout_subjects",
         "서비스 계정 표식",
         "unbound_keys",
+        "확인하지 않았다",
     ):
         assert needle in doc, needle
 
