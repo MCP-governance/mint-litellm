@@ -84,11 +84,15 @@ class TestLocalBuffer:
         read, unreadable = LocalBuffer.read(path)
         assert len(read) == 1 and unreadable == 1
 
-    def test_the_open_segment_is_not_claimable_by_its_writer(self, tmp_path):
+    def test_claiming_closes_the_segment_being_written(self, tmp_path):
         buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        assert not buffer.has_pending()
         buffer.append(make_event(1))
-        assert not buffer.has_pending() and buffer.claim() == []
-        buffer.close()
+        assert buffer.has_pending()
+        (claimed,) = buffer.claim()
+        assert [e.source_key for e in LocalBuffer.read(claimed)[0]] == [make_event(1).source_key]
+        assert not buffer.has_pending()
+        buffer.append(make_event(2))
         assert buffer.has_pending()
 
     def test_claim_renames_and_release_gives_the_file_back(self, tmp_path):
@@ -290,7 +294,6 @@ class TestEvidenceRecorder:
 
         async def scenario():
             await rec.record(make_event(1))
-            buffer.close()
             store.fail = None
             await rec.record(make_event(2))
             await asyncio.sleep(0.2)

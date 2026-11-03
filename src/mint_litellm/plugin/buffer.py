@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import os
 import sys
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -81,6 +82,7 @@ class LocalBuffer:
         self._size = 0
         self._dropped_events = 0
         self._dropped_files = 0
+        self._lock = threading.RLock()
 
     def append(self, event: Event) -> None:
         line = event.to_json_line()
@@ -104,32 +106,43 @@ class LocalBuffer:
             raise BufferWriteError(f"{type(exc).__name__}") from exc
 
     def take_overflow(self) -> Overflow | None:
-        if not self._dropped_files:
-            return None
-        report = Overflow(self._dropped_events, self._dropped_files)
-        self._dropped_events = self._dropped_files = 0
-        return report
+        with self._lock:
+            if not self._dropped_files:
+                return None
+            report = Overflow(self._dropped_events, self._dropped_files)
+            self._dropped_events = self._dropped_files = 0
+            return report
 
     def close(self) -> None:
-        self._close_current()
+        with self._lock:
+            self._close_current()
 
     def has_pending(self) -> bool:
-        try:
-            return any(self._claimable())
-        except OSError:
-            return False
+        with self._lock:
+            if self._handle is not None and self._size > 0:
+                return True
+            try:
+                return any(self._claimable())
+            except OSError:
+                return False
 
     def claim(self) -> list[Path]:
-        """다시 적재할 닫힌 파일과 주인이 없어진 열린 파일을 가져온다(이름을 바꿔 소유한다)."""
-        claimed: list[Path] = []
-        for path in self._claimable():
-            target = path.with_name(f"{path.name}{_REPLAYING}.{self._owner}")
-            try:
-                os.rename(path, target)
-            except OSError:
-                continue
-            claimed.append(target)
-        return claimed
+        """다시 적재할 파일을 가져온다(이름을 바꿔 소유한다).
+
+        지금 쓰고 있는 파일도 닫아서 포함한다. 닫지 않으면 쓰는 프로세스가 살아 있는 동안 그
+        파일의 사건은 다시 적재되지 않는다. 주인이 없어진 열린 파일도 가져온다.
+        """
+        with self._lock:
+            self._close_current()
+            claimed: list[Path] = []
+            for path in self._claimable():
+                target = path.with_name(f"{path.name}{_REPLAYING}.{self._owner}")
+                try:
+                    os.rename(path, target)
+                except OSError:
+                    continue
+                claimed.append(target)
+            return claimed
 
     def release(self, path: Path) -> None:
         """재적재를 마치지 못한 파일을 다시 닫힌 파일로 돌려놓는다."""
