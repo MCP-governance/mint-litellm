@@ -26,6 +26,7 @@ dev = [
     "ruff>=0.6",
     "pyflakes>=3.2",
     "psycopg[binary]>=3.2",
+    "mcp==1.30.0",
 ]
 
 [project.urls]

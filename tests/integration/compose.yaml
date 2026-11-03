@@ -1,0 +1,152 @@
+name: mint-e
+
+# 통합 시험 전용 스택. 시험 서버는 제품 배포·승인 목록 밖이며 이 파일에서만 쓴다.
+# 네트워크: front(LiteLLM·계수 프록시·Postgres·OPA)와 back(계수 프록시·Toxiproxy·시험 서버)을 나눠
+# LiteLLM이 시험 서버에 계수 프록시를 거치지 않고는 닿을 수 없게 한다.
+
+x-litellm: &litellm
+  image: ghcr.io/berriai/litellm-database:v1.106.6@sha256:7ef0e78fe00ad5ea7ea45666cc1d1f02cb7076aee69091543bf397de52db33ce
+  environment: &litellm-env
+    LITELLM_MASTER_KEY: ${MINT_E_MASTER_KEY:-sk-integration-master}
+    LITELLM_SALT_KEY: ${MINT_E_SALT_KEY:-sk-integration-salt}
+    DATABASE_URL: postgresql://postgres:${MINT_E_DB_PASSWORD:-integration-db}@postgres:5432/litellm
+    LITELLM_LOG: INFO
+    PYTHONPATH: /opt/mint/src
+  volumes:
+    - ${MINT_E_LITELLM_CONFIG:-./config/litellm.base.yaml}:/app/config.yaml:ro
+    - ../../src:/opt/mint/src:ro
+  command: ["--config", "/app/config.yaml", "--port", "4000"]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:4000/health/readiness', timeout=3).read()"]
+    interval: 5s
+    timeout: 5s
+    retries: 60
+    start_period: 30s
+  networks: [front]
+
+x-testserver: &testserver
+  build:
+    context: ./mcp_testserver
+    args:
+      MCP_VERSION: "1.30.0"
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:9001/health', timeout=3).read()"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+  networks: [back]
+
+services:
+  postgres:
+    image: postgres:16@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${MINT_E_DB_PASSWORD:-integration-db}
+      POSTGRES_DB: litellm
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/10-mint.sql:ro
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4132:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d litellm && psql -U postgres -d mint -c 'select 1' >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks: [front]
+
+  opa:
+    image: openpolicyagent/opa:1.21.4@sha256:12420358d3f22a0cd2424ddc44a16e292ecb42825d3dfbca779986006822a3f6
+    command: ["run", "--server", "--addr=:8181"]
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4181:8181"
+    networks: [front]
+
+  testserver-a:
+    <<: *testserver
+    environment:
+      INSTANCE_ID: upstream-a
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4191:9001"
+
+  testserver-b:
+    <<: *testserver
+    environment:
+      INSTANCE_ID: upstream-b
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4192:9001"
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    command: ["-host=", "-config=/etc/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/etc/toxiproxy.json:ro
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4174:8474"
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      testserver-a:
+        condition: service_healthy
+      testserver-b:
+        condition: service_healthy
+    networks: [back]
+
+  toxiproxy-db:
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    command: ["-host=", "-config=/etc/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy-db.json:/etc/toxiproxy.json:ro
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4175:8474"
+      - "${MINT_E_PORT_PREFIX:-}4176:8668"
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [front]
+
+  counting-proxy:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    volumes:
+      - ./counting_proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./counting_proxy/mcp_proxy.conf:/etc/nginx/mcp_proxy.conf:ro
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4180:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://counting-proxy:8080/__health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      toxiproxy:
+        condition: service_healthy
+    networks: [front, back]
+
+  litellm1:
+    <<: *litellm
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4101:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      counting-proxy:
+        condition: service_healthy
+
+  litellm2:
+    <<: *litellm
+    ports:
+      - "${MINT_E_PORT_PREFIX:-}4102:4000"
+    depends_on:
+      litellm1:
+        condition: service_healthy
+
+networks:
+  front: {}
+  back: {}
