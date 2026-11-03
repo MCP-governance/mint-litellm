@@ -76,6 +76,23 @@
 
 `init`은 LiteLLM 설정 조각을 `config/litellm.mint.yaml`에 쓴다. `--out <경로>`로 위치를 바꾸고 `--out -`로 표준 출력에 낸다. 통제할 설정 서버는 `--mcp-server <이름>=<URL>`로 줄 수 있으며 `server_id`는 이름과 같게 명시된다.
 
+## 승인 조건과 대상 확인
+
+`approve`는 정책이 읽는 조건을 승인과 함께 저장한다. 승인은 생성한 뒤 조건을 바꿀 수 없으므로 조건이 달라지면 새 승인을 만든다. 조건은 지정한 것만 저장되고 사건에도 그대로 남는다.
+
+| 옵션 | 조건 | 효과 |
+| --- | --- | --- |
+| `--high-risk-tools a,b` | `high_risk_tools` | 나열한 도구는 호출별 승인을 요구한다. |
+| `--business-hours-only` | `business_hours_only` | 업무 시간 밖의 호출을 차단한다. 업무 시간은 정책 번들의 값이다. |
+| `--business-hours 시간대,요일,시작,끝` | `business_hours` | 이 승인의 업무 시간을 재정의한다(예: `Asia/Seoul,1-5,09:00,18:00`, 요일은 1=월 ~ 7=일). `--business-hours-only`와 함께 쓴다. |
+| `--require-consent 목적` | `require_consent` | 그 목적의 동의가 있어야 호출을 허용한다. |
+
+승인 범위(`--scope key|user|team`)의 대상은 LiteLLM에서 읽어 확인한다. 대상이 없거나, `object_permission.mcp_servers`에 서버 식별자가 아닌 항목(별칭·이름)이 있거나, 대상에 해당 서버의 권한(직접 부여 또는 서버가 속한 접근 그룹)이 없으면 승인은 만들어지지 않는다. 이용 관계에 팀이 있으면 `team` 범위는 그 팀, `key` 범위는 팀이 같은 키, `user` 범위는 그 팀에 속한 사용자여야 한다. 팀이 없는 관계에서는 `team` 범위가 그 조직에 묶인 팀이어야 하고, `key`·`user` 범위는 조직 유도 결과(팀 바인딩, 사용자 바인딩, 기본 조직 순)가 관계의 조직과 같아야 한다. `--scope org` 승인은 지원하지 않으므로 조직에 묶인 팀을 `team` 범위로 승인한다.
+
+## 서버 등록의 계약 URL
+
+`server register`는 서버의 URL 해시를 계약 값으로 저장한다. URL은 `--url`, LiteLLM 설정 파일(`--config` 또는 `MINT_LITELLM_CONFIG`의 `mcp_servers.<이름>.url`, `server_id`가 같은 항목), 관리 API 응답 순으로 정하며 출처는 사건의 `url_source`(`operator`, `config_file`, `registry`)에 남는다. 제어 평면 키는 제한된 키라서 관리 API가 URL을 응답하지 않는 것이 보통이다. 둘 이상의 출처가 보이면 모두 같아야 한다. 이미 등록된 서버에 다시 실행하면 계약 값을 갱신한다. `status`는 플러그인이 관측한 계약 불일치(`server_identity_mismatch_observed`)를 서버를 다시 등록하기 전까지 경보로 표시한다.
+
 ## 출력 형식
 
 기본 출력은 사람이 읽는 텍스트이다. `--json`(명령 앞이나 뒤 어디에 두어도 된다)을 주면 표준 출력에 JSON 객체 한 개만 쓴다. 안내와 오류 메시지는 표준 오류로 나간다.
@@ -97,7 +114,7 @@
 | 명령 | 추가 필드 |
 | --- | --- |
 | `init` | `migrations`(이번에 적용한 마이그레이션), `login_roles`(설정한 로그인 역할), `snippet_path`(설정 조각 파일) 또는 `snippet`(`--out -`일 때 본문) |
-| `check` | `findings`(각 항목 `item`, `level`=`OK`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
+| `check` | `incomplete`(확인하지 못한 필수 행), `findings`(각 항목 `item`, `level`=`OK`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
 | `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `servers`(상태별 개수), `alerts`, `observations` |
 | `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`) |
 
@@ -108,6 +125,11 @@
 | 0 | 성공 |
 | 1 | 명령을 수행할 수 없음: 입력 검증 실패, 상태 전이 위반, 직무 분리 위반, LiteLLM 읽기 실패, 데이터베이스 오류, `check`의 필수 설정 위반 |
 | 2 | 명령줄 사용법 오류 |
+| 3 | 실패는 없지만 필수 검증을 모두 수행하지 못함: `check`가 관리 API나 LiteLLM 설치본이 없어 필수 행을 확인하지 못했다(`incomplete`에 항목이 나온다). |
 | 4 | 인증 실패: 토큰이 없거나 틀렸거나 만료됨, 역할 부족 |
 
-`check`는 필수 설정이 하나라도 어긋나면 1로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다. 변경 명령은 한 트랜잭션에서 상태와 사건을 함께 기록하므로, 0이 아닌 코드로 끝난 명령은 아무것도 바꾸지 않는다.
+`check`는 필수 설정이 하나라도 어긋나면 1로 끝나고, 어긋남은 없지만 필수 행을 확인하지 못했으면 3으로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다. 변경 명령은 한 트랜잭션에서 상태와 사건을 함께 기록하므로, 0이 아닌 코드로 끝난 명령은 아무것도 바꾸지 않는다.
+
+## 호출별 승인의 인자 지문
+
+`call-approval request --args-fp`에는 차단 사건에 기록된 지문이나 같은 규칙으로 계산한 값을 넣는다. 지문은 HMAC-SHA256이며 키는 `MINT_FINGERPRINT_KEY`의 UTF-8 바이트, 입력은 호출 인자를 키로 정렬하고 구분자 공백 없이(`,`와 `:`) 비ASCII 문자를 그대로 둔 JSON의 UTF-8 바이트이다. `--fp-key-version`은 `MINT_FINGERPRINT_KEY_VERSION`과 같은 값을 쓴다. 키가 설정되어 있지 않으면 호출별 승인은 항상 요구 상태로 남는다.

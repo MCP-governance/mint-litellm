@@ -1,8 +1,9 @@
 name: mint
 
 services:
+  # PostgreSQL 16.15
   postgres:
-    image: postgres:16
+    image: postgres:16@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD를 .env에 설정하십시오}
       POSTGRES_DB: litellm
@@ -36,12 +37,20 @@ services:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/litellm
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY를 .env에 설정하십시오}
       STORE_MODEL_IN_DB: "True"
-      MINT_DATABASE_URL: postgresql://mint_plugin_app:${MINT_PLUGIN_DB_PASSWORD}@postgres:5432/mint
-      MINT_INSTANCE_ID: ${MINT_INSTANCE_ID:-default}
-      MINT_MODE: ${MINT_MODE:-enforce}
-      MINT_OPA_URL: http://opa:8181
       PROXY_BASE_URL: ${PROXY_BASE_URL:-}
       MCP_TRUSTED_REDIRECT_ORIGINS: ${MCP_TRUSTED_REDIRECT_ORIGINS:-}
+      MINT_INSTANCE_ID: ${MINT_INSTANCE_ID:-default}
+      MINT_MODE: ${MINT_MODE:-enforce}
+      MINT_DATABASE_URL: postgresql://mint_plugin_app:${MINT_PLUGIN_DB_PASSWORD}@postgres:5432/mint
+      MINT_OPA_URL: http://opa:8181
+      MINT_BUFFER_DIR: /var/lib/mint/buffer
+      MINT_BUFFER_MAX_BYTES: ${MINT_BUFFER_MAX_BYTES:-52428800}
+      MINT_DB_POOL_SIZE: ${MINT_DB_POOL_SIZE:-8}
+      MINT_DECISION_BUDGET_MS: ${MINT_DECISION_BUDGET_MS:-300}
+      MINT_FINGERPRINT_KEY: ${MINT_FINGERPRINT_KEY:?MINT_FINGERPRINT_KEY가 필요합니다(mint.sh up이 생성합니다)}
+      MINT_FINGERPRINT_KEY_VERSION: ${MINT_FINGERPRINT_KEY_VERSION:-1}
+      MINT_READINESS_URL: http://localhost:4000/health/readiness
+      MINT_SELFCHECK_GRACE_SECONDS: ${MINT_SELFCHECK_GRACE_SECONDS:-30}
     ports:
       - "${MINT_LITELLM_PORT:-4000}:4000"
     volumes:
