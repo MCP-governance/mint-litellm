@@ -1,7 +1,6 @@
 """정책 판본 활성화. 번들 준비·게시·정책 엔진 일치 확인·활성 전환은 정책 모듈이 수행한다."""
 
 import asyncio
-import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,8 +56,6 @@ def activate(
 
     async def publish(archive: bytes) -> None:
         policy_bundle.publish_bundle(source.bundle_path, archive)
-        # 임시 파일은 소유자만 읽을 수 있는데, 정책 엔진은 다른 사용자로 실행된다.
-        os.chmod(source.bundle_path, 0o644)
 
     async def run() -> None:
         async with await psycopg.AsyncConnection.connect(database_url) as aconn:

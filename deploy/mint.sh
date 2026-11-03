@@ -38,7 +38,6 @@ from mint_litellm.plugin.policy.bundle import prepare_bundle, publish_bundle
 target = Path('${BUNDLE_FILE}')
 if not target.exists():
     publish_bundle(target, prepare_bundle(Path('/opt/mint'), 'initial').archive)
-    target.chmod(0o644)
 "
 }
 
