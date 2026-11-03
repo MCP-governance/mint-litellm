@@ -184,9 +184,6 @@ def test_schema_has_the_fourteen_tables(db):
     assert {r[0] for r in rows} == EXPECTED_TABLES
 
 
-# ---- 상태 전이 ----------------------------------------------------------------------------
-
-
 def test_server_walks_the_full_lifecycle(db):
     add_org(db)
     sid = add_server(db, status="awaiting_approval")
@@ -399,9 +396,6 @@ def test_allowlist_requires_an_end_date_and_expires_one_way(db):
         db.execute("UPDATE mint.allowlists SET status = 'active' WHERE id = %s", (row[0],))
 
 
-# ---- 유일 제약 ---------------------------------------------------------------------------
-
-
 def test_a_team_or_user_binds_to_one_org_only(db):
     add_org(db, "orgA")
     add_org(db, "orgB")
@@ -486,9 +480,6 @@ def test_viewer_may_be_unbound(db):
     )
 
 
-# ---- 동의 --------------------------------------------------------------------------------
-
-
 def add_consent(conn, source="operator_attested", ref="ticket-1", sha=HEX, valid_days=30):
     conn.execute(
         "INSERT INTO mint.consents (id, instance_id, org_id, human_user_id, server_id, purpose,"
@@ -558,9 +549,6 @@ def test_server_scoped_denial_must_name_the_server(db, base):
         db.execute(sql, (new_uuid7(), I, "srv-9", "srv-1"))
 
 
-# ---- 세대와 버전 -------------------------------------------------------------------------
-
-
 def test_epoch_advances_for_organization_and_server_changes(db):
     assert epoch(db) == 0
     add_org(db)
@@ -614,9 +602,6 @@ def test_state_version_is_assigned_by_the_database(db):
     assert scalar(db, "SELECT state_version FROM mint.orgs") == 2
 
 
-# ---- 설정 --------------------------------------------------------------------------------
-
-
 def test_settings_defaults_and_checks(db):
     db.execute("INSERT INTO mint.settings (instance_id) VALUES (%s)", (I,))
     mode, reasons, policies, version = db.execute(
@@ -635,9 +620,6 @@ def test_settings_defaults_and_checks(db):
         db.execute("UPDATE mint.settings SET default_org_id = 'missing'")
     add_org(db)
     db.execute("UPDATE mint.settings SET default_org_id = 'orgA'")
-
-
-# ---- 원장 --------------------------------------------------------------------------------
 
 
 def add_event(conn, key=None, kind="approval_granted", **cols):
@@ -731,9 +713,6 @@ def test_seal_columns_can_be_filled_exactly_once(db):
     db.execute(seal, (b"\x01" * 32, key))
     with fails(db, errors.CheckViolation):
         db.execute(seal, (b"\x02" * 32, key))
-
-
-# ---- 역할 분리 ---------------------------------------------------------------------------
 
 
 def test_plugin_role_reads_state_and_consumes_call_approvals_only(db, base):
