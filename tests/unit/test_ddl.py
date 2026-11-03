@@ -117,7 +117,7 @@ def add_approval(conn, relation, status="active", org="orgA", server="srv-1", **
         "valid_until": NOW + timedelta(days=30),
         "basis": '{"kind": "operator_registered"}',
         "granted_by": "alice" if status != "pending" else None,
-        "requested_by": "bob",
+        "requested_by": "op-1",
         "status": status,
         "revoked_at": NOW if status == "revoked" else None,
         **override,
@@ -134,7 +134,7 @@ def add_call_approval(conn, fp=HEX):
         "INSERT INTO mint.call_approvals (id, instance_id, org_id, principal_type, principal_id,"
         " server_id, tool, args_fp, fp_key_version, policy_version_id, status, requested_by,"
         " expires_at) VALUES"
-        " (%s, %s, 'orgA', 'user', 'u1', 'srv-1', 'write', %s, 1, 'pv-1', 'pending', 'bob', %s)",
+        " (%s, %s, 'orgA', 'user', 'u1', 'srv-1', 'write', %s, 1, 'pv-1', 'pending', 'op-1', %s)",
         (cid, I, fp, NOW + timedelta(minutes=15)),
     )
     return cid
@@ -459,8 +459,8 @@ def test_operator_token_is_unique(db):
     )
     db.execute(sql, (I, "alice", HEX))
     with fails(db, errors.UniqueViolation):
-        db.execute(sql, (I, "bob", HEX))
-    db.execute(sql, (I, "bob", "b" * 64))
+        db.execute(sql, (I, "op-1", HEX))
+    db.execute(sql, (I, "op-1", "b" * 64))
 
 
 @pytest.mark.parametrize("role", ["admin", "approver"])
