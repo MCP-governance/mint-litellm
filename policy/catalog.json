@@ -1,0 +1,8 @@
+{
+  "rules": [
+    {"id":"R1","description":"승인 범위 밖 호출","observable":true,"output":"Block","reference_policies":["POL-I-03","POL-E-01","POL-E-03"]},
+    {"id":"R2","description":"고위험 도구 호출","observable":false,"output":"RequireApproval","reference_policies":["POL-E-07","POL-O-15"]},
+    {"id":"R3","description":"업무 시간 밖 호출","observable":true,"output":"Block","reference_policies":["POL-E-01"]},
+    {"id":"R4","description":"동의 확인","observable":false,"output":"require_consent","reference_policies":["POL-R-15","POL-E-08"]}
+  ]
+}
