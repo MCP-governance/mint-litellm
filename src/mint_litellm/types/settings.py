@@ -143,7 +143,8 @@ class SettingRow(BaseModel):
     value: str
     grade: SettingGrade
     self_checks: tuple[SelfCheckItem, ...] = ()
-    # 프로세스 안에서 원본 설정을 읽지 않아 init·check의 설정 파일 검사로만 확인하는 행
+    # 설정 파일에 명시되었는지는 프로세스 안에서 알 수 없어 init·check가 파일을 검사한다.
+    # 이 행의 self_checks는 프로세스 안에서 대신 확인하는 항목이다.
     file_check_only: bool = False
     observation_item: str | None = None
     reason: str
@@ -179,7 +180,7 @@ SETTINGS_TABLE: tuple[SettingRow, ...] = (
         location=SettingLocation.MCP_SERVERS,
         value="명시",
         grade=SettingGrade.REQUIRED,
-        self_checks=(),
+        self_checks=(SelfCheckItem.SERVER_REGISTRY_MATCH,),
         file_check_only=True,
         reason=(
             "명시하지 않으면 URL이 바뀔 때 식별자가 바뀌어 기존 권한이 어긋난다. "
