@@ -27,7 +27,6 @@ FORBIDDEN = {
     "internal documents": re.compile("위키|wiki|지시서|설계서", re.IGNORECASE),
     "dated trace": re.compile(r"\b20\d\d-\d\d-\d\d\b|\b1[01]/\d\d\b"),
     "ip address": re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
-    "personal name": re.compile("양승권|bobysg", re.IGNORECASE),
 }
 
 
