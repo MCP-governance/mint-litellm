@@ -202,7 +202,7 @@ def test_bootstrap_and_relation_terminate_commands():
     bootstrap = by_name["operator bootstrap"]
     assert bootstrap.unauthenticated and bootstrap.roles == frozenset()
     assert bootstrap.events == (EventKind.OPERATOR_ADDED,)
-    assert bootstrap.litellm_reads == ()
+    assert bootstrap.litellm_reads == ("/user/info",)
     terminate = by_name["relation terminate"]
     assert terminate.roles == frozenset({OperatorRole.ADMIN})
     assert terminate.events == (EventKind.RELATION_TERMINATING,)

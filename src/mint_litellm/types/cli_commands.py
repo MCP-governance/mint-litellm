@@ -92,10 +92,12 @@ COMMANDS: tuple[CliCommand, ...] = (
     CliCommand(
         path=("operator", "bootstrap"),
         summary="`operators` 표가 비어 있을 때만 토큰 없이 첫 `admin` 운영자를 만들고 토큰을 "
-        "발급한다. `--name`과 `--user-id`가 필요하며 행위자는 `bootstrap`으로 기록한다. "
-        "운영자가 이미 있으면 거부한다.",
+        "발급한다. `--name`과 `--user-id`가 필요하며, 사용자가 LiteLLM의 사람 사용자로 "
+        "존재하는지 확인한다. 행위자는 `bootstrap`으로 기록하고, 운영자가 이미 있으면 "
+        "거부한다.",
         roles=frozenset(),
         unauthenticated=True,
+        litellm_reads=("/user/info",),
         events=(EventKind.OPERATOR_ADDED,),
     ),
     CliCommand(
