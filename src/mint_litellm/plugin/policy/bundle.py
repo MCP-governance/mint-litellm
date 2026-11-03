@@ -1,0 +1,217 @@
+"""정책 번들 준비와 활성 판본 전환."""
+
+import asyncio
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import tarfile
+import tempfile
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import httpx
+
+from mint_litellm.types.events import EventKind, control_source_key
+from mint_litellm.types.ids import new_uuid7
+
+
+@dataclass(frozen=True)
+class PreparedBundle:
+    policy_version_id: str
+    bundle_sha256: str
+    catalog_sha256: str
+    archive: bytes
+
+
+def _validate_hours(hours: object) -> None:
+    if not isinstance(hours, dict) or set(hours) != {"tz", "days", "start", "end"}:
+        raise ValueError("invalid business hours")
+    try:
+        ZoneInfo(hours["tz"])
+    except (KeyError, TypeError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("invalid timezone") from exc
+    days = hours["days"]
+    if not isinstance(days, list) or not days or any(
+        type(d) is not int or d not in range(1, 8) for d in days
+    ):
+        raise ValueError("invalid business days")
+    for value in (hours["start"], hours["end"]):
+        if not isinstance(value, str) or not re.fullmatch(
+            r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value
+        ):
+            raise ValueError("invalid business time")
+    if hours["start"] >= hours["end"]:
+        raise ValueError("business start must precede end")
+
+
+def prepare_bundle(
+    root: Path,
+    policy_version_id: str,
+    *,
+    opa: str | Sequence[str] = "opa",
+    opa_policy_path: str | None = None,
+) -> PreparedBundle:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", policy_version_id):
+        raise ValueError("invalid policy version")
+    root = root.resolve()
+    bundle_dir = root / "policy" / "bundle"
+    files = sorted(
+        (p for p in bundle_dir.rglob("*") if p.is_file() and p.suffix in {".rego", ".json"}
+         and p.relative_to(bundle_dir).as_posix() != "mint/meta/data.json"),
+        key=lambda p: p.relative_to(root).as_posix(),
+    )
+    if not files or any(
+        p.is_symlink() or not p.resolve().is_relative_to(bundle_dir) for p in files
+    ):
+        raise ValueError("invalid bundle files")
+    contents = [(p.relative_to(root).as_posix(), p.read_bytes()) for p in files]
+    source = dict(contents)
+    data = json.loads(source["policy/bundle/mint/data/data.json"])
+    _validate_hours(data["business_hours"])
+    catalog = (root / "policy" / "catalog.json").read_bytes()
+    catalog_data = json.loads(catalog)
+    if {rule["id"] for rule in catalog_data["rules"]} != {"R1", "R2", "R3", "R4"}:
+        raise ValueError("invalid catalog")
+    command = [opa] if isinstance(opa, str) else list(opa)
+    subprocess.run(
+        [*command, "test", opa_policy_path or str(root / "policy")],
+        check=True,
+        capture_output=True,
+    )
+    if any((root / name).read_bytes() != content for name, content in contents):
+        raise ValueError("bundle changed during validation")
+    if (root / "policy" / "catalog.json").read_bytes() != catalog:
+        raise ValueError("catalog changed during validation")
+    digest = hashlib.sha256()
+    for name, content in contents:
+        digest.update(name.encode("utf-8") + b"\0" + content + b"\0")
+    sha = digest.hexdigest()
+    meta = json.dumps({"policy_version_id": policy_version_id, "bundle_sha256": sha}).encode()
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+        for name, content in contents + [("policy/bundle/mint/meta/data.json", meta)]:
+            info = tarfile.TarInfo(name.removeprefix("policy/bundle/"))
+            info.size = len(content)
+            info.mtime = 0
+            archive.addfile(info, io.BytesIO(content))
+    return PreparedBundle(
+        policy_version_id, sha, hashlib.sha256(catalog).hexdigest(), stream.getvalue()
+    )
+
+
+def publish_bundle(path: Path, archive: bytes) -> None:
+    path = path.resolve()
+    fd, temp_name = tempfile.mkstemp(prefix=".bundle-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(archive)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+async def register_bundle(conn, *, instance_id: str, bundle: PreparedBundle) -> None:
+    async with conn.transaction():
+        await conn.execute(
+            "INSERT INTO mint.policy_versions "
+            "(instance_id, id, catalog_sha256, bundle_sha256, status) "
+            "VALUES (%s, %s, %s, %s, 'validated')",
+            (instance_id, bundle.policy_version_id, bundle.catalog_sha256, bundle.bundle_sha256),
+        )
+
+
+async def activate_bundle(
+    conn,
+    *,
+    instance_id: str,
+    actor: str,
+    bundle: PreparedBundle,
+    publish: Callable[[bytes], Awaitable[None]],
+    opa_url: str,
+    timeout_seconds: float,
+) -> None:
+    if timeout_seconds <= 0 or not actor:
+        raise ValueError("invalid activation parameters")
+    async with asyncio.timeout(timeout_seconds), conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (instance_id,))
+        cursor = await conn.execute(
+            "SELECT catalog_sha256, bundle_sha256, status FROM mint.policy_versions "
+            "WHERE instance_id = %s AND id = %s FOR UPDATE",
+            (instance_id, bundle.policy_version_id),
+        )
+        row = await cursor.fetchone()
+        if row != (bundle.catalog_sha256, bundle.bundle_sha256, "validated"):
+            raise ValueError("policy version does not match validated bundle")
+        await conn.execute(
+            "UPDATE mint.policy_versions SET status = 'staged' WHERE instance_id = %s AND id = %s",
+            (instance_id, bundle.policy_version_id),
+        )
+        await publish(bundle.archive)
+        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
+            expected = {
+                "policy_version_id": bundle.policy_version_id,
+                "bundle_sha256": bundle.bundle_sha256,
+            }
+            while True:
+                response = await client.get(opa_url.rstrip("/") + "/v1/data/mint/meta")
+                response.raise_for_status()
+                if response.json().get("result") == expected:
+                    break
+                await asyncio.sleep(0.1)
+        await conn.execute(
+            "UPDATE mint.policy_versions SET status = 'superseded' "
+            "WHERE instance_id = %s AND status = 'active'", (instance_id,)
+        )
+        cursor = await conn.execute(
+            "UPDATE mint.policy_versions SET status = 'active', activated_at = now(), "
+            "activated_by = %s "
+            "WHERE instance_id = %s AND id = %s AND status = 'staged' RETURNING state_version",
+            (actor, instance_id, bundle.policy_version_id),
+        )
+        version_row = await cursor.fetchone()
+        if version_row is None:
+            raise ValueError("policy activation failed")
+        source_key = control_source_key(
+            EventKind.POLICY_ACTIVATED, bundle.policy_version_id, version_row[0]
+        )
+        payload = json.dumps(
+            {"policy_version_id": bundle.policy_version_id, "bundle_sha256": bundle.bundle_sha256}
+        )
+        await conn.execute(
+            "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload) "
+            "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+            (
+                new_uuid7(), instance_id, EventKind.POLICY_ACTIVATED.value,
+                source_key, actor, payload,
+            ),
+        )
+
+
+async def retry_activation(
+    conn,
+    *,
+    instance_id: str,
+    actor: str,
+    bundle: PreparedBundle,
+    publish: Callable[[bytes], Awaitable[None]],
+    opa_url: str,
+    timeout_seconds: float,
+) -> None:
+    """게시 후 DB 전환이 실패한 validated 판본을 다시 게시하고 활성화한다."""
+    await activate_bundle(
+        conn,
+        instance_id=instance_id,
+        actor=actor,
+        bundle=bundle,
+        publish=publish,
+        opa_url=opa_url,
+        timeout_seconds=timeout_seconds,
+    )
