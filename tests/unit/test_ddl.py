@@ -654,10 +654,33 @@ def add_event(conn, key=None, kind="approval_granted", **cols):
     names = ", ".join(row)
     marks = ", ".join(["%s"] * len(row))
     cur = conn.execute(
-        f"INSERT INTO mint.events ({names}) VALUES ({marks}) ON CONFLICT (source_key) DO NOTHING",
+        f"INSERT INTO mint.events ({names}) VALUES ({marks})"
+        " ON CONFLICT (instance_id, source_key) DO NOTHING",
         list(row.values()),
     )
     return key, cur.rowcount
+
+
+def test_same_source_key_in_two_instances_stays_two_events(db):
+    key = "operator:admin:1:operator_added"
+    assert add_event(db, key=key, kind="operator_added", instance_id="inst1")[1] == 1
+    assert add_event(db, key=key, kind="operator_added", instance_id="inst2")[1] == 1
+    assert add_event(db, key=key, kind="operator_added", instance_id="inst1")[1] == 0
+    assert scalar(db, "SELECT count(*) FROM mint.events WHERE source_key = %s", key) == 2
+
+
+def test_sealing_sequence_is_unique_per_instance(db):
+    seal = (
+        "UPDATE mint.events SET seal_seq = 1, row_hash = %s, sealed_at = now()"
+        " WHERE source_key = %s"
+    )
+    first, _ = add_event(db, instance_id="inst1")
+    second, _ = add_event(db, instance_id="inst1")
+    other, _ = add_event(db, instance_id="inst2")
+    db.execute(seal, (b"" * 32, first))
+    db.execute(seal, (b"" * 32, other))
+    with fails(db, errors.UniqueViolation):
+        db.execute(seal, (b"" * 32, second))
 
 
 def test_event_source_key_converges_to_one_row(db):

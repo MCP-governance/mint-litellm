@@ -372,24 +372,27 @@ CREATE TRIGGER state_epoch_guard
     BEFORE UPDATE OR DELETE ON mint.state_epoch
     FOR EACH ROW EXECUTE FUNCTION mint.guard_state_epoch();
 
--- source_key가 같은 사건은 한 행으로 수렴한다. 재적재는 ON CONFLICT (source_key) DO NOTHING.
+-- 같은 배치에서 source_key가 같은 사건은 한 행으로 수렴한다.
+-- 재적재는 ON CONFLICT (instance_id, source_key) DO NOTHING.
 CREATE TABLE mint.events (
     event_id      uuid PRIMARY KEY,
     instance_id   mint.ident NOT NULL,
     inserted_at   timestamptz NOT NULL DEFAULT clock_timestamp(),
     kind          text NOT NULL CHECK (kind ~ '^[a-z][a-z_]*$'),
-    source_key    text NOT NULL UNIQUE CHECK (length(source_key) BETWEEN 1 AND 512),
+    source_key    text NOT NULL CHECK (length(source_key) BETWEEN 1 AND 512),
     invocation_id uuid,
     attempt_id    integer CHECK (attempt_id >= 1),
     actor         text,
     subject       jsonb,
     payload       jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
-    seal_seq      bigint UNIQUE,
+    seal_seq      bigint,
     prev_hash     bytea CHECK (prev_hash IS NULL OR length(prev_hash) = 32),
     row_hash      bytea CHECK (row_hash IS NULL OR length(row_hash) = 32),
     sealed_at     timestamptz,
     CHECK (source_key NOT LIKE 'call:%' OR (invocation_id IS NOT NULL AND attempt_id IS NOT NULL)),
-    CHECK ((seal_seq IS NULL) = (row_hash IS NULL) AND (seal_seq IS NULL) = (sealed_at IS NULL))
+    CHECK ((seal_seq IS NULL) = (row_hash IS NULL) AND (seal_seq IS NULL) = (sealed_at IS NULL)),
+    UNIQUE (instance_id, source_key),
+    UNIQUE (instance_id, seal_seq)
 );
 
 CREATE INDEX events_by_time ON mint.events (instance_id, inserted_at);
