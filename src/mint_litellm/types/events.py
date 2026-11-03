@@ -31,6 +31,7 @@ class EventKind(StrEnum):
     CALL_OUTCOME_UNKNOWN = "call_outcome_unknown"
     # 시스템 사건
     ENFORCEMENT_UNVERIFIED = "enforcement_unverified"
+    SERVER_IDENTITY_MISMATCH_OBSERVED = "server_identity_mismatch_observed"
     BUFFER_OVERFLOW = "buffer_overflow"
     BUFFER_REPLAYED = "buffer_replayed"
     # 제어 사건(사람의 행위)
@@ -73,12 +74,18 @@ CALL_KINDS: frozenset[EventKind] = frozenset(
 )
 
 SYSTEM_KINDS: frozenset[EventKind] = frozenset(
-    {EventKind.ENFORCEMENT_UNVERIFIED, EventKind.BUFFER_OVERFLOW, EventKind.BUFFER_REPLAYED}
+    {
+        EventKind.ENFORCEMENT_UNVERIFIED,
+        EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED,
+        EventKind.BUFFER_OVERFLOW,
+        EventKind.BUFFER_REPLAYED,
+    }
 )
 
 # 제어 사건의 source_key 첫 마디. ``<entity>:{id}:{state_version}:{kind}``
 CONTROL_ENTITY: dict[EventKind, str] = {
     EventKind.ENFORCEMENT_UNVERIFIED: "selfcheck",
+    EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED: "selfcheck",
     EventKind.BUFFER_OVERFLOW: "buffer",
     EventKind.BUFFER_REPLAYED: "buffer",
     EventKind.SERVER_REGISTERED: "server",

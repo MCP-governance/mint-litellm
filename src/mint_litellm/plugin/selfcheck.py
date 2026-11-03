@@ -44,8 +44,9 @@ from mint_litellm.types.settings import SELF_CHECK_DESCRIPTIONS, SelfCheckItem
 log = logging.getLogger("mint_litellm.selfcheck")
 
 REQUIRED_MODES = ("pre_mcp_call", "post_mcp_call")
-# 통제 대상이 아닌 서버 상태. 이 서버는 LiteLLM에 없어도 기동을 막지 않는다.
-INACTIVE_SERVER_STATUSES = frozenset({"rejected", "terminated"})
+# 통제 대상 서버 상태. 그 밖의 상태 서버는 LiteLLM에 없어도 기동을 막지 않는다.
+CONTROLLED_SERVER_STATUSES = frozenset({"approved", "suspended"})
+CONTRACT_FIELDS = ("url_sha256", "transport", "auth_type")
 
 
 @dataclass(frozen=True)
@@ -159,7 +160,7 @@ def check_items(
         add(SelfCheckItem.KEY_ACCESS_STRICT, False, "MINT database unavailable")
         add(SelfCheckItem.SERVER_REGISTRY_MATCH, False, "MINT database unavailable")
     else:
-        active = [s for s in controlled if s.status not in INACTIVE_SERVER_STATUSES]
+        active = [s for s in controlled if s.status in CONTROLLED_SERVER_STATUSES]
         open_servers = [
             s.server_id for s in active if getattr(by_id.get(s.server_id), "allow_all_keys", False)
         ]
@@ -171,19 +172,11 @@ def check_items(
             if not strict
             else f"allow_all_keys is set on {', '.join(open_servers[:5])}",
         )
-        mismatched = []
-        for server in active:
-            entry = by_id.get(server.server_id)
-            if entry is None or (entry.url_sha256, entry.transport, entry.auth_type) != (
-                server.url_sha256,
-                server.transport,
-                server.auth_type,
-            ):
-                mismatched.append(server.server_id)
+        absent = [s.server_id for s in active if s.server_id not in by_id]
         add(
             SelfCheckItem.SERVER_REGISTRY_MATCH,
-            not mismatched,
-            f"registry differs from the approved contract: {', '.join(mismatched[:5])}",
+            not absent,
+            f"not in the registry: {', '.join(absent[:5])}",
         )
 
     owners: dict[str, set[str]] = {}
@@ -215,6 +208,24 @@ def check_items(
         problems.append("supported_db_objects lacks mcp")
     add(SelfCheckItem.REQUIRED_SETTINGS, not problems, "; ".join(problems))
     return results
+
+
+def contract_mismatches(
+    view: LiteLLMView, controlled: Sequence[RegisteredServer]
+) -> list[tuple[str, str]]:
+    """레지스트리에 있지만 승인된 계약 값과 다른 통제 서버의 (서버, 항목). 기동을 막지 않는다."""
+    by_id = {entry.server_id: entry for entry in view.registry}
+    found = []
+    for server in controlled:
+        entry = by_id.get(server.server_id)
+        if server.status not in CONTROLLED_SERVER_STATUSES or entry is None:
+            continue
+        found.extend(
+            (server.server_id, name)
+            for name in CONTRACT_FIELDS
+            if getattr(entry, name) != getattr(server, name)
+        )
+    return found
 
 
 def terminate_process() -> None:
@@ -259,6 +270,8 @@ class PluginRuntime:
     logger: Any = None
     guardrail: Any = None
     last_results: list[CheckResult] = field(default_factory=list)
+    last_mismatches: list[tuple[str, str]] = field(default_factory=list)
+    _reported: set[tuple[str, str]] = field(default_factory=set, repr=False)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @property
@@ -307,13 +320,12 @@ class PluginRuntime:
             )
         except Exception:
             controlled = None
+        view = self.view_collector()
         results = check_items(
-            self.view_collector(),
-            logger=self.logger,
-            guardrail=self.guardrail,
-            controlled=controlled,
+            view, logger=self.logger, guardrail=self.guardrail, controlled=controlled
         )
         self.last_results = results
+        self.last_mismatches = contract_mismatches(view, controlled or [])
         return results
 
     async def verify(self) -> bool:
@@ -341,10 +353,12 @@ class PluginRuntime:
             while True:
                 if await self.verify():
                     log.info("MINT 자가 점검 통과")
+                    await self._report_mismatches()
                     return
                 if time.monotonic() >= deadline:
                     break
                 await asyncio.sleep(self.retry_seconds)
+            await self._report_mismatches()
             await self._fail()
             if self.config.required:
                 self.terminate()
@@ -356,6 +370,23 @@ class PluginRuntime:
             await self._fail(error=type(exc).__name__)
             if self.config.required:
                 self.terminate()
+
+    async def _report_mismatches(self) -> None:
+        """승인된 계약과 다른 서버를 사건으로 남긴다. 그 서버의 호출은 판정에서 차단된다."""
+        for server_id, name in self.last_mismatches:
+            if (server_id, name) in self._reported:
+                continue
+            self._reported.add((server_id, name))
+            kind = EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED
+            await self.recorder.record(
+                Event(
+                    instance_id=self.config.instance_id,
+                    inserted_at=datetime.now(UTC),
+                    kind=kind,
+                    source_key=control_source_key(kind, str(new_uuid7()), 1),
+                    payload={"server_id": server_id, "field": name},
+                )
+            )
 
     async def _fail(self, error: str | None = None) -> None:
         failed = [

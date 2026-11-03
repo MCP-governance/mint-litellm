@@ -13,6 +13,7 @@ from mint_litellm.plugin.selfcheck import (
     PluginRuntime,
     check_items,
     collect_view,
+    contract_mismatches,
 )
 from mint_litellm.plugin.snapshot import RegisteredServer
 from mint_litellm.types.decision import url_sha256
@@ -162,20 +163,40 @@ def test_item_4_key_access_is_strict_for_controlled_servers():
     ],
     ids=["url", "transport", "auth"],
 )
-def test_item_5_registry_must_match_the_approved_contract(mutation):
-    assert SelfCheckItem.SERVER_REGISTRY_MATCH in failed(
-        run_checks(view(registry=[entry(**mutation)]))
-    )
+def test_item_5_does_not_fail_when_a_contract_value_differs(mutation):
+    changed = view(registry=[entry(**mutation)])
+    assert SelfCheckItem.SERVER_REGISTRY_MATCH not in failed(run_checks(changed))
+    (field,) = mutation
+    assert contract_mismatches(changed, [registered()]) == [("srv-1", field)]
 
 
-def test_item_5_registry_must_contain_every_active_controlled_server():
+def test_contract_mismatches_cover_only_controlled_servers_present_in_the_registry():
+    changed = view(registry=[entry(transport="sse", auth_type="oauth2")])
+    assert contract_mismatches(changed, [registered()]) == [
+        ("srv-1", "transport"),
+        ("srv-1", "auth_type"),
+    ]
+    assert contract_mismatches(changed, [registered(status="pending")]) == []
+    assert contract_mismatches(view(registry=[]), [registered()]) == []
+    assert contract_mismatches(view(), [registered()]) == []
+
+
+def test_item_5_registry_must_contain_every_controlled_server():
     assert SelfCheckItem.SERVER_REGISTRY_MATCH in failed(run_checks(view(registry=[])))
-    for status in ("rejected", "terminated"):
-        results = run_checks(view(registry=[]), controlled=[registered(status=status)])
-        assert SelfCheckItem.SERVER_REGISTRY_MATCH not in failed(results)
-    for status in ("pending", "awaiting_approval", "approved", "suspended", "terminating"):
+    for status in ("approved", "suspended"):
         results = run_checks(view(registry=[]), controlled=[registered(status=status)])
         assert SelfCheckItem.SERVER_REGISTRY_MATCH in failed(results)
+    other_states = (
+        "pending",
+        "validating",
+        "awaiting_approval",
+        "rejected",
+        "terminating",
+        "terminated",
+    )
+    for status in other_states:
+        results = run_checks(view(registry=[]), controlled=[registered(status=status)])
+        assert SelfCheckItem.SERVER_REGISTRY_MATCH not in failed(results)
 
 
 def test_items_4_and_5_fail_when_the_mint_database_cannot_be_read():
@@ -401,3 +422,29 @@ def test_a_runtime_without_the_required_environment_raises_runtime_error(monkeyp
     monkeypatch.setattr(selfcheck, "_runtime", None)
     with pytest.raises(RuntimeError):
         selfcheck.get_runtime({})
+
+
+def test_a_contract_mismatch_does_not_stop_startup_and_is_recorded_once_per_field(tmp_path):
+    changed = view(registry=[entry(transport="sse", url_sha256=url_sha256("https://moved/"))])
+    runtime, store, stopped, _ = make_runtime(tmp_path, v=changed)
+    asyncio.run(runtime._startup())
+    assert runtime.verified and stopped == []
+    events = store.of_kind("server_identity_mismatch_observed")
+    assert sorted(e.payload["field"] for e in events) == ["transport", "url_sha256"]
+    assert {e.payload["server_id"] for e in events} == {"srv-1"}
+    for event in events:
+        assert event.actor is None and event.invocation_id is None
+        assert event.source_key.startswith("selfcheck:")
+        assert event.source_key.endswith(":1:server_identity_mismatch_observed")
+    assert len({e.source_key for e in events}) == 2
+    asyncio.run(runtime._report_mismatches())
+    assert len(store.of_kind("server_identity_mismatch_observed")) == 2
+
+
+def test_a_mismatch_is_also_recorded_when_another_item_stops_the_startup(tmp_path):
+    changed = view(registry=[entry(transport="sse")], strict_guardrail_modes=False)
+    runtime, store, stopped, _ = make_runtime(tmp_path, v=changed)
+    asyncio.run(runtime._startup())
+    assert stopped == [1]
+    assert len(store.of_kind("server_identity_mismatch_observed")) == 1
+    assert len(store.of_kind("enforcement_unverified")) == 1

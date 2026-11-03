@@ -57,6 +57,7 @@ def test_call_source_key_rule():
         (EventKind.POLICY_ACTIVATED, "policy_version"),
         (EventKind.ORG_BINDING_CREATED, "org_binding"),
         (EventKind.BUFFER_REPLAYED, "buffer"),
+        (EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED, "selfcheck"),
     ],
 )
 def test_control_source_key_rule(kind, entity):
