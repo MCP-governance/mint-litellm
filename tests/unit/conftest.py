@@ -13,7 +13,7 @@ DATABASE_URL = os.environ.get("MINT_TEST_DATABASE_URL")
 
 @pytest.fixture(scope="session")
 def migrated_database() -> Iterator[str]:
-    """임시 데이터베이스를 만들어 초기 스키마를 적용하고 접속 주소를 돌려준다."""
+    """일회용 데이터베이스를 만들어 초기 스키마를 적용하고 접속 주소를 돌려준다."""
     if not DATABASE_URL:
         pytest.skip("MINT_TEST_DATABASE_URL is not set")
     import psycopg
