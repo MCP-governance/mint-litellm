@@ -174,6 +174,8 @@ def test_limits_doc_covers_the_declared_limitations():
         "unbound_keys",
         "확인하지 않았다",
         "정규화하지 않음",
+        "유일한 허용 근거",
+        "redirect_uri",
     ):
         assert needle in doc, needle
 
