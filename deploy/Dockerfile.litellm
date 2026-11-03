@@ -7,9 +7,11 @@ COPY src /src/src
 RUN pip wheel --no-deps --wheel-dir /wheels /src
 
 FROM ${LITELLM_IMAGE}
+# 정책 시험과 번들 준비에 쓰는 opa 실행 파일과 정책 소스. 정책 엔진 이미지와 같은 판본이다.
+COPY --from=openpolicyagent/opa:1.21.4@sha256:12420358d3f22a0cd2424ddc44a16e292ecb42825d3dfbca779986006822a3f6 /opa /usr/local/bin/opa
+COPY policy /opt/mint/policy
 COPY --from=build /wheels /tmp/wheels
-# 의존 패키지(pydantic, psycopg, pyyaml)는 LiteLLM 이미지에 이미 있다.
 RUN python -m ensurepip \
-    && python -m pip install --no-deps --no-index /tmp/wheels/*.whl \
+    && python -m pip install "$(ls /tmp/wheels/*.whl)[litellm]" \
     && python -m pip uninstall -y pip \
     && rm -rf /tmp/wheels

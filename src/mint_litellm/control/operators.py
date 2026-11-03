@@ -65,6 +65,7 @@ def _insert(
     role: OperatorRole,
     user_id: str | None,
     expires_in_days: int | None,
+    emitted: list | None = None,
 ) -> tuple[str, int]:
     token = issue_token()
     expires_at = None if expires_in_days is None else datetime.now(UTC) + timedelta(
@@ -82,7 +83,7 @@ def _insert(
         " VALUES (%s, %s, %s, %s, %s, %s) RETURNING state_version",
         (instance_id, name, role.value, hash_token(token), user_id, expires_at),
     )
-    ledger.record(
+    event = ledger.record(
         ctx_conn,
         instance_id,
         EventKind.OPERATOR_ADDED,
@@ -92,6 +93,8 @@ def _insert(
         payload={"name": name, "role": role.value, "user_id": user_id,
                  "expires_at": None if expires_at is None else expires_at.isoformat()},
     )
+    if emitted is not None:
+        emitted.append(event)
     return token, row["state_version"]
 
 
@@ -108,12 +111,17 @@ def add(
     if user_id:
         _require_human_user(litellm, user_id)
     token, _ = _insert(ctx.conn, ctx.instance_id, ctx.operator.name, name, role, user_id,
-                       expires_in_days)
+                       expires_in_days, ctx.emitted)
     return token
 
 
 def bootstrap(
-    conn: psycopg.Connection, instance_id: str, litellm: LiteLLMAdmin, name: str, user_id: str
+    conn: psycopg.Connection,
+    instance_id: str,
+    litellm: LiteLLMAdmin,
+    name: str,
+    user_id: str,
+    emitted: list | None = None,
 ) -> str:
     """운영자가 하나도 없을 때만 토큰 없이 첫 admin을 만든다."""
     conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"mint-bootstrap:{instance_id}",))
@@ -123,7 +131,8 @@ def bootstrap(
     if existing["n"]:
         raise ControlError("운영자가 이미 있어 bootstrap을 실행할 수 없습니다.")
     _require_human_user(litellm, user_id)
-    token, _ = _insert(conn, instance_id, "bootstrap", name, OperatorRole.ADMIN, user_id, None)
+    token, _ = _insert(conn, instance_id, "bootstrap", name, OperatorRole.ADMIN, user_id, None,
+                       emitted)
     return token
 
 

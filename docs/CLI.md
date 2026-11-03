@@ -57,6 +57,57 @@
 
 승인을 모두 철회해도 서버 상태는 바뀌지 않는다. 서버 전체를 막으려면 `server suspend`를 쓴다. 특정 주체를 더 넓은 승인까지 포함해 막으려면 `revoke --deny`를 쓴다.
 
+## 환경 변수
+
+| 변수 | 용도 | 기본값 |
+| --- | --- | --- |
+| `MINT_DATABASE_URL` | MINT 데이터베이스 접속 주소 | 필수 |
+| `MINT_INSTANCE_ID` | 배치 식별자. 영문자·숫자·`.`·`_`·`-`, 128자 이하 | `default` |
+| `MINT_OPERATOR_TOKEN` | 운영자 토큰. `--token-file <파일>`로 대신할 수 있다. | 인증이 필요한 명령에서 필수 |
+| `MINT_LITELLM_URL` | LiteLLM 관리 API 주소 | `server register`·`operator add`·`approve`·`consent add`·`check`·`status`에서 필요 |
+| `MINT_LITELLM_KEY` | 제어 평면 LiteLLM 키(`proxy_admin`, `allowed_routes` 7개로 제한) | 위와 같음 |
+| `MINT_LITELLM_CONFIG` | `check`·`status`가 읽는 LiteLLM `config.yaml` 경로. `--config`로 대신할 수 있다. | 없음 |
+| `MINT_MODE` | 모드 상한. `enforce`이면 `settings mode observe`가 거부된다. | `enforce` |
+| `MINT_REPLICAS` | `check`가 공유 캐시 설정을 판단할 때 쓰는 복제본 수 | `1` |
+| `MINT_PLUGIN_DB_PASSWORD`, `MINT_CONTROL_DB_PASSWORD` | `init`이 판정 프로세스용·제어 평면용 로그인 역할(`mint_plugin_app`, `mint_control_app`)을 만들 때 쓰는 비밀번호 | 없음(역할을 만들지 않음) |
+| `MINT_OPA_URL`, `MINT_POLICY_ROOT`, `MINT_OPA_BUNDLE_PATH` | `policy activate`의 정책 엔진 주소, `policy/`를 담은 루트, 정책 엔진이 감시하는 번들 파일. 각 옵션(`--opa-url`, `--policy-root`, `--bundle-path`)으로 대신할 수 있다. | `/opt/mint`, `/bundles/mint.tar.gz` |
+
+## 설정 조각
+
+`init`은 LiteLLM 설정 조각을 `config/litellm.mint.yaml`에 쓴다. `--out <경로>`로 위치를 바꾸고 `--out -`로 표준 출력에 낸다. 통제할 설정 서버는 `--mcp-server <이름>=<URL>`로 줄 수 있으며 `server_id`는 이름과 같게 명시된다.
+
+## 출력 형식
+
+기본 출력은 사람이 읽는 텍스트이다. `--json`(명령 앞이나 뒤 어디에 두어도 된다)을 주면 표준 출력에 JSON 객체 한 개만 쓴다. 안내와 오류 메시지는 표준 오류로 나간다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `ok` | 명령이 성공했는지. `check`가 필수 설정 위반으로 실패해도 결과는 출력된다. |
+| `command` | 명령 이름(`approve`, `org add` 등) |
+| `id` | 변경의 중심이 된 객체의 식별자. 생성 명령은 만든 객체(승인·거부·이용 관계·동의·허용 목록·호출별 승인은 UUID, 조직·운영자·정책 판본은 이름), 상태 변경 명령은 대상 객체 |
+| `state_version` | 변경 뒤 그 객체의 상태 버전 |
+| `events` | 이 명령이 원장에 남긴 사건 목록(남긴 순서). 항목: `event_id`, `kind`, `source_key`, `entity`, `entity_id`, `state_version` |
+| `token` | 토큰을 발급하는 명령(`operator add`, `operator bootstrap`)만. 다시 표시되지 않는다. |
+| `notes` | `approve`가 알리는 주의 사항 목록 |
+
+`id`와 `state_version`은 `events`의 첫 사건에서 온다. `approve`처럼 사건이 둘이면(`approval_granted`, `server_approved`) 첫 사건이 승인이다. `revoke --deny`는 `approval_revoked`, `denial_created` 순서이다.
+
+명령별 추가 필드는 다음과 같다.
+
+| 명령 | 추가 필드 |
+| --- | --- |
+| `init` | `migrations`(이번에 적용한 마이그레이션), `login_roles`(설정한 로그인 역할), `snippet_path`(설정 조각 파일) 또는 `snippet`(`--out -`일 때 본문) |
+| `check` | `findings`(각 항목 `item`, `level`=`OK`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
+| `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `servers`(상태별 개수), `alerts`, `observations` |
+| `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`) |
+
 ## 종료 코드
 
-`check`는 필수 설정이 하나라도 어긋나면 0이 아닌 값으로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다.
+| 코드 | 의미 |
+| --- | --- |
+| 0 | 성공 |
+| 1 | 명령을 수행할 수 없음: 입력 검증 실패, 상태 전이 위반, 직무 분리 위반, LiteLLM 읽기 실패, 데이터베이스 오류, `check`의 필수 설정 위반 |
+| 2 | 명령줄 사용법 오류 |
+| 4 | 인증 실패: 토큰이 없거나 틀렸거나 만료됨, 역할 부족 |
+
+`check`는 필수 설정이 하나라도 어긋나면 1로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다. 변경 명령은 한 트랜잭션에서 상태와 사건을 함께 기록하므로, 0이 아닌 코드로 끝난 명령은 아무것도 바꾸지 않는다.

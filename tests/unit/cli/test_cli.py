@@ -58,7 +58,8 @@ class Cli:
 
 
 @pytest.fixture
-def mint(fresh_db, stub, capsys, tmp_path):
+def mint(fresh_db, stub, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     return Cli(fresh_db, stub.url, capsys, tmp_path)
 
 
@@ -73,7 +74,7 @@ def bootstrap(mint) -> str:
 def test_init_creates_the_default_org_settings_and_prints_the_snippet(mint):
     path = mint.tmp / "snippet.yaml"
     code, out, err = mint.run("init", "--mcp-server", "docs=http://u.test/mcp",
-                              "--output", str(path))
+                              "--out", str(path))
     assert code == 0 and "마이그레이션 적용" in err and "allowed_routes" in err
     assert "server_id: docs" in path.read_text(encoding="utf-8")
     again, _, err = mint.run("init")
@@ -88,7 +89,7 @@ def test_init_creates_the_default_org_settings_and_prints_the_snippet(mint):
 
 
 def test_init_no_spend_logs_and_bad_server_argument(mint):
-    code, out, _ = mint.run("init", "--no-spend-logs")
+    code, out, _ = mint.run("init", "--no-spend-logs", "--out", "-")
     assert code == 0 and "disable_spend_logs: true" in out
     code, _, err = mint.run("init", "--mcp-server", "missing-url")
     assert code == 1 and "이름=URL" in err
@@ -208,7 +209,7 @@ def test_full_activation_path_through_the_cli(mint):
     code, out, _ = mint.run(*args, "--second-approver", f"@{boss_file}", token=appr)
     assert code == 0, out
     code, out, _ = mint.run("ledger", "list", "--json", "--kind", "server_approved", token=boss)
-    assert code == 0 and json.loads(out.strip())["kind"] == "server_approved"
+    assert code == 0 and json.loads(out)["events"][0]["kind"] == "server_approved"
     code, out, _ = mint.run("revoke", "not-a-uuid", "--reason", "r", token=appr)
     assert code == 1  # 잘못된 식별자는 데이터베이스 오류로 거부된다
 
@@ -239,20 +240,72 @@ def test_settings_and_org_commands(mint):
     assert info["mode"]["effective"] == "enforce" and info["policy_version"] is None
 
 
-def test_policy_activate_without_the_verifier_module_is_refused(mint, monkeypatch):
-    import sys
-
-    monkeypatch.setitem(sys.modules, "mint_litellm.plugin.policy.bundle", None)
+def test_policy_activate_needs_a_valid_bundle_source_and_engine_address(mint, tmp_path):
     boss = bootstrap(mint)
-    code, _, err = mint.run("policy", "activate", "v1", "--catalog-sha256", "a" * 64,
-                            "--bundle-sha256", "b" * 64, token=boss)
-    assert code == 1 and "검증 모듈" in err
+    code, _, err = mint.run("policy", "activate", "v1", "--policy-root", str(tmp_path),
+                            token=boss)
+    assert code == 1 and "--opa-url" in err
+    code, _, err = mint.run("policy", "activate", "v1", "--policy-root", str(tmp_path),
+                            "--opa-url", "http://opa.test:8181", token=boss)
+    assert code == 1 and "정책 번들이 올바르지" in err
+
+
+def test_init_writes_the_default_snippet_path_and_reports_json(mint):
+    code, out, _ = mint.run("--json", "init")
+    result = json.loads(out)
+    assert code == 0 and result["ok"] is True and result["command"] == "init"
+    assert result["snippet_path"] == "config/litellm.mint.yaml"
+    assert (mint.tmp / "config" / "litellm.mint.yaml").is_file()
+    assert result["migrations"] == []  # 시험용 데이터베이스는 이미 최신이다
+    assert [e["kind"] for e in result["events"]] == [
+        "settings_changed", "org_created", "settings_changed"]
+
+
+def test_json_output_names_the_created_object_version_and_event_keys(mint):
+    code, out, _ = mint.run("init", "--json")
+    assert code == 0
+    code, out, _ = mint.run("operator", "bootstrap", "--name", "boss", "--user-id", "human-2",
+                            "--json")
+    result = json.loads(out)
+    assert result["token"].startswith("mint_") and result["id"] == "boss"
+    assert result["state_version"] == 1
+    assert result["events"][0]["source_key"] == "operator:boss:1:operator_added"
+    boss = result["token"]
+    run = lambda *a: json.loads(mint.run(*a, "--json", token=boss)[1])  # noqa: E731
+    org = run("org", "add", "acme", "--name", "ACME")
+    assert (org["id"], org["state_version"], org["events"][0]["kind"]) == ("acme", 1, "org_created")
+    mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp", token=boss)
+    relation = run("relation", "add", "--org", "acme", "--server", "ctl-everything",
+                   "--purpose", "ops")
+    assert relation["id"] == relation["events"][0]["entity_id"]
+    assert relation["events"][0]["source_key"] == f"relation:{relation['id']}:1:relation_created"
+    appr = mint.token(mint.run("operator", "add", "ap", "--role", "approver", "--user-id",
+                               "human-1", token=boss)[1])
+    approval = json.loads(mint.run(
+        "approve", "--relation", relation["id"], "--scope", "key", "--scope-id", GOOD_KEY,
+        "--tools", "echo", "--valid-until", FAR_FUTURE, "--basis", "b", "--requested-by", "x",
+        "--json", token=appr)[1])
+    assert [e["kind"] for e in approval["events"]] == ["approval_granted", "server_approved"]
+    assert approval["id"] == approval["events"][0]["entity_id"]
+    assert approval["state_version"] == 1
+    revoked = run("revoke", approval["id"], "--reason", "r", "--deny")
+    assert [e["kind"] for e in revoked["events"]] == ["approval_revoked", "denial_created"]
+    assert revoked["id"] == approval["id"] and revoked["state_version"] == 2
+    listed = run("ledger", "list", "--limit", "3")
+    assert listed["ok"] is True and len(listed["events"]) == 3
+    assert {"event_id", "kind", "source_key", "actor", "payload"} <= set(listed["events"][0])
+
+
+def test_json_flag_is_accepted_before_the_command_too(mint):
+    boss = bootstrap(mint)
+    code, out, _ = mint.run("--json", "ledger", "list", token=boss)
+    assert code == 0 and json.loads(out)["ok"] is True
 
 
 def test_check_exits_nonzero_on_required_violations_and_prints_levels(mint):
     boss = bootstrap(mint)
     config = mint.tmp / "config.yaml"
-    mint.run("init", "--output", str(config))
+    mint.run("init", "--out", str(config))
     code, out, err = mint.run("check", "--config", str(config), token=boss)
     assert code == 1 and "필수 설정 점검에 실패" in err
     assert "[실패] object_permission 서버 식별자 형식" in out
@@ -260,9 +313,9 @@ def test_check_exits_nonzero_on_required_violations_and_prints_levels(mint):
     assert "  unbound_keys: 1" in out
     bad = mint.tmp / "bad.yaml"
     bad.write_text("general_settings: {}\n", encoding="utf-8")
-    code, out, _ = mint.run("check", "--config", str(bad), "--json", token=boss)
+    code, out, err = mint.run("check", "--config", str(bad), "--json", token=boss)
     result = json.loads(out)
-    assert code == 1 and result["ok"] is False
+    assert code == 1 and result["ok"] is False and "필수 설정 점검에 실패" in err
     assert {f["level"] for f in result["findings"]} >= {"FAIL"}
     env_file = mint.tmp / "litellm.env"
     env_file.write_text("PROXY_BASE_URL=https://g.test\nMCP_TRUSTED_REDIRECT_ORIGINS=https://a.test\n",

@@ -10,7 +10,7 @@ import json
 import os
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -55,11 +55,18 @@ PROGRAM = "mint-litellm"
 
 @dataclass
 class Run:
+    """명령 한 건의 실행 맥락과 출력. 텍스트와 JSON은 같은 결과에서 만든다."""
+
     args: argparse.Namespace
     cfg: ControlConfig
     environ: dict[str, str]
     conn: psycopg.Connection
     ctx: Context | None
+    emitted: list = field(default_factory=list)
+    extra_events: list = field(default_factory=list)
+    text: list[str] = field(default_factory=list)
+    data: dict[str, Any] = field(default_factory=dict)
+    failure: str | None = None
 
     def context(self) -> Context:
         assert self.ctx is not None
@@ -67,6 +74,12 @@ class Run:
 
     def litellm(self) -> LiteLLMAdmin:
         return self.cfg.litellm()
+
+    def say(self, line: str) -> None:
+        self.text.append(line)
+
+    def events(self) -> list:
+        return self.ctx.emitted if self.ctx is not None else self.emitted
 
 
 Handler = Callable[[Run], None]
@@ -82,14 +95,6 @@ def _when(text: str) -> datetime:
 
 def _csv(text: str) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
-
-
-def _out(text: str = "") -> None:
-    print(text)
-
-
-def _issued(token: str) -> None:
-    _out(f"발급된 토큰(다시 표시되지 않습니다): {token}")
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +120,7 @@ def _init(run: Run) -> None:
         if run.environ.get(var)
     }
     configured_roles = ensure_login_roles(run.conn, passwords)
-    ctx = Context(run.conn, cfg.instance_id, Operator("init", "admin", None))
+    ctx = run.context()
     version = settings_store.ensure(run.conn, cfg.instance_id)
     if version is not None:
         ctx.emit(
@@ -136,12 +141,19 @@ def _init(run: Run) -> None:
     if settings_store.load(run.conn, cfg.instance_id)["default_org_id"] is None:
         settings_store.set_default_org(ctx, args.org_id)
     text = litellm_config.snippet(servers_arg, no_spend_logs=args.no_spend_logs)
-    if args.output:
-        Path(args.output).write_text(text, encoding="utf-8", newline="\n")
+    run.data.update(migrations=applied, login_roles=configured_roles)
+    if args.out == "-":
+        run.say(text.rstrip("\n"))
+        run.data["snippet"] = text
     else:
-        _out(text.rstrip("\n"))
+        path = Path(args.out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline="\n")
+        run.data["snippet_path"] = path.as_posix()
     log = sys.stderr
     print(f"마이그레이션 적용: {', '.join(applied) or '없음(이미 최신)'}", file=log)
+    if args.out != "-":
+        print(f"LiteLLM 설정 조각: {args.out}", file=log)
     if configured_roles:
         print(f"로그인 역할 설정: {', '.join(configured_roles)}", file=log)
     elif not passwords:
@@ -191,37 +203,47 @@ def _check(run: Run) -> None:
         replicas=run.cfg.replicas,
         registered_servers=registered,
     )
-    if run.args.json:
-        _out(json.dumps({
-            "ok": not report.failed,
-            "findings": [{"item": f.item, "level": f.level.name, "message": f.message}
-                         for f in report.findings],
-            "observations": report.observations,
-        }, ensure_ascii=False))
-    else:
-        _out(report.render())
+    run.data.update(
+        findings=[
+            {"item": f.item, "level": f.level.name, "message": f.message} for f in report.findings
+        ],
+        observations=report.observations,
+    )
+    run.say(report.render())
     if report.failed:
-        raise ControlError("필수 설정 점검에 실패했습니다.")
+        run.failure = "필수 설정 점검에 실패했습니다."
 
 
 def _status(run: Run) -> None:
     info = status.collect(
-        run.context(), run.cfg, _optional_litellm(run),
-        litellm_config.load_config(_config_path(run)), _gather_env(run),
+        run.context(),
+        run.cfg,
+        _optional_litellm(run),
+        litellm_config.load_config(_config_path(run)),
+        _gather_env(run),
     )
-    _out(json.dumps(info, ensure_ascii=False) if run.args.json else status.render(info))
+    run.data.update(info)
+    run.say(status.render(info))
+
+
+def _issued(run: Run, token: str) -> None:
+    run.data["token"] = token
+    run.say(f"발급된 토큰(다시 표시되지 않습니다): {token}")
 
 
 def _operator_add(run: Run) -> None:
     a = run.args
-    _issued(operators.add(run.context(), run.litellm(), a.name, OperatorRole(a.role), a.user_id,
-                          a.expires_in_days))
+    token = operators.add(
+        run.context(), run.litellm(), a.name, OperatorRole(a.role), a.user_id, a.expires_in_days
+    )
+    _issued(run, token)
 
 
 def _operator_bootstrap(run: Run) -> None:
-    token = operators.bootstrap(run.conn, run.cfg.instance_id, run.litellm(), run.args.name,
-                                run.args.user_id)
-    _issued(token)
+    token = operators.bootstrap(
+        run.conn, run.cfg.instance_id, run.litellm(), run.args.name, run.args.user_id, run.emitted
+    )
+    _issued(run, token)
 
 
 def _second(run: Run) -> Operator | None:
@@ -233,18 +255,32 @@ def _second(run: Run) -> Operator | None:
     return operators.authenticate(run.conn, run.cfg.instance_id, value)
 
 
+def _created(run: Run, object_id: str) -> None:
+    run.data["id"] = object_id
+    run.say(object_id)
+
+
 def _approve(run: Run) -> None:
     a = run.args
     approval_id, notes = approvals.approve(
-        run.context(), run.litellm(),
-        relation_id=a.relation, scope_type=a.scope, scope_id=a.scope_id, tools=a.tools,
-        valid_from=a.valid_from or datetime.now(UTC), valid_until=a.valid_until,
-        approval_class=a.approval_class, basis_text=a.basis, requested_by=a.requested_by,
-        allowlist_ids=a.allowlist_ref or [], second=_second(run),
+        run.context(),
+        run.litellm(),
+        relation_id=a.relation,
+        scope_type=a.scope,
+        scope_id=a.scope_id,
+        tools=a.tools,
+        valid_from=a.valid_from or datetime.now(UTC),
+        valid_until=a.valid_until,
+        approval_class=a.approval_class,
+        basis_text=a.basis,
+        requested_by=a.requested_by,
+        allowlist_ids=a.allowlist_ref or [],
+        second=_second(run),
     )
     for note in notes:
         print(note, file=sys.stderr)
-    _out(f"승인 {approval_id}")
+    run.data["notes"] = notes
+    _created(run, approval_id)
 
 
 def _subject(a: argparse.Namespace) -> tuple[SubjectType, str]:
@@ -254,30 +290,126 @@ def _subject(a: argparse.Namespace) -> tuple[SubjectType, str]:
 def _ledger_list(run: Run) -> None:
     a = run.args
     rows = ledger.list_events(
-        run.conn, run.cfg.instance_id, kind=a.kind, since=a.since, until=a.until,
-        invocation_id=a.invocation_id, limit=a.limit,
+        run.conn,
+        run.cfg.instance_id,
+        kind=a.kind,
+        since=a.since,
+        until=a.until,
+        invocation_id=a.invocation_id,
+        limit=a.limit,
     )
+    run.data["events"] = [json.loads(json.dumps(row, default=str)) for row in rows]
     for row in rows:
-        if a.json:
-            _out(json.dumps(row, ensure_ascii=False, default=str))
-        else:
-            _out(f"{row['inserted_at'].isoformat()}\t{row['kind']}\t{row['actor'] or '-'}\t"
-                 f"{row['source_key']}")
+        run.say(
+            f"{row['inserted_at'].isoformat()}\t{row['kind']}\t{row['actor'] or '-'}\t"
+            f"{row['source_key']}"
+        )
 
 
 def _policy_activate(run: Run) -> None:
-    a = run.args
-    policy_versions.activate(run.context(), a.version, a.catalog_sha256, a.bundle_sha256,
-                             policy_versions.load_verifier())
+    a, ctx = run.args, run.context()
+    source = policy_versions.PolicySource(
+        root=Path(a.policy_root),
+        opa=a.opa,
+        bundle_path=Path(a.bundle_path),
+        opa_url=a.opa_url or run.environ.get("MINT_OPA_URL", ""),
+        timeout_seconds=a.timeout,
+    )
+    if not source.opa_url:
+        raise ControlError("--opa-url 또는 MINT_OPA_URL이 필요합니다.")
+    policy_versions.activate(
+        run.conn, run.cfg.require_database(), ctx.instance_id, ctx.operator.name, a.version, source
+    )
+    run.conn.commit()
+    row = fetchone(
+        run.conn,
+        "SELECT event_id, kind, source_key FROM mint.events WHERE instance_id = %s"
+        " AND kind = 'policy_activated' AND source_key LIKE %s ORDER BY inserted_at DESC LIMIT 1",
+        (ctx.instance_id, f"policy_version:{a.version}:%"),
+    )
+    if row:
+        run.extra_events.append(row)
+    run.data["id"] = a.version
 
 
-def _printing(call: Callable[..., Any], *names: str):
+def _done(call: Callable[..., Any], *names: str) -> Handler:
     def handler(run: Run) -> None:
-        result = call(run.context(), *[getattr(run.args, n) for n in names])
-        if isinstance(result, str):
-            _out(result)
+        call(run.context(), *[getattr(run.args, n) for n in names])
 
     return handler
+
+
+def _denial(run: Run) -> None:
+    a = run.args
+    _created(
+        run,
+        approvals.create_denial(
+            run.context(),
+            scope_type=a.scope,
+            scope_id=a.scope_id,
+            server_id=a.server,
+            tools=a.tools,
+            reason=a.reason,
+            org_id=a.org,
+        ),
+    )
+
+
+def _call_request(run: Run) -> None:
+    a, ctx = run.args, run.context()
+    _created(
+        run,
+        approvals.call_request(
+            ctx,
+            org_id=a.org,
+            principal_type=a.principal_type,
+            principal_id=a.principal_id,
+            server_id=a.server,
+            tool=a.tool,
+            args_fp=a.args_fp,
+            fp_key_version=a.fp_key_version,
+            policy_version_id=a.policy_version,
+            expires_in_minutes=a.expires_in_minutes,
+            requested_by=a.requested_by or ctx.operator.user_id or ctx.operator.name,
+        ),
+    )
+
+
+def _consent_add(run: Run) -> None:
+    a = run.args
+    _created(
+        run,
+        consents.add(
+            run.context(),
+            run.litellm(),
+            a.org,
+            a.user,
+            a.server,
+            a.purpose,
+            a.data_scope,
+            a.text_version,
+            a.granted_at or datetime.now(UTC),
+            a.valid_until,
+            a.evidence_ref,
+            a.evidence_sha256,
+        ),
+    )
+
+
+def _allowlist_add(run: Run) -> None:
+    a = run.args
+    _created(
+        run,
+        allowlists.add(
+            run.context(),
+            a.kind,
+            a.value,
+            a.valid_from or datetime.now(UTC),
+            a.valid_until,
+            a.org,
+            a.note,
+        ),
+    )
 
 
 HANDLERS: dict[str, Handler] = {
@@ -286,50 +418,44 @@ HANDLERS: dict[str, Handler] = {
     "status": _status,
     "operator add": _operator_add,
     "operator bootstrap": _operator_bootstrap,
-    "server register": lambda r: servers.register(r.context(), r.litellm(), r.args.server_id,
-                                                  r.args.url),
-    "server suspend": _printing(servers.suspend, "server_id"),
-    "server resume": _printing(servers.resume, "server_id"),
-    "relation add": lambda r: _out(relations.add(
-        r.context(), r.args.org, r.args.server, r.args.purpose, r.args.team)),
-    "relation terminate": _printing(relations.terminate, "relation"),
+    "server register": lambda r: servers.register(
+        r.context(), r.litellm(), r.args.server_id, r.args.url
+    ),
+    "server suspend": _done(servers.suspend, "server_id"),
+    "server resume": _done(servers.resume, "server_id"),
+    "relation add": lambda r: _created(
+        r, relations.add(r.context(), r.args.org, r.args.server, r.args.purpose, r.args.team)
+    ),
+    "relation terminate": _done(relations.terminate, "relation"),
     "approve": _approve,
-    "deny": lambda r: _out(approvals.create_denial(
-        r.context(), scope_type=r.args.scope, scope_id=r.args.scope_id, server_id=r.args.server,
-        tools=r.args.tools, reason=r.args.reason, org_id=r.args.org)),
-    "denial lift": _printing(approvals.lift_denial, "denial_id"),
-    "revoke": lambda r: approvals.revoke(r.context(), r.args.approval_id, r.args.reason,
-                                         r.args.deny),
-    "call-approval request": lambda r: _out(approvals.call_request(
-        r.context(), org_id=r.args.org, principal_type=r.args.principal_type,
-        principal_id=r.args.principal_id, server_id=r.args.server, tool=r.args.tool,
-        args_fp=r.args.args_fp, fp_key_version=r.args.fp_key_version,
-        policy_version_id=r.args.policy_version, expires_in_minutes=r.args.expires_in_minutes,
-        requested_by=r.args.requested_by or r.context().operator.user_id
-        or r.context().operator.name)),
+    "deny": _denial,
+    "denial lift": _done(approvals.lift_denial, "denial_id"),
+    "revoke": lambda r: approvals.revoke(
+        r.context(), r.args.approval_id, r.args.reason, r.args.deny
+    ),
+    "call-approval request": _call_request,
     "call-approval approve": lambda r: approvals.call_approve(
-        r.context(), r.args.call_approval_id, _second(r)),
-    "call-approval reject": _printing(approvals.call_reject, "call_approval_id"),
-    "call-approval cancel": _printing(approvals.call_cancel, "call_approval_id"),
-    "consent add": lambda r: _out(consents.add(
-        r.context(), r.litellm(), r.args.org, r.args.user, r.args.server, r.args.purpose,
-        r.args.data_scope, r.args.text_version, r.args.granted_at or datetime.now(UTC),
-        r.args.valid_until, r.args.evidence_ref, r.args.evidence_sha256)),
-    "consent revoke": _printing(consents.revoke, "consent_id"),
-    "allowlist add": lambda r: _out(allowlists.add(
-        r.context(), r.args.kind, r.args.value, r.args.valid_from or datetime.now(UTC),
-        r.args.valid_until, r.args.org, r.args.note)),
-    "allowlist lift": _printing(allowlists.lift, "allowlist_id"),
+        r.context(), r.args.call_approval_id, _second(r)
+    ),
+    "call-approval reject": _done(approvals.call_reject, "call_approval_id"),
+    "call-approval cancel": _done(approvals.call_cancel, "call_approval_id"),
+    "consent add": _consent_add,
+    "consent revoke": _done(consents.revoke, "consent_id"),
+    "allowlist add": _allowlist_add,
+    "allowlist lift": _done(allowlists.lift, "allowlist_id"),
     "org add": lambda r: orgs.add(r.context(), r.args.org_id, r.args.name),
-    "org close": _printing(orgs.close, "org_id"),
+    "org close": _done(orgs.close, "org_id"),
     "org bind": lambda r: orgs.bind(r.context(), r.args.org, *_subject(r.args)),
     "org unbind": lambda r: orgs.unbind(r.context(), *_subject(r.args)),
     "settings default-org": lambda r: settings_store.set_default_org(
-        r.context(), None if r.args.clear else r.args.org),
+        r.context(), None if r.args.clear else r.args.org
+    ),
     "settings mode": lambda r: settings_store.set_mode(
-        r.context(), Mode(r.args.mode), r.cfg.mode_ceiling),
+        r.context(), Mode(r.args.mode), r.cfg.mode_ceiling
+    ),
     "settings observable": lambda r: settings_store.set_observable(
-        r.context(), r.args.reasons, r.args.policy_ids),
+        r.context(), r.args.reasons, r.args.policy_ids
+    ),
     "policy activate": _policy_activate,
     "ledger list": _ledger_list,
 }
@@ -344,7 +470,6 @@ def _a(*flags: str, **kwargs: Any) -> tuple[tuple[str, ...], dict[str, Any]]:
     return flags, kwargs
 
 
-_JSON = _a("--json", action="store_true", help="JSON으로 출력")
 _CONFIG = _a("--config", help="LiteLLM config.yaml 경로(기본: MINT_LITELLM_CONFIG)")
 _ENV_FILE = _a("--env-file", help="LiteLLM 환경 파일(KEY=VALUE)")
 _SECOND = _a("--second-approver", help="요청자와 다른 사용자의 운영자 토큰(또는 @파일)")
@@ -356,12 +481,13 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--org-id", default="default", help="기본 조직 식별자"),
         _a("--org-name", default="기본 조직", help="기본 조직 이름"),
         _a("--mcp-server", action="append", help="통제할 설정 서버(이름=URL, 반복 가능)"),
-        _a("--output", help="설정 조각을 쓸 파일(기본: 표준 출력)"),
+        _a("--out", default="config/litellm.mint.yaml",
+           help="설정 조각을 쓸 파일(기본: config/litellm.mint.yaml, -는 표준 출력)"),
         _a("--no-spend-logs", action="store_true",
            help="disable_spend_logs: true를 설정 조각에 포함"),
     ],
-    "check": [_CONFIG, _ENV_FILE, _JSON],
-    "status": [_CONFIG, _ENV_FILE, _JSON],
+    "check": [_CONFIG, _ENV_FILE],
+    "status": [_CONFIG, _ENV_FILE],
     "operator add": [
         _a("name"),
         _a("--role", required=True, choices=[r.value for r in OperatorRole]),
@@ -459,8 +585,14 @@ ARGUMENTS: dict[str, list[Any]] = {
     ],
     "policy activate": [
         _a("version", help="정책 판본 식별자"),
-        _a("--catalog-sha256", required=True),
-        _a("--bundle-sha256", required=True),
+        _a("--policy-root", default=os.environ.get("MINT_POLICY_ROOT", "/opt/mint"),
+           help="policy/ 디렉터리를 담은 루트(기본: MINT_POLICY_ROOT 또는 /opt/mint)"),
+        _a("--opa", default="opa", help="정책 시험에 쓸 opa 실행 파일"),
+        _a("--bundle-path",
+           default=os.environ.get("MINT_OPA_BUNDLE_PATH", "/bundles/mint.tar.gz"),
+           help="정책 엔진이 감시하는 번들 파일(공유 볼륨)"),
+        _a("--opa-url", help="정책 엔진 주소(기본: MINT_OPA_URL)"),
+        _a("--timeout", type=float, default=30.0, help="엔진 적재 확인 제한 시간(초)"),
     ],
     "ledger list": [
         _a("--kind"),
@@ -468,7 +600,6 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--until", type=_when),
         _a("--invocation-id", type=UUID),
         _a("--limit", type=int, default=100),
-        _JSON,
     ],
 }
 
@@ -491,6 +622,7 @@ def _add_arguments(parser: argparse.ArgumentParser, name: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog=PROGRAM, description="MINT 운영자 명령줄 도구")
     root.add_argument("--token-file", help="운영자 토큰 파일(기본: MINT_OPERATOR_TOKEN)")
+    root.add_argument("--json", action="store_true", help="결과를 JSON 한 개로 출력")
     tree: dict[tuple[str, ...], argparse._SubParsersAction] = {(): root.add_subparsers(
         dest="group0", metavar="명령", required=True)}
     for command in COMMANDS:
@@ -503,6 +635,8 @@ def build_parser() -> argparse.ArgumentParser:
                     dest=f"group{depth}", metavar="명령", required=True)
         leaf = tree[command.path[:-1]].add_parser(command.path[-1], help=command.summary)
         leaf.set_defaults(command_name=command.name)
+        leaf.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                          help="결과를 JSON 한 개로 출력")
         _add_arguments(leaf, command.name)
     return root
 
@@ -519,17 +653,53 @@ def _token(args: argparse.Namespace, environ: dict[str, str]) -> str | None:
     return environ.get("MINT_OPERATOR_TOKEN")
 
 
+def _event_entry(event: Any) -> dict[str, Any]:
+    """사건(객체 또는 행)을 JSON 출력용으로 줄인다. 식별자와 상태 버전은 source_key에서 읽는다."""
+    get = event.get if isinstance(event, dict) else lambda key: getattr(event, key)
+    key = str(get("source_key"))
+    entity, entity_id, version, _ = key.split(":", 3)
+    return {
+        "event_id": str(get("event_id")),
+        "kind": str(getattr(get("kind"), "value", get("kind"))),
+        "source_key": key,
+        "entity": entity,
+        "entity_id": entity_id,
+        "state_version": int(version),
+    }
+
+
+def _result(run: Run, command: CliCommand) -> dict[str, Any]:
+    entries = [_event_entry(e) for e in [*run.events(), *run.extra_events]]
+    result: dict[str, Any] = {"ok": run.failure is None, "command": command.name}
+    result.update(run.data)
+    if entries:
+        result.setdefault("id", entries[0]["entity_id"])
+        result["state_version"] = entries[0]["state_version"]
+        result["events"] = entries
+    return result
+
+
 def run_command(args: argparse.Namespace, environ: dict[str, str]) -> None:
     command = COMMAND_INDEX[args.command_name]
     cfg = ControlConfig.from_env(environ)
     with connect(cfg.require_database()) as conn:
         ctx = None
-        if not command.unauthenticated:
+        if command.name == "init":
+            ctx = Context(conn, cfg.instance_id, Operator("init", "admin", None))
+        elif not command.unauthenticated:
             operator = operators.authenticate(conn, cfg.instance_id, _token(args, environ))
             if OperatorRole(operator.role) not in command.roles:
                 raise AuthError(f"{command.name}은(는) {operator.role} 역할로 실행할 수 없습니다.")
             ctx = Context(conn, cfg.instance_id, operator)
-        HANDLERS[command.name](Run(args, cfg, environ, conn, ctx))
+        run = Run(args, cfg, environ, conn, ctx)
+        HANDLERS[command.name](run)
+    if args.json:
+        print(json.dumps(_result(run, command), ensure_ascii=False, default=str))
+    else:
+        for line in run.text:
+            print(line)
+    if run.failure:
+        raise ControlError(run.failure)
 
 
 def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = None) -> int:

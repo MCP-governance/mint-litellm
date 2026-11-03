@@ -356,8 +356,14 @@ def test_default_policy_ids_are_seeded_without_changing_the_ddl_default(conn):
 # --- 호출별 승인 ------------------------------------------------------------------
 
 
-def setup_policy(ctx, version="v1"):
-    policy_versions.activate(ctx, version, HEX, HEX, lambda *args: None)
+def setup_policy(conn, version="v1"):
+    """정책 엔진 없이 활성 판본 한 건을 만든다(호출별 승인이 판본 식별자를 참조한다)."""
+    conn.execute(
+        "INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256, bundle_sha256)"
+        " VALUES (%s, %s, %s, %s)", (INSTANCE, version, HEX, HEX))
+    for status in ("staged", "active"):
+        conn.execute("UPDATE mint.policy_versions SET status = %s, activated_at = now(),"
+                     " activated_by = 'x' WHERE id = %s", (status, version))
 
 
 def request_call(ctx, **overrides):
@@ -372,7 +378,7 @@ def test_call_approval_lifecycle_and_events(ctx, litellm, conn):
     prepare(ctx, litellm)
     with pytest.raises(ControlError, match="활성 정책 판본"):
         request_call(ctx)
-    setup_policy(ctx)
+    setup_policy(conn)
     call_id = request_call(ctx)
     row = fetchone(conn, "SELECT * FROM mint.call_approvals")
     assert (row["status"], row["policy_version_id"]) == ("pending", "v1")
@@ -391,7 +397,7 @@ def test_call_approval_lifecycle_and_events(ctx, litellm, conn):
 
 def test_call_approval_cannot_be_approved_by_the_calling_user(ctx, litellm, conn):
     prepare(ctx, litellm)
-    setup_policy(ctx)
+    setup_policy(conn)
     call_id = request_call(ctx)
     subject = make_ctx(conn, "alice-op", "approver", user_id="alice")
     with pytest.raises(ControlError, match="호출 주체와 같은 사용자"):
@@ -405,7 +411,7 @@ def test_call_approval_cannot_be_approved_by_the_calling_user(ctx, litellm, conn
 
 def test_call_approval_requester_needs_a_second_person(ctx, litellm, conn):
     prepare(ctx, litellm)
-    setup_policy(ctx)
+    setup_policy(conn)
     call_id = request_call(ctx, requested_by="carol")
     carol = make_ctx(conn, "carol-op", "approver", user_id="carol")
     with pytest.raises(ControlError, match="요청자와 같은 사용자"):
@@ -418,7 +424,7 @@ def test_call_approval_requester_needs_a_second_person(ctx, litellm, conn):
 
 def test_call_approval_input_validation(ctx, litellm, conn):
     prepare(ctx, litellm)
-    setup_policy(ctx)
+    setup_policy(conn)
     for override, message in (
         ({"principal_type": "robot"}, "principal-type"),
         ({"args_fp": "xyz"}, "args-fp"),
@@ -430,7 +436,7 @@ def test_call_approval_input_validation(ctx, litellm, conn):
 
 def test_expired_call_approval_cannot_be_approved(ctx, litellm, conn):
     prepare(ctx, litellm)
-    setup_policy(ctx)
+    setup_policy(conn)
     call_id = request_call(ctx)
     conn.execute("ALTER TABLE mint.call_approvals DISABLE TRIGGER call_approvals_2_frozen")
     conn.execute("UPDATE mint.call_approvals SET expires_at = now() - interval '1 minute'")
@@ -485,35 +491,16 @@ def test_allowlist_add_and_lift(ctx, conn):
     assert count(conn, "allowlist_added") == 2 and count(conn, "allowlist_lifted") == 1
 
 
-def test_policy_activation_supersedes_the_previous_version(ctx, conn):
-    seen = []
-    policy_versions.activate(ctx, "v1", HEX, HEX, lambda *a: seen.append(a))
-    other = "cd" * 32
-    policy_versions.activate(ctx, "v2", HEX, other, lambda *a: seen.append(a))
-    found = fetchall(conn, "SELECT id, status FROM mint.policy_versions")
-    rows = {r["id"]: r["status"] for r in found}
-    assert rows == {"v1": "superseded", "v2": "active"}
-    assert seen == [("v1", HEX, HEX), ("v2", HEX, other)]
-    assert [e["payload"]["superseded"] for e in events(conn, "policy_activated")] == [None, "v1"]
-    with pytest.raises(ControlError, match="다른 해시"):
-        policy_versions.activate(ctx, "v2", HEX, HEX, lambda *a: None)
-    with pytest.raises(ControlError, match="superseded"):
-        policy_versions.activate(ctx, "v1", HEX, HEX, lambda *a: None)
-
-
-def test_policy_activation_that_fails_verification_leaves_nothing(ctx, conn):
-    def failing(*args):
-        raise ControlError("해시 불일치")
-
-    with pytest.raises(ControlError, match="해시 불일치"):
-        policy_versions.activate(ctx, "v1", HEX, HEX, failing)
-    assert fetchone(conn, "SELECT count(*) AS n FROM mint.policy_versions")["n"] == 0
-    assert count(conn, "policy_activated") == 0
-
-
-def test_a_missing_policy_verifier_blocks_activation(monkeypatch):
-    import sys
-
-    monkeypatch.setitem(sys.modules, "mint_litellm.plugin.policy.bundle", None)
-    with pytest.raises(ControlError, match="검증 모듈"):
-        policy_versions.load_verifier()
+def test_policy_activation_is_refused_for_settled_versions_and_bad_sources(conn, tmp_path):
+    source = policy_versions.PolicySource(
+        root=tmp_path, opa="opa", bundle_path=tmp_path / "mint.tar.gz",
+        opa_url="http://opa.test:8181", timeout_seconds=1,
+    )
+    with pytest.raises(ControlError, match="정책 번들이 올바르지"):
+        policy_versions.activate(conn, "unused", INSTANCE, "root", "v1", source)
+    setup_policy(conn)
+    with pytest.raises(ControlError, match="active 상태"):
+        policy_versions.activate(conn, "unused", INSTANCE, "root", "v1", source)
+    with pytest.raises(ControlError, match="정책 번들이 올바르지"):
+        policy_versions.activate(conn, "unused", INSTANCE, "root", "v-new", source)
+    assert fetchone(conn, "SELECT count(*) AS n FROM mint.policy_versions")["n"] == 1

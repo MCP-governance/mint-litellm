@@ -1,81 +1,90 @@
-"""정책 판본 활성화의 데이터베이스 단계.
+"""정책 판본 활성화. 번들 준비·게시·정책 엔진 일치 확인·활성 전환은 정책 모듈이 수행한다."""
 
-번들 검증과 정책 엔진 적재는 ``verify``가 맡는다. ``verify``는 실제로 적재된 번들의 해시를
-확인하지 못하면 예외를 던져야 하며, 그 경우 판본은 만들어지지 않는다.
-"""
+import asyncio
+import os
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
 
-from collections.abc import Callable
+import httpx
+import psycopg
 
-from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchone
 from mint_litellm.control.errors import ControlError
-from mint_litellm.types.events import EventKind
+from mint_litellm.plugin.policy import bundle as policy_bundle
 
-Verifier = Callable[[str, str, str], None]
-"""``verify(version_id, catalog_sha256, bundle_sha256)``"""
+
+@dataclass(frozen=True)
+class PolicySource:
+    root: Path
+    opa: str
+    bundle_path: Path
+    opa_url: str
+    timeout_seconds: float
 
 
 def activate(
-    ctx: Context, version_id: str, catalog_sha256: str, bundle_sha256: str, verify: Verifier
+    conn: psycopg.Connection,
+    database_url: str,
+    instance_id: str,
+    actor: str,
+    version_id: str,
+    source: PolicySource,
 ) -> None:
-    existing = fetchone(
-        ctx.conn,
-        "SELECT status, catalog_sha256, bundle_sha256 FROM mint.policy_versions"
-        " WHERE instance_id = %s AND id = %s FOR UPDATE",
-        (ctx.instance_id, version_id),
-    )
-    if existing and (existing["catalog_sha256"], existing["bundle_sha256"]) != (
-        catalog_sha256,
-        bundle_sha256,
-    ):
-        raise ControlError(f"판본 {version_id}은(는) 다른 해시로 이미 등록되어 있습니다.")
-    if existing and existing["status"] in ("active", "superseded"):
-        raise ControlError(
-            f"판본 {version_id}은(는) {existing['status']} 상태입니다. 새 판본으로 등록하십시오."
-        )
-    verify(version_id, catalog_sha256, bundle_sha256)
-    if existing is None:
-        ctx.conn.execute(
-            "INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256, bundle_sha256)"
-            " VALUES (%s, %s, %s, %s)",
-            (ctx.instance_id, version_id, catalog_sha256, bundle_sha256),
-        )
-    ctx.conn.execute(
-        "UPDATE mint.policy_versions SET status = 'staged'"
-        " WHERE instance_id = %s AND id = %s AND status = 'validated'",
-        (ctx.instance_id, version_id),
-    )
-    previous = fetchone(
-        ctx.conn,
-        "UPDATE mint.policy_versions SET status = 'superseded'"
-        " WHERE instance_id = %s AND status = 'active' RETURNING id",
-        (ctx.instance_id,),
-    )
+    """``version_id``로 번들을 준비해 등록하고 활성화한다.
+
+    등록만 되고 전환에 실패한 ``validated`` 판본은 같은 명령으로 다시 게시·활성화한다.
+    """
     row = fetchone(
-        ctx.conn,
-        "UPDATE mint.policy_versions SET status = 'active', activated_at = now(),"
-        " activated_by = %s WHERE instance_id = %s AND id = %s RETURNING state_version",
-        (ctx.operator.name, ctx.instance_id, version_id),
+        conn,
+        "SELECT status FROM mint.policy_versions WHERE instance_id = %s AND id = %s",
+        (instance_id, version_id),
     )
-    ctx.emit(
-        EventKind.POLICY_ACTIVATED,
-        version_id,
-        row["state_version"],
-        {
-            "policy_version_id": version_id,
-            "catalog_sha256": catalog_sha256,
-            "bundle_sha256": bundle_sha256,
-            "superseded": None if previous is None else previous["id"],
-        },
-    )
-
-
-def load_verifier() -> Verifier:
-    """정책 레인의 번들 검증 모듈을 불러온다. 없으면 활성화할 수 없다."""
-    try:
-        from mint_litellm.plugin.policy.bundle import verify_and_load  # type: ignore[import-not-found]
-    except ImportError:
+    if row and row["status"] != "validated":
         raise ControlError(
-            "정책 번들 검증 모듈이 이 설치본에 없어 정책을 활성화할 수 없습니다."
+            f"판본 {version_id}은(는) {row['status']} 상태입니다. "
+            "새 판본 이름으로 다시 실행하십시오."
+        )
+    try:
+        bundle = policy_bundle.prepare_bundle(source.root, version_id, opa=source.opa)
+    except FileNotFoundError as error:
+        raise ControlError(f"정책 번들을 준비할 수 없습니다: {error}") from None
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or b"").decode("utf-8", "replace").strip()
+        raise ControlError(f"정책 시험이 실패했습니다: {detail}") from None
+    except (ValueError, OSError, KeyError) as error:
+        raise ControlError(f"정책 번들이 올바르지 않습니다: {error}") from None
+
+    async def publish(archive: bytes) -> None:
+        policy_bundle.publish_bundle(source.bundle_path, archive)
+        # 임시 파일은 소유자만 읽을 수 있는데, 정책 엔진은 다른 사용자로 실행된다.
+        os.chmod(source.bundle_path, 0o644)
+
+    async def run() -> None:
+        async with await psycopg.AsyncConnection.connect(database_url) as aconn:
+            if row is None:
+                await policy_bundle.register_bundle(
+                    aconn, instance_id=instance_id, bundle=bundle
+                )
+            activate_fn = (
+                policy_bundle.retry_activation if row else policy_bundle.activate_bundle
+            )
+            await activate_fn(
+                aconn,
+                instance_id=instance_id,
+                actor=actor,
+                bundle=bundle,
+                publish=publish,
+                opa_url=source.opa_url,
+                timeout_seconds=source.timeout_seconds,
+            )
+
+    try:
+        asyncio.run(run(), loop_factory=asyncio.SelectorEventLoop)
+    except TimeoutError:
+        raise ControlError(
+            "정책 엔진이 시간 안에 새 번들을 적재하지 않았습니다. 판본은 활성화되지 않았으며 "
+            "같은 명령으로 다시 시도할 수 있습니다."
         ) from None
-    return verify_and_load
+    except (ValueError, OSError, httpx.HTTPError) as error:
+        raise ControlError(f"정책 활성화에 실패했습니다: {error}") from None

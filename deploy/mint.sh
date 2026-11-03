@@ -29,18 +29,17 @@ cli() {
     "${COMPOSE[@]}" run --rm control "$@"
 }
 
-publish_bundle_if_given() {
-    [ -n "${MINT_POLICY_BUNDLE:-}" ] || return 0
-    [ -f "$MINT_POLICY_BUNDLE" ] || fail "정책 번들 파일이 없습니다: $MINT_POLICY_BUNDLE"
-    "${COMPOSE[@]}" run --rm --no-deps -T \
-        -v "$(cd "$(dirname "$MINT_POLICY_BUNDLE")" && pwd)/$(basename "$MINT_POLICY_BUNDLE"):/in/bundle.tar.gz:ro" \
-        --entrypoint sh control -c \
-        "cp /in/bundle.tar.gz ${BUNDLE_FILE}.tmp && mv ${BUNDLE_FILE}.tmp ${BUNDLE_FILE}"
-}
-
-require_bundle() {
-    "${COMPOSE[@]}" run --rm --no-deps -T --entrypoint sh control -c "test -f ${BUNDLE_FILE}" \
-        || fail "정책 번들이 게시되어 있지 않습니다. MINT_POLICY_BUNDLE=<번들 파일>로 up을 다시 실행하십시오."
+# 정책 엔진은 번들 파일이 있어야 기동한다. 파일이 없으면 저장소의 기본 정책으로 첫 번들을 게시하고,
+# 판본 등록과 활성화는 policy activate가 수행한다.
+ensure_bundle() {
+    "${COMPOSE[@]}" run --rm --no-deps -T --entrypoint python control -c "
+from pathlib import Path
+from mint_litellm.plugin.policy.bundle import prepare_bundle, publish_bundle
+target = Path('${BUNDLE_FILE}')
+if not target.exists():
+    publish_bundle(target, prepare_bundle(Path('/opt/mint'), 'initial').archive)
+    target.chmod(0o644)
+"
 }
 
 cmd_up() {
@@ -48,9 +47,8 @@ cmd_up() {
     [ -f config/litellm.config.yaml ] || cp litellm.config.example.yaml config/litellm.config.yaml
     "${COMPOSE[@]}" build litellm
     "${COMPOSE[@]}" up -d --wait postgres
-    admin_cli init >/dev/null
-    publish_bundle_if_given
-    require_bundle
+    admin_cli init --out /app/config/litellm.mint.yaml >/dev/null
+    ensure_bundle
     "${COMPOSE[@]}" up -d opa litellm
     echo "기동했습니다. 상태: ./mint.sh status"
 }
@@ -92,7 +90,7 @@ cmd_upgrade() {
     require_env
     "${COMPOSE[@]}" build litellm
     "${COMPOSE[@]}" up -d --wait postgres
-    admin_cli init >/dev/null
+    admin_cli init --out /app/config/litellm.mint.yaml >/dev/null
     "${COMPOSE[@]}" up -d litellm
     echo "업그레이드했습니다."
 }

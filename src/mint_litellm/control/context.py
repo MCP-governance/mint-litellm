@@ -1,6 +1,6 @@
 """명령 한 건의 실행 맥락: 연결, 배치, 인증된 운영자."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import psycopg
@@ -21,6 +21,7 @@ class Context:
     conn: psycopg.Connection
     instance_id: str
     operator: Operator
+    emitted: list = field(default_factory=list)
 
     def emit(
         self,
@@ -30,7 +31,7 @@ class Context:
         payload: dict[str, Any],
         subject: dict[str, Any] | None = None,
     ):
-        return ledger.record(
+        event = ledger.record(
             self.conn,
             self.instance_id,
             kind,
@@ -40,3 +41,5 @@ class Context:
             payload=payload,
             subject=subject,
         )
+        self.emitted.append(event)
+        return event

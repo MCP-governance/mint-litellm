@@ -16,8 +16,9 @@ services:
       retries: 20
     restart: unless-stopped
 
-  # 번들 모드로 띄우고 번들 파일을 감시한다. 번들 볼륨은 제어 평면과 공유하며
-  # 호스트 바인드 마운트는 파일 변경 알림이 전달되지 않아 쓰지 않는다.
+  # 번들 모드(--bundle)로 띄우고 번들 파일을 감시한다. --bundle 없이 타르볼을 감시하면 재적재 때
+  # 이전 파일과 새 파일이 함께 남아 적재가 실패한다. 번들 디렉터리는 제어 평면 컨테이너와 공유하는
+  # 명명 볼륨이어야 하며, 호스트 디렉터리 바인드 마운트는 파일 변경 알림이 전달되지 않는다.
   opa:
     image: openpolicyagent/opa:1.21.4@sha256:12420358d3f22a0cd2424ddc44a16e292ecb42825d3dfbca779986006822a3f6
     command: ["run", "--server", "--addr", ":8181", "--bundle", "--watch", "/bundles/mint.tar.gz"]
@@ -70,8 +71,11 @@ services:
       MINT_LITELLM_URL: http://litellm:4000
       MINT_LITELLM_CONFIG: /app/config/litellm.config.yaml
       MINT_OPERATOR_TOKEN: ${MINT_OPERATOR_TOKEN:-}
+      MINT_OPA_URL: http://opa:8181
+      MINT_POLICY_ROOT: /opt/mint
+      MINT_OPA_BUNDLE_PATH: /bundles/mint.tar.gz
     volumes:
-      - ./config:/app/config:ro
+      - ./config:/app/config
       - bundles:/bundles
     depends_on:
       postgres:
