@@ -1,0 +1,429 @@
+"""기동 자가 점검과 플러그인 실행 상태.
+
+플러그인은 ``unverified`` 상태로 시작해 모든 MCP 호출을 차단하고, LiteLLM 앱이 기동을 마친 뒤
+워커마다 8개 항목을 프로세스 안에서 확인한다. 모두 통과해야 ``verified``가 된다. 점검이
+실패하면 사건을 남기고(``MINT_REQUIRED``가 참이면) 프로세스를 멈춘다. LiteLLM의 키나 관리
+API는 쓰지 않는다.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import multiprocessing
+import os
+import signal
+import time
+import urllib.request
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
+
+from mint_litellm.compat import litellm_1_106 as compat
+from mint_litellm.compat.litellm_1_106 import RegistryEntry
+from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer
+from mint_litellm.plugin.config import PluginConfig
+from mint_litellm.plugin.discovery import DiscoveryResult, evaluate_listed_tool
+from mint_litellm.plugin.pipeline import (
+    Outcome,
+    PipelineDeps,
+    PolicyEvaluate,
+    build_request,
+    evaluate_request,
+)
+from mint_litellm.plugin.result import ResultDeps
+from mint_litellm.plugin.snapshot import PluginDatabase, RegisteredServer
+from mint_litellm.types.decision import OperationType
+from mint_litellm.types.events import Event, EventKind, control_source_key
+from mint_litellm.types.ids import new_uuid7
+from mint_litellm.types.settings import SELF_CHECK_DESCRIPTIONS, SelfCheckItem
+
+log = logging.getLogger("mint_litellm.selfcheck")
+
+REQUIRED_MODES = ("pre_mcp_call", "post_mcp_call")
+# 통제 대상이 아닌 서버 상태. 이 서버는 LiteLLM에 없어도 기동을 막지 않는다.
+INACTIVE_SERVER_STATUSES = frozenset({"rejected", "terminated"})
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    item: SelfCheckItem
+    ok: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class LiteLLMView:
+    """점검 시점에 프로세스 안에서 읽은 LiteLLM 상태."""
+
+    callbacks: Sequence[Any]
+    general_settings: Mapping[str, Any]
+    strict_guardrail_modes: bool
+    store_prompts_in_spend_logs: bool
+    user_url_validation: bool
+    registry: Sequence[RegistryEntry]
+    missing_symbols: Sequence[str]
+
+
+def collect_view(env: Mapping[str, str] | None = None) -> LiteLLMView:
+    missing = compat.missing_symbols()
+    if missing:
+        return LiteLLMView((), {}, True, False, True, (), missing)
+    return LiteLLMView(
+        callbacks=compat.litellm_callbacks(),
+        general_settings=compat.general_settings(),
+        strict_guardrail_modes=compat.strict_guardrail_modes_enabled(
+            os.environ if env is None else env
+        ),
+        store_prompts_in_spend_logs=compat.spend_logs_store_prompts(),
+        user_url_validation=compat.litellm_attribute("user_url_validation", True) is not False,
+        registry=compat.registry_entries(),
+        missing_symbols=(),
+    )
+
+
+def _hook_names(event_hook: Any) -> set[str]:
+    if event_hook is None:
+        return set()
+    items = event_hook if isinstance(event_hook, (list, tuple, set)) else [event_hook]
+    return {str(getattr(i, "value", i)) for i in items}
+
+
+def _is_guardrail(callback: Any) -> bool:
+    return hasattr(callback, "guardrail_name") and hasattr(callback, "event_hook")
+
+
+def _runs_before_tool_call(callback: Any) -> bool:
+    event_hook = getattr(callback, "event_hook", None)
+    return event_hook is None or "pre_mcp_call" in _hook_names(event_hook)
+
+
+def check_items(
+    view: LiteLLMView,
+    *,
+    logger: Any,
+    guardrail: Any,
+    controlled: Sequence[RegisteredServer] | None,
+) -> list[CheckResult]:
+    """8개 항목을 확인한다. ``controlled``가 ``None``이면 MINT DB를 읽지 못한 것이다."""
+    results: list[CheckResult] = []
+
+    def add(item: SelfCheckItem, ok: bool, detail: str = "") -> None:
+        results.append(CheckResult(item, ok, "" if ok else detail))
+
+    callbacks = list(view.callbacks)
+    positions = {id(cb): i for i, cb in enumerate(callbacks)}
+
+    add(
+        SelfCheckItem.CALLBACK_REGISTERED,
+        logger is not None and id(logger) in positions,
+        "logger is not registered in litellm_settings.callbacks",
+    )
+
+    modes = _hook_names(getattr(guardrail, "event_hook", None)) if guardrail else set()
+    add(
+        SelfCheckItem.GUARDRAIL_MODES,
+        guardrail is not None
+        and id(guardrail) in positions
+        and all(m in modes for m in REQUIRED_MODES)
+        and getattr(guardrail, "default_on", False) is True,
+        "guardrail is missing, lacks a mode, or is not default_on",
+    )
+
+    order_ok = False
+    if guardrail is not None and logger is not None:
+        g_pos, l_pos = positions.get(id(guardrail)), positions.get(id(logger))
+        later = [
+            cb
+            for i, cb in enumerate(callbacks)
+            if g_pos is not None and i > g_pos and _is_guardrail(cb) and _runs_before_tool_call(cb)
+        ]
+        order_ok = (
+            g_pos is not None
+            and l_pos is not None
+            and l_pos < g_pos
+            and not later
+            and getattr(guardrail, "run_in_parallel", False) is False
+        )
+    add(
+        SelfCheckItem.GUARDRAIL_ORDER,
+        order_ok,
+        "MINT guardrail must follow the logger and be the last pre-call guardrail",
+    )
+
+    by_id = {entry.server_id: entry for entry in view.registry}
+    if controlled is None:
+        add(SelfCheckItem.KEY_ACCESS_STRICT, False, "MINT database unavailable")
+        add(SelfCheckItem.SERVER_REGISTRY_MATCH, False, "MINT database unavailable")
+    else:
+        active = [s for s in controlled if s.status not in INACTIVE_SERVER_STATUSES]
+        open_servers = [
+            s.server_id for s in active if getattr(by_id.get(s.server_id), "allow_all_keys", False)
+        ]
+        strict = view.general_settings.get("require_key_mcp_access_defined") is True
+        add(
+            SelfCheckItem.KEY_ACCESS_STRICT,
+            strict and not open_servers,
+            "require_key_mcp_access_defined must be true"
+            if not strict
+            else f"allow_all_keys is set on {', '.join(open_servers[:5])}",
+        )
+        mismatched = []
+        for server in active:
+            entry = by_id.get(server.server_id)
+            if entry is None or (entry.url_sha256, entry.transport, entry.auth_type) != (
+                server.url_sha256,
+                server.transport,
+                server.auth_type,
+            ):
+                mismatched.append(server.server_id)
+        add(
+            SelfCheckItem.SERVER_REGISTRY_MATCH,
+            not mismatched,
+            f"registry differs from the approved contract: {', '.join(mismatched[:5])}",
+        )
+
+    owners: dict[str, set[str]] = {}
+    for entry in view.registry:
+        for name in entry.names:
+            owners.setdefault(name.replace(" ", "_"), set()).add(entry.server_id)
+    clashes = sorted(name for name, ids in owners.items() if len(ids) > 1)
+    add(
+        SelfCheckItem.NAME_ALIAS_UNIQUE,
+        not clashes,
+        f"names shared by several servers: {', '.join(clashes[:5])}",
+    )
+
+    add(
+        SelfCheckItem.COMPAT_SYMBOLS,
+        not view.missing_symbols,
+        f"missing: {', '.join(view.missing_symbols[:5])}",
+    )
+
+    problems = []
+    if not view.strict_guardrail_modes:
+        problems.append("LITELLM_STRICT_GUARDRAIL_MODES=false")
+    if view.store_prompts_in_spend_logs:
+        problems.append("store_prompts_in_spend_logs=true")
+    if not view.user_url_validation:
+        problems.append("user_url_validation=false")
+    supported = view.general_settings.get("supported_db_objects")
+    if isinstance(supported, list) and "mcp" not in [str(s) for s in supported]:
+        problems.append("supported_db_objects lacks mcp")
+    add(SelfCheckItem.REQUIRED_SETTINGS, not problems, "; ".join(problems))
+    return results
+
+
+def terminate_process() -> None:
+    """프록시를 멈춘다. 워커이면 감독 프로세스에도 종료를 알려 컨테이너 재시작 정책이 받게 한다."""
+    parent = os.getppid()
+    if multiprocessing.parent_process() is not None or parent > 1:
+        with contextlib.suppress(OSError):
+            os.kill(parent, signal.SIGTERM)
+    os._exit(3)
+
+
+async def wait_for_readiness(url: str, timeout: float) -> bool:
+    def probe() -> bool:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:  # noqa: S310
+                return response.status == 200
+        except Exception:
+            return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await asyncio.to_thread(probe):
+            return True
+        await asyncio.sleep(0.25)
+    return False
+
+
+def load_policy_evaluator(config: PluginConfig) -> PolicyEvaluate | None:
+    if config.opa_url is None:
+        return None
+    try:
+        from mint_litellm.plugin.policy.opa_client import OPAClient
+    except ImportError as exc:
+        raise RuntimeError("MINT_OPA_URL is set but the policy client is not installed") from exc
+    return OPAClient(config.opa_url, config.decision_budget_seconds).evaluate
+
+
+@dataclass
+class PluginRuntime:
+    """한 워커 프로세스의 플러그인 상태. 로거와 가드레일이 공유한다."""
+
+    config: PluginConfig
+    database: PluginDatabase
+    recorder: EvidenceRecorder
+    evaluate: PolicyEvaluate | None
+    view_collector: Callable[[], LiteLLMView] = collect_view
+    terminate: Callable[[], None] = terminate_process
+    readiness: Callable[[str, float], Awaitable[bool]] = wait_for_readiness
+    retry_seconds: float = 1.0
+    recheck_seconds: float = 30.0
+    verified: bool = False
+    logger: Any = None
+    guardrail: Any = None
+    last_results: list[CheckResult] = field(default_factory=list)
+    _task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    @property
+    def deps(self) -> PipelineDeps:
+        return PipelineDeps(
+            config=self.config,
+            snapshots=self.database,
+            recorder=self.recorder,
+            evaluate=self.evaluate,
+            verified=lambda: self.verified,
+        )
+
+    @property
+    def result_deps(self) -> ResultDeps:
+        return ResultDeps(config=self.config, database=self.database, recorder=self.recorder)
+
+    async def judge_call(self, data: Mapping[str, Any], auth: Any, *, unverified: bool = False):
+        deps = self.deps if not unverified else _unverified(self.deps)
+        request = build_request(
+            data,
+            auth,
+            operation=OperationType.TOOL_CALL,
+            instance_id=self.config.instance_id,
+            hook_parser=compat.parse_hook_data,
+            resolver=compat.resolve_server,
+            principal_factory=compat.principal_from_auth,
+        )
+        outcome: Outcome = await evaluate_request(request, deps)
+        return outcome
+
+    async def judge_listed_tool(self, data: Mapping[str, Any], auth: Any) -> DiscoveryResult:
+        return await evaluate_listed_tool(
+            data,
+            auth,
+            self.deps,
+            hook_parser=compat.parse_hook_data,
+            resolver=compat.resolve_listed_server,
+            principal_factory=compat.principal_from_auth,
+        )
+
+    async def run_checks(self) -> list[CheckResult]:
+        try:
+            controlled: Sequence[RegisteredServer] | None = await asyncio.wait_for(
+                self.database.registered_servers(self.config.instance_id),
+                self.config.decision_budget_seconds * 10,
+            )
+        except Exception:
+            controlled = None
+        results = check_items(
+            self.view_collector(),
+            logger=self.logger,
+            guardrail=self.guardrail,
+            controlled=controlled,
+        )
+        self.last_results = results
+        return results
+
+    async def verify(self) -> bool:
+        results = await self.run_checks()
+        self.verified = all(r.ok for r in results)
+        return self.verified
+
+    def ensure_started(self) -> None:
+        """실행 중인 이벤트 루프가 있으면 기동 후 점검을 예약한다(워커마다 한 번)."""
+        if self._task is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._task = loop.create_task(self._startup())
+
+    async def _startup(self) -> None:
+        try:
+            url = self.config.readiness_url or (
+                f"http://localhost:{os.environ.get('PORT', '4000')}/health/readiness"
+            )
+            await self.readiness(url, 300.0)
+            deadline = time.monotonic() + self.config.selfcheck_grace_seconds
+            while True:
+                if await self.verify():
+                    log.info("MINT 자가 점검 통과")
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(self.retry_seconds)
+            await self._fail()
+            if self.config.required:
+                self.terminate()
+                return
+            while not await self.verify():
+                await asyncio.sleep(self.recheck_seconds)
+        except Exception as exc:
+            log.error("자가 점검 실행 오류: %s", type(exc).__name__)
+            await self._fail(error=type(exc).__name__)
+            if self.config.required:
+                self.terminate()
+
+    async def _fail(self, error: str | None = None) -> None:
+        failed = [
+            {"item": int(r.item), "name": r.item.name, "detail": r.detail}
+            for r in self.last_results
+            if not r.ok
+        ]
+        payload: dict[str, Any] = {"failed": failed}
+        if error is not None:
+            payload["error"] = error
+        event = Event(
+            instance_id=self.config.instance_id,
+            inserted_at=datetime.now(UTC),
+            kind=EventKind.ENFORCEMENT_UNVERIFIED,
+            source_key=control_source_key(EventKind.ENFORCEMENT_UNVERIFIED, str(new_uuid7()), 1),
+            payload=payload,
+        )
+        await self.recorder.record(event)
+        log.error(
+            "MINT 자가 점검 실패: %s",
+            ", ".join(f"{SELF_CHECK_DESCRIPTIONS[r.item]}" for r in self.last_results if not r.ok)
+            or (error or "unknown"),
+        )
+
+
+def _unverified(deps: PipelineDeps) -> PipelineDeps:
+    return PipelineDeps(
+        config=deps.config,
+        snapshots=deps.snapshots,
+        recorder=deps.recorder,
+        evaluate=deps.evaluate,
+        verified=lambda: False,
+        clock=deps.clock,
+    )
+
+
+_runtime: PluginRuntime | None = None
+
+
+def get_runtime(env: Mapping[str, str] | None = None) -> PluginRuntime:
+    """프로세스 전역 실행 상태. 처음 부를 때 환경 변수에서 설정을 읽는다."""
+    global _runtime
+    if _runtime is None:
+        config = PluginConfig.from_env(os.environ if env is None else env)
+        database = PluginDatabase(
+            config.database_url,
+            max_size=config.db_pool_size,
+            acquire_timeout=config.decision_budget_seconds,
+        )
+        recorder = EvidenceRecorder(
+            database,
+            LocalBuffer(config.buffer_dir, config.buffer_max_bytes),
+            budget_seconds=config.decision_budget_seconds,
+            instance_id=config.instance_id,
+        )
+        _runtime = PluginRuntime(
+            config=config,
+            database=database,
+            recorder=recorder,
+            evaluate=load_policy_evaluator(config),
+        )
+    return _runtime
