@@ -1,6 +1,7 @@
 """명령줄 도구: 명령 표와의 일치, 인증·역할, 성공 경로, 종료 코드."""
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from litellm_stub import CONTROL_KEY, GOOD_KEY
@@ -9,6 +10,8 @@ psycopg = pytest.importorskip("psycopg")
 
 from mint_litellm import cli  # noqa: E402
 from mint_litellm.types.cli_commands import COMMANDS, OperatorRole  # noqa: E402
+
+FAR_FUTURE = (datetime.now(UTC) + timedelta(days=400)).isoformat()
 
 
 def test_every_command_in_the_table_has_a_handler_and_a_parser():
@@ -141,7 +144,7 @@ def _minimal_argv(path):
     parser = cli.build_parser()
     required = {
         "--role": "viewer", "--relation": "r", "--scope": "key", "--scope-id": "s",
-        "--tools": "t", "--valid-until": "2099-01-01", "--basis": "b", "--requested-by": "u",
+        "--tools": "t", "--valid-until": FAR_FUTURE, "--basis": "b", "--requested-by": "u",
         "--reason": "r", "--org": "o", "--server": "s", "--purpose": "p",
         "--principal-type": "user",
         "--principal-id": "p", "--tool": "t", "--args-fp": "0" * 64, "--user": "u",
@@ -196,7 +199,7 @@ def test_full_activation_path_through_the_cli(mint):
     relation = out.strip()
     # 신청자와 승인자가 같은 사용자이면 거부, --second-approver로 다른 사용자가 확인하면 허용
     args = ["approve", "--relation", relation, "--scope", "key", "--scope-id", GOOD_KEY,
-            "--tools", "echo", "--valid-until", "2099-01-01", "--basis", "근거",
+            "--tools", "echo", "--valid-until", FAR_FUTURE, "--basis", "근거",
             "--requested-by", "human-1"]
     code, _, err = mint.run(*args, token=appr)
     assert code == 1 and "--second-approver" in err
