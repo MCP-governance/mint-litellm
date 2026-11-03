@@ -396,12 +396,19 @@ CREATE INDEX events_by_time ON mint.events (instance_id, inserted_at);
 CREATE INDEX events_by_invocation ON mint.events (invocation_id) WHERE invocation_id IS NOT NULL;
 CREATE INDEX events_unsealed ON mint.events (inserted_at, event_id) WHERE seal_seq IS NULL;
 
--- 원장은 추가만 가능하다. 봉인 열만 한 번 채울 수 있다.
+-- 원장은 추가만 가능하다. 봉인 열은 삽입 때 지워지고 봉인자의 수정으로만 한 번 채워진다.
 CREATE FUNCTION mint.guard_events() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     seal_cols text[] := ARRAY['seal_seq', 'prev_hash', 'row_hash', 'sealed_at'];
 BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.seal_seq := NULL;
+        NEW.prev_hash := NULL;
+        NEW.row_hash := NULL;
+        NEW.sealed_at := NULL;
+        RETURN NEW;
+    END IF;
     IF TG_OP = 'UPDATE' THEN
         IF OLD.seal_seq IS NULL AND (to_jsonb(NEW) - seal_cols) = (to_jsonb(OLD) - seal_cols) THEN
             RETURN NEW;
@@ -413,7 +420,7 @@ BEGIN
 END $$;
 
 CREATE TRIGGER events_guard
-    BEFORE UPDATE OR DELETE ON mint.events
+    BEFORE INSERT OR UPDATE OR DELETE ON mint.events
     FOR EACH ROW EXECUTE FUNCTION mint.guard_events();
 
 CREATE FUNCTION mint.guard_events_truncate() RETURNS trigger

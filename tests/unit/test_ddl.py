@@ -780,3 +780,25 @@ def test_sealer_role_can_only_fill_seal_columns(db, base):
         " WHERE source_key = %s",
         (b"\x03" * 32, key),
     )
+
+
+@pytest.mark.parametrize("role", [None, "mint_ledger_writer", "mint_plugin", "mint_control"])
+def test_inserted_events_never_carry_seal_columns(db, role):
+    if role:
+        db.execute(f"SET LOCAL ROLE {role}")
+    key, _ = add_event(
+        db,
+        seal_seq=7,
+        prev_hash=b"" * 32,
+        row_hash=b"" * 32,
+        sealed_at=NOW,
+    )
+    if role:
+        db.execute("RESET ROLE")
+    stored = db.execute(
+        "SELECT seal_seq, prev_hash, row_hash, sealed_at FROM mint.events WHERE source_key = %s",
+        (key,),
+    ).fetchone()
+    assert stored == (None, None, None, None)
+    unsealed = scalar(db, "SELECT count(*) FROM mint.events WHERE seal_seq IS NULL")
+    assert unsealed == 1
