@@ -500,6 +500,23 @@ CREATE TRIGGER denials_2_frozen BEFORE UPDATE ON mint.denials
 CREATE TRIGGER denials_3_once BEFORE UPDATE ON mint.denials
     FOR EACH ROW EXECUTE FUNCTION mint.set_once('lifted_at', 'lifted_by');
 
+-- 판정 프로세스 역할만 가진 접속은 승인된 호출별 승인을 소비하는 전이만 할 수 있다.
+-- 제어 평면 역할의 구성원과 슈퍼유저는 제한을 받지 않는다.
+CREATE FUNCTION mint.restrict_plugin_call_approval() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF pg_has_role(current_user, 'mint_plugin', 'MEMBER')
+       AND NOT pg_has_role(current_user, 'mint_control', 'MEMBER')
+       AND NOT (OLD.status = 'approved' AND NEW.status = 'consumed'
+                AND NEW.consumed_invocation_id IS NOT NULL) THEN
+        RAISE EXCEPTION 'the plugin role can only consume an approved call approval'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER call_approvals_0_role BEFORE UPDATE ON mint.call_approvals
+    FOR EACH ROW EXECUTE FUNCTION mint.restrict_plugin_call_approval();
 CREATE TRIGGER call_approvals_1_status BEFORE INSERT OR UPDATE ON mint.call_approvals
     FOR EACH ROW EXECUTE FUNCTION mint.check_status(
         'pending',

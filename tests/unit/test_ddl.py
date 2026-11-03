@@ -825,3 +825,61 @@ def test_inserted_events_never_carry_seal_columns(db, role):
     assert stored == (None, None, None, None)
     unsealed = scalar(db, "SELECT count(*) FROM mint.events WHERE seal_seq IS NULL")
     assert unsealed == 1
+
+
+@pytest.mark.parametrize(
+    ("start", "target"),
+    [
+        ("pending", "rejected"),
+        ("pending", "cancelled"),
+        ("pending", "expired"),
+        ("pending", "approved"),
+        ("approved", "cancelled"),
+        ("approved", "expired"),
+        ("approved", "approved"),
+    ],
+)
+def test_plugin_role_cannot_make_other_call_approval_transitions(db, base, start, target):
+    cid = add_call_approval(db)
+    if start == "approved":
+        advance_call_approval(db, cid, "approved")
+    db.execute("SET LOCAL ROLE mint_plugin")
+    with fails(db, errors.InsufficientPrivilege):
+        db.execute("UPDATE mint.call_approvals SET status = %s WHERE id = %s", (target, cid))
+    db.execute("RESET ROLE")
+    assert scalar(db, "SELECT status FROM mint.call_approvals WHERE id = %s", cid) == start
+
+
+def test_plugin_role_can_only_consume_an_approved_call_approval(db, base):
+    cid = add_call_approval(db)
+    db.execute("SET LOCAL ROLE mint_plugin")
+    with fails(db, errors.InsufficientPrivilege):
+        db.execute(
+            "UPDATE mint.call_approvals SET status = 'consumed', consumed_invocation_id = %s"
+            " WHERE id = %s",
+            (new_uuid7(), cid),
+        )
+    db.execute("RESET ROLE")
+    advance_call_approval(db, cid, "approved")
+    db.execute("SET LOCAL ROLE mint_plugin")
+    db.execute(
+        "UPDATE mint.call_approvals SET status = 'consumed', consumed_invocation_id = %s"
+        " WHERE id = %s",
+        (new_uuid7(), cid),
+    )
+    db.execute("RESET ROLE")
+    assert scalar(db, "SELECT status FROM mint.call_approvals WHERE id = %s", cid) == "consumed"
+
+
+@pytest.mark.parametrize("role", ["mint_control", None])
+def test_control_plane_keeps_every_legal_call_approval_transition(db, base, role):
+    first, second = add_call_approval(db), add_call_approval(db, fp="b" * 64)
+    advance_call_approval(db, second, "approved")
+    if role:
+        db.execute(f"SET LOCAL ROLE {role}")
+    advance_call_approval(db, first, "rejected")
+    advance_call_approval(db, second, "cancelled")
+    if role:
+        db.execute("RESET ROLE")
+    statuses = db.execute("SELECT status FROM mint.call_approvals ORDER BY id").fetchall()
+    assert sorted(s[0] for s in statuses) == ["cancelled", "rejected"]
