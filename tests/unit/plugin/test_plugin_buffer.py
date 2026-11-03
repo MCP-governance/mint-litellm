@@ -1,0 +1,314 @@
+import asyncio
+import io
+import json
+import os
+from datetime import UTC, datetime
+from uuid import UUID
+
+import pytest
+from plugin_helpers import FakeStore
+
+from mint_litellm.plugin.buffer import (
+    BufferWriteError,
+    ConsumeRequest,
+    ConsumptionLost,
+    EvidenceRecorder,
+    LocalBuffer,
+)
+from mint_litellm.types.events import (
+    Event,
+    EventKind,
+    Evidence,
+    call_source_key,
+    control_source_key,
+)
+from mint_litellm.types.ids import new_uuid7
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+
+def make_event(n: int = 0, *, payload: dict | None = None) -> Event:
+    invocation = UUID(int=(0x0192F7A07C1E7A108000 << 48) + n)
+    return Event(
+        instance_id="inst",
+        inserted_at=datetime(2026, 11, 3, 9, 0, n % 60, tzinfo=UTC),
+        kind=EventKind.DECISION_EVALUATED,
+        source_key=call_source_key(invocation, 1, EventKind.DECISION_EVALUATED),
+        invocation_id=invocation,
+        attempt_id=1,
+        payload=payload or {"n": n},
+    )
+
+
+def recorder(tmp_path, store, *, stderr=None, max_bytes=1024 * 1024, interval=0.0):
+    buffer = LocalBuffer(tmp_path / "buf", max_bytes)
+    rec = EvidenceRecorder(
+        store,
+        buffer,
+        budget_seconds=1.0,
+        instance_id="inst",
+        stderr=stderr if stderr is not None else io.StringIO(),
+        replay_interval_seconds=interval,
+    )
+    return rec, buffer
+
+
+def closed_files(buffer: LocalBuffer):
+    buffer.close()
+    return sorted(buffer._dir.glob("*.jsonl"))
+
+
+class TestLocalBuffer:
+    def test_events_are_appended_as_json_lines_and_read_back(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        events = [make_event(i) for i in range(3)]
+        for event in events:
+            buffer.append(event)
+        (path,) = closed_files(buffer)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 3 and all(
+            json.loads(line)["kind"] == "decision_evaluated" for line in lines
+        )
+        read, unreadable = LocalBuffer.read(path)
+        assert read == events and unreadable == 0
+
+    def test_a_truncated_last_line_is_counted_not_fatal(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        buffer.append(make_event(1))
+        (path,) = closed_files(buffer)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('{"kind": "decision_ev')
+        read, unreadable = LocalBuffer.read(path)
+        assert len(read) == 1 and unreadable == 1
+
+    def test_the_open_segment_is_not_claimable_by_its_writer(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        buffer.append(make_event(1))
+        assert not buffer.has_pending() and buffer.claim() == []
+        buffer.close()
+        assert buffer.has_pending()
+
+    def test_claim_renames_and_release_gives_the_file_back(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        buffer.append(make_event(1))
+        buffer.close()
+        (claimed,) = buffer.claim()
+        assert ".replaying." in claimed.name and not buffer.has_pending()
+        buffer.release(claimed)
+        assert buffer.has_pending()
+        (claimed,) = buffer.claim()
+        buffer.discard(claimed)
+        assert not any(tmp_path.iterdir())
+
+    def test_the_size_cap_deletes_the_oldest_closed_files_and_counts_what_was_lost(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 8 * 1024)
+        big = "x" * 900
+        for i in range(30):
+            buffer.append(make_event(i, payload={"pad": big}))
+        total = sum(p.stat().st_size for p in tmp_path.iterdir())
+        assert total <= 8 * 1024
+        overflow = buffer.take_overflow()
+        assert overflow is not None and overflow.dropped_files >= 1
+        kept = 0
+        for path in closed_files(buffer):
+            kept += len(LocalBuffer.read(path)[0])
+        assert kept + overflow.dropped_events == 30
+        assert buffer.take_overflow() is None
+
+    def test_an_event_larger_than_the_cap_cannot_be_buffered(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 1024)
+        with pytest.raises(BufferWriteError):
+            buffer.append(make_event(1, payload={"pad": "x" * 4000}))
+
+    def test_an_unwritable_location_raises_a_buffer_error(self, tmp_path):
+        blocker = tmp_path / "file"
+        blocker.write_text("x")
+        buffer = LocalBuffer(blocker / "inner", 1024 * 1024)
+        with pytest.raises(BufferWriteError):
+            buffer.append(make_event(1))
+
+    @pytest.mark.skipif(fcntl is None, reason="needs flock")
+    def test_an_open_file_without_a_live_writer_is_adopted(self, tmp_path):
+        dead = tmp_path / ("deadbeef-000001.open")
+        dead.write_text(make_event(5).to_json_line() + "\n", encoding="utf-8")
+        live = LocalBuffer(tmp_path, 1024 * 1024)
+        assert live.has_pending()
+        other = LocalBuffer(tmp_path, 1024 * 1024)
+        other.append(make_event(6))
+        assert [p.name for p in live.claim()] and not any(
+            p.name.startswith(other._owner) for p in live.claim()
+        )
+
+    @pytest.mark.skipif(fcntl is None, reason="needs flock")
+    def test_a_file_held_by_a_live_writer_is_not_adopted(self, tmp_path):
+        writer = LocalBuffer(tmp_path, 1024 * 1024)
+        writer.append(make_event(1))
+        reader = LocalBuffer(tmp_path, 1024 * 1024)
+        assert not reader.has_pending()
+
+
+class TestEvidenceRecorder:
+    def test_database_first(self, tmp_path):
+        store = FakeStore()
+        rec, buffer = recorder(tmp_path, store)
+        assert asyncio.run(rec.record(make_event(1))) is Evidence.DB
+        assert len(store.events) == 1 and not buffer.has_pending()
+
+    def test_a_database_failure_falls_back_to_the_buffer_once(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        rec, buffer = recorder(tmp_path, store)
+        assert asyncio.run(rec.record(make_event(1))) is Evidence.BUFFER
+        (path,) = closed_files(buffer)
+        (event,), _ = LocalBuffer.read(path)
+        assert event.evidence is Evidence.BUFFER and store.events == {}
+
+    def test_buffer_failure_falls_back_to_one_stderr_line(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        stderr = io.StringIO()
+        rec, buffer = recorder(tmp_path, store, stderr=stderr)
+        blocker = tmp_path / "file"
+        blocker.write_text("x")
+        buffer._dir = blocker / "inner"
+        assert asyncio.run(rec.record(make_event(1))) is Evidence.STDERR
+        record = json.loads(stderr.getvalue())
+        assert record["evidence"] == "stderr" and record["source_key"].startswith("call:")
+
+    def test_consumption_lost_is_reported_and_nothing_is_stored(self, tmp_path):
+        store = FakeStore()
+        store.lose_consumption = True
+        rec, _ = recorder(tmp_path, store)
+        consume = ConsumeRequest(
+            call_approval_id=new_uuid7(),
+            invocation_id=new_uuid7(),
+            principal_type="user",
+            principal_id="u1",
+            server_id="s",
+            tool="t",
+            args_fp="0" * 64,
+            policy_version_id="pv",
+            state_version=1,
+        )
+        result = asyncio.run(rec.try_database(make_event(1), consume))
+        assert result.consumption_lost and not result.stored and store.events == {}
+
+    def test_overflow_is_recorded_as_a_system_event(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        rec, buffer = recorder(tmp_path, store, max_bytes=8 * 1024)
+
+        async def fill():
+            for i in range(30):
+                await rec.record(make_event(i, payload={"pad": "x" * 900}))
+
+        asyncio.run(fill())
+        kinds = []
+        for path in closed_files(buffer):
+            kinds += [e.kind for e in LocalBuffer.read(path)[0]]
+        assert EventKind.BUFFER_OVERFLOW in kinds
+
+    def test_replay_loads_the_buffer_and_records_the_count(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        rec, buffer = recorder(tmp_path, store)
+
+        async def scenario():
+            for i in range(3):
+                await rec.record(make_event(i))
+            buffer.close()
+            store.fail = None
+            await rec.replay()
+
+        asyncio.run(scenario())
+        assert len(store.of_kind("decision_evaluated")) == 3
+        (report,) = store.of_kind("buffer_replayed")
+        assert report.payload == {"replayed": 3, "duplicates": 0, "unreadable": 0}
+        assert not buffer.has_pending()
+
+    def test_commit_then_lost_response_converges_to_one_row_and_counts_the_duplicate(
+        self, tmp_path
+    ):
+        class LostResponse(FakeStore):
+            armed = True
+
+            async def insert_event(self, event, consume=None):
+                inserted = await super().insert_event(event, consume)
+                if self.armed:
+                    self.armed = False
+                    raise ConnectionResetError("response lost")
+                return inserted
+
+        store = LostResponse()
+        rec, buffer = recorder(tmp_path, store)
+
+        async def scenario():
+            assert await rec.record(make_event(1)) is Evidence.BUFFER
+            buffer.close()
+            await rec.replay()
+
+        asyncio.run(scenario())
+        assert len(store.of_kind("decision_evaluated")) == 1
+        (report,) = store.of_kind("buffer_replayed")
+        assert report.payload == {"replayed": 0, "duplicates": 1, "unreadable": 0}
+
+    def test_replay_stops_and_returns_the_file_when_the_database_fails(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        rec, buffer = recorder(tmp_path, store)
+
+        async def scenario():
+            await rec.record(make_event(1))
+            buffer.close()
+            await rec.replay()
+
+        asyncio.run(scenario())
+        assert buffer.has_pending() and store.events == {}
+
+    def test_replaying_system_events_does_not_chain_new_reports(self, tmp_path):
+        store = FakeStore()
+        rec, buffer = recorder(tmp_path, store)
+        report = Event(
+            instance_id="inst",
+            inserted_at=datetime(2026, 11, 3, tzinfo=UTC),
+            kind=EventKind.BUFFER_REPLAYED,
+            source_key=control_source_key(EventKind.BUFFER_REPLAYED, str(new_uuid7()), 1),
+            payload={"replayed": 1, "duplicates": 0, "unreadable": 0},
+        )
+        buffer.append(report)
+        buffer.close()
+        asyncio.run(rec.replay())
+        assert len(store.events) == 1 and not buffer.has_pending()
+
+    def test_a_successful_write_starts_a_replay_of_waiting_events(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        rec, buffer = recorder(tmp_path, store)
+
+        async def scenario():
+            await rec.record(make_event(1))
+            buffer.close()
+            store.fail = None
+            await rec.record(make_event(2))
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert len(store.of_kind("decision_evaluated")) == 2
+        assert not buffer.has_pending()
+
+    def test_a_plugin_without_a_database_still_records_to_the_buffer(self, tmp_path):
+        rec, buffer = recorder(tmp_path, None)
+        assert asyncio.run(rec.record(make_event(1))) is Evidence.BUFFER
+
+
+def test_buffer_directory_is_created_on_first_use(tmp_path):
+    target = tmp_path / "a" / "b"
+    LocalBuffer(target, 1024 * 1024).append(make_event(1))
+    assert target.is_dir() and os.listdir(target)
+
+
+def test_consumption_lost_is_an_exception_type():
+    assert issubclass(ConsumptionLost, Exception)
