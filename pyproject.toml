@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mint-litellm"
+dynamic = ["version"]
+description = "LiteLLM 프록시에 플러그인으로 붙어 MCP 서버와 도구 호출에 거버넌스를 더하는 패키지"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["litellm", "mcp", "governance", "plugin", "opa"]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+litellm = ["litellm==1.106.6"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "pyflakes>=3.2",
+    "psycopg[binary]>=3.2",
+]
+
+[project.urls]
+Repository = "https://github.com/MCP-governance/mint-litellm"
+
+[tool.hatch.version]
+path = "src/mint_litellm/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mint_litellm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
