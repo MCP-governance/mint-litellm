@@ -52,7 +52,7 @@ def test_row_counts_by_grade():
     counts = {g: sum(r.grade is g for r in SETTINGS_TABLE) for g in SettingGrade}
     assert counts == {
         SettingGrade.REQUIRED: 11,
-        SettingGrade.RECOMMENDED: 8,
+        SettingGrade.RECOMMENDED: 9,
         SettingGrade.OBSERVATION: 1,
     }
 
@@ -62,6 +62,7 @@ def test_observation_items():
         "spend_log_arguments_stored",
         "guardrail_optout_subjects",
         "auth_cache_shared",
+        "unbound_keys",
     )
 
 
@@ -169,6 +170,7 @@ def test_limits_doc_covers_the_declared_limitations():
         "operator_attested",
         "guardrail_optout_subjects",
         "서비스 계정 표식",
+        "unbound_keys",
     ):
         assert needle in doc, needle
 
@@ -202,3 +204,9 @@ def test_bootstrap_and_relation_terminate_commands():
     terminate = by_name["relation terminate"]
     assert terminate.roles == frozenset({OperatorRole.ADMIN})
     assert terminate.events == (EventKind.RELATION_TERMINATING,)
+
+
+def test_observation_items_used_by_rows_are_declared():
+    used = {r.observation_item for r in SETTINGS_TABLE if r.observation_item}
+    assert used <= set(OBSERVATION_ITEMS)
+    assert {"auth_cache_shared", "spend_log_arguments_stored", "unbound_keys"} <= used

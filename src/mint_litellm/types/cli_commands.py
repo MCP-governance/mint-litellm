@@ -71,7 +71,7 @@ COMMANDS: tuple[CliCommand, ...] = (
     CliCommand(
         path=("check",),
         summary="필수 설정 위반이 있으면 종료 코드 0이 아닌 값으로 끝나고, 권장 설정은 경고하며, "
-        "관측 항목 3가지를 출력한다.",
+        "관측 항목 4가지를 출력한다.",
         roles=ALL_ROLES,
         litellm_reads=("/v1/mcp/server", "/key/list", "/team/list", "/guardrails/list"),
     ),

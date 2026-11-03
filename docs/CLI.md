@@ -17,7 +17,7 @@
 | 명령 | 역할 | 설명 | LiteLLM 읽기 | 사건 |
 | --- | --- | --- | --- | --- |
 | `mint-litellm init` | 토큰 불필요 | LiteLLM 설정 조각(권장 설정 포함)을 만들고 기본 조직을 준비한다. `--no-spend-logs`를 주면 `disable_spend_logs: true`를 포함한다. | - | - |
-| `mint-litellm check` | 모든 역할 | 필수 설정 위반이 있으면 종료 코드 0이 아닌 값으로 끝나고, 권장 설정은 경고하며, 관측 항목 3가지를 출력한다. | `/v1/mcp/server`, `/key/list`, `/team/list`, `/guardrails/list` | - |
+| `mint-litellm check` | 모든 역할 | 필수 설정 위반이 있으면 종료 코드 0이 아닌 값으로 끝나고, 권장 설정은 경고하며, 관측 항목 4가지를 출력한다. | `/v1/mcp/server`, `/key/list`, `/team/list`, `/guardrails/list` | - |
 | `mint-litellm status` | 모든 역할 | 모드, 정책 판본, 경보, 관측 항목을 표시한다. | `/v1/mcp/server`, `/key/list`, `/team/list` | - |
 | `mint-litellm operator add` | `admin` | 운영자를 등록하고 토큰을 발급한다. `admin`·`approver`는 LiteLLM 사용자 식별자 (`--user-id`) 결속이 필수이다. | `/user/info` | `operator_added` |
 | `mint-litellm operator bootstrap` | 토큰 불필요 | `operators` 표가 비어 있을 때만 토큰 없이 첫 `admin` 운영자를 만들고 토큰을 발급한다. `--name`과 `--user-id`가 필요하며 행위자는 `bootstrap`으로 기록한다. 운영자가 이미 있으면 거부한다. | - | `operator_added` |

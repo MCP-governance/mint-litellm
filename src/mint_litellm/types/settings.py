@@ -308,12 +308,22 @@ SETTINGS_TABLE: tuple[SettingRow, ...] = (
         observation_item="auth_cache_shared",
         reason="Redis가 없으면 키·팀 권한 캐시 무효화가 복제본 사이에 전파되지 않는다.",
     ),
+    SettingRow(
+        key="사용자·팀에 결속되지 않은 키",
+        location=SettingLocation.MANAGEMENT_API,
+        value="없음",
+        grade=SettingGrade.RECOMMENDED,
+        observation_item="unbound_keys",
+        reason="사용자도 팀도 없는 키는 신원을 확정할 수 없어 호출이 항상 차단된다.",
+    ),
 )
 
 # check·status가 출력하는 관측 항목. 실패 조건이 아니다.
-# guardrail_optout_subjects는 가드레일 제외 메타데이터를 가진 키·팀의 수이다.
+# guardrail_optout_subjects는 가드레일 제외 메타데이터를 가진 키·팀의 수이고,
+# unbound_keys는 사용자와 팀 어디에도 결속되지 않은 키의 수이다(0이 아니면 경고).
 OBSERVATION_ITEMS: tuple[str, ...] = (
     "spend_log_arguments_stored",
     "guardrail_optout_subjects",
     "auth_cache_shared",
+    "unbound_keys",
 )
