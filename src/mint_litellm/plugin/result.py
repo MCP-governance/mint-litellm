@@ -1,0 +1,114 @@
+"""도구 호출 응답·실패 관측.
+
+응답 본문과 결과 값은 기록하지 않는다. 허용된 호출만 관측하며, 차단된 호출의 실패 이벤트는
+이미 판정 사건으로 기록되어 있어 무시한다.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Protocol
+from uuid import UUID
+
+from mint_litellm.plugin.buffer import EvidenceRecorder
+from mint_litellm.plugin.config import PluginConfig
+from mint_litellm.plugin.snapshot import NegativeStateQuery
+from mint_litellm.types.decision import RevocationCheck
+from mint_litellm.types.events import Event, EventKind, ResponseObservation, call_source_key
+
+
+class RevocationSource(Protocol):
+    async def read_epoch(self, instance_id: str) -> int | None: ...
+
+    async def has_negative_state(self, query: NegativeStateQuery) -> bool: ...
+
+
+@dataclass
+class ResultDeps:
+    config: PluginConfig
+    database: RevocationSource
+    recorder: EvidenceRecorder
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+
+
+def _event(ctx: Mapping[str, Any], kind: EventKind, payload: dict[str, Any], deps: ResultDeps):
+    invocation_id = UUID(ctx["invocation_id"])
+    attempt_id = int(ctx["attempt_id"])
+    return Event(
+        instance_id=deps.config.instance_id,
+        inserted_at=deps.clock(),
+        kind=kind,
+        source_key=call_source_key(invocation_id, attempt_id, kind),
+        invocation_id=invocation_id,
+        attempt_id=attempt_id,
+        payload={"decision_ref": ctx["decision_ref"], **payload},
+    )
+
+
+async def check_revocation(
+    ctx: Mapping[str, Any], deps: ResultDeps
+) -> tuple[RevocationCheck, int | None, bool | None]:
+    """판정 스냅숏 이후 선택된 승인·거부·관계·서버가 부정 상태로 바뀌었는지.
+
+    세대가 같으면 바뀐 것이 없다. 세대가 다르면 부정 상태를 다시 조회하고, DB를 읽지 못하면
+    ``unavailable``로 남긴다.
+    """
+    snapshot_epoch = ctx.get("state_epoch")
+    try:
+        async with asyncio.timeout(deps.config.decision_budget_seconds):
+            current = await deps.database.read_epoch(deps.config.instance_id)
+            if current == snapshot_epoch:
+                return RevocationCheck.UNCHANGED, current, False
+            changed = await deps.database.has_negative_state(
+                NegativeStateQuery(
+                    instance_id=deps.config.instance_id,
+                    server_id=ctx["server_id"],
+                    tool=ctx["tool"],
+                    key_id=ctx.get("key_id"),
+                    user_id=ctx.get("user_id"),
+                    team_id=ctx.get("team_id"),
+                    org_id=ctx.get("org_id"),
+                    approval_id=ctx.get("approval_id"),
+                    relation_id=ctx.get("relation_id"),
+                )
+            )
+    except Exception:
+        return RevocationCheck.UNAVAILABLE, None, None
+    return RevocationCheck.CHANGED, current, changed
+
+
+async def observe_response(
+    ctx: Mapping[str, Any], *, is_error: bool, size_bytes: int | None, deps: ResultDeps
+) -> None:
+    if not ctx.get("allowed"):
+        return
+    check, current, revoked = await check_revocation(ctx, deps)
+    observation = ResponseObservation(
+        is_error=is_error,
+        size_bytes=size_bytes,
+        snapshot_state_epoch=ctx.get("state_epoch"),
+        current_state_epoch=current,
+        revocation_check=check,
+        revoked_after_snapshot=revoked,
+    )
+    event = _event(ctx, EventKind.CALL_RESPONSE_RECEIVED, observation.model_dump(mode="json"), deps)
+    await deps.recorder.record(event)
+
+
+async def observe_unknown_outcome(
+    ctx: Mapping[str, Any], *, exception_type: str, http_status: int | None, deps: ResultDeps
+) -> None:
+    """응답이 오지 않은 허용 호출. 시간 초과와 연결 단절은 실패 이벤트로만 관측된다."""
+    if not ctx.get("allowed"):
+        return
+    cause = "timeout" if http_status == 504 else "failure"
+    event = _event(
+        ctx,
+        EventKind.CALL_OUTCOME_UNKNOWN,
+        {"cause": cause, "exception_type": exception_type, "http_status": http_status},
+        deps,
+    )
+    await deps.recorder.record(event)
