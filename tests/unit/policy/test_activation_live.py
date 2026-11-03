@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shlex
 import sys
 import uuid
 from collections.abc import Iterator
@@ -50,13 +51,8 @@ def live_database() -> Iterator[str]:
 
 
 def opa_command() -> list[str]:
-    if os.name == "nt":
-        source = ROOT.resolve().as_posix()
-        mount = f"/mnt/{source[0].lower()}/{source[3:]}"
-        docker = ["wsl.exe", "-d", "kali-linux", "--", "docker"]
-    else:
-        mount = str(ROOT.resolve())
-        docker = ["docker"]
+    docker = shlex.split(os.environ.get("MINT_TEST_DOCKER", "docker"))
+    mount = os.environ.get("MINT_TEST_DOCKER_SOURCE", str(ROOT.resolve()))
     return [*docker, "run", "--rm", "-v", f"{mount}:/work:ro", IMAGE]
 
 
