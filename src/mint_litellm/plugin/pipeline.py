@@ -69,8 +69,8 @@ from mint_litellm.types.settings import Mode, ObservationSettings, effective_mod
 
 log = logging.getLogger("mint_litellm.pipeline")
 
-# 승인 범위가 좁을수록 먼저 선택된다.
-_SCOPE_RANK = {"key": 0, "user": 1, "team": 2, "org": 3}
+# 승인 범위는 좁은 쪽부터 본다.
+_SCOPE_ORDER = ("key", "user", "team", "org")
 
 
 PolicyEvaluate = Callable[..., Awaitable[Evaluation]]
@@ -266,14 +266,18 @@ def denial_and_approval(
         and a.valid_from <= now < a.valid_until
         and relation_status[a.id] == "active"
     ]
-    containing = [a for a in valid if tool in a.tools]
-    if containing:
+    # 유효 승인이 하나라도 있는 가장 좁은 범위 하나만 본다. 그 범위에 도구가 든 승인이 없으면
+    # 더 넓은 범위에 있어도 선택하지 않는다.
+    for scope in _SCOPE_ORDER:
+        in_scope = [a for a in valid if a.scope_type == scope]
+        if not in_scope:
+            continue
+        containing = [a for a in in_scope if tool in a.tools]
+        if not containing:
+            return ApprovalSelection([StageResult.finding(Reason.TOOL_NOT_IN_APPROVAL)], None)
         ordered = sorted(containing, key=lambda a: a.id)
         ordered.sort(key=lambda a: a.valid_from, reverse=True)
-        ordered.sort(key=lambda a: _SCOPE_RANK[a.scope_type])
         return ApprovalSelection([], ordered[0])
-    if valid:
-        return ApprovalSelection([StageResult.finding(Reason.TOOL_NOT_IN_APPROVAL)], None)
     if not in_org:
         if matched:
             return ApprovalSelection([StageResult.stop(Reason.ORG_BOUNDARY)], None)
@@ -328,21 +332,26 @@ def build_policy_input(
 ) -> dict[str, Any]:
     """정책 입력. 인자 원문은 넣지 않고, 1단계에 없는 값은 키를 만들지 않는다."""
     now = snapshot.now
-    server_doc: dict[str, Any] = {
-        "id": resolved.server_id,
-        "transport": resolved.transport,
-        "auth_type": resolved.auth_type,
-    }
     server = snapshot.server
-    if server is not None:
-        server_doc["status"] = server.status
-        allowed_kinds = {
+    allowed_kinds = (
+        {
             snapshot.allowlists[i].kind
             for i in server.basis_allowlist_ids
-            if i in snapshot.allowlists
+            if i in snapshot.allowlists and snapshot.allowlists[i].status == "active"
         }
-        server_doc["provider_allowed"] = "provider" in allowed_kinds
-        server_doc["auth_server_allowed"] = "auth_server" in allowed_kinds
+        if server is not None
+        else set()
+    )
+    # 서버 행이 없어도 server 객체를 빼지 않는다. 정책의 필수 입력 검사가 누락을 전환 불가 오류로
+    # 바꾸면 관측 모드에서 미등록 서버를 허용으로 전환할 수 없다.
+    server_doc: dict[str, Any] = {
+        "id": resolved.server_id,
+        "status": server.status if server is not None else "unregistered",
+        "transport": resolved.transport,
+        "auth_type": resolved.auth_type,
+        "provider_allowed": "provider" in allowed_kinds,
+        "auth_server_allowed": "auth_server" in allowed_kinds,
+    }
 
     if selected is None:
         approval: dict[str, Any] = {"present": False}

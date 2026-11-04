@@ -24,11 +24,13 @@ from plugin_helpers import (
     user_principal,
 )
 
+from mint_litellm.compat.litellm_1_106 import HookData, ServerResolutionError
 from mint_litellm.plugin.pipeline import (
     Deadline,
     argument_fingerprint,
     blocking_reason,
     build_policy_input,
+    build_request,
     evaluate_request,
 )
 from mint_litellm.plugin.policy.input import has_only_policy_fields
@@ -250,7 +252,15 @@ class TestStateStage:
         assert code(outcome) == "MINT-SERVER-UNREGISTERED"
         reasons = [f.reason_code for f in outcome.snapshot.findings]
         assert reasons == ["SERVER_UNREGISTERED", "APPROVAL_ABSENT"]
-        assert len(calls) == 1 and "status" not in calls[0]["server"]
+        assert len(calls) == 1
+        assert calls[0]["server"] == {
+            "id": "srv-1",
+            "status": "unregistered",
+            "transport": "http",
+            "auth_type": "none",
+            "provider_allowed": False,
+            "auth_server_allowed": False,
+        }
 
     def test_unregistered_server_is_allowed_in_observe_mode_with_findings_recorded(self, tmp_path):
         snap = snapshot(server=None, approvals=(), settings=SettingsRow(mode=Mode.OBSERVE))
@@ -453,14 +463,91 @@ class TestDenialAndApproval:
         outcome = decide(harness(tmp_path, snap))
         assert outcome.allowed and outcome.snapshot.selected_approval_id == "a-team"
 
-    def test_an_approval_that_lists_the_tool_wins_over_a_narrower_one_that_does_not(self, tmp_path):
+    def test_a_narrower_scope_covers_a_broader_one(self, tmp_path):
         snap = snapshot(
             approvals=(
-                approval(id="a-user", scope_type="user", scope_id="u1", tools=("other",)),
-                approval(id="a-team"),
+                approval(id="a-key", scope_type="key", scope_id="k" * 64, tools=("a",)),
+                approval(id="a-team", tools=("a", "b")),
             )
         )
-        assert decide(harness(tmp_path, snap)).snapshot.selected_approval_id == "a-team"
+        calls: list = []
+        h = harness(tmp_path, snap, evaluate=evaluator(calls=calls))
+        outcome = decide(h, request(tool_name="b"))
+        assert code(outcome) == "MINT-TOOL-NOT-IN-APPROVAL"
+        assert outcome.snapshot.stop is None and outcome.snapshot.selected_approval_id is None
+        assert calls[0]["approval"] == {"present": False}
+        listed = decide(harness(tmp_path, snap), request(tool_name="a"))
+        assert listed.snapshot.selected_approval_id == "a-key"
+
+    def test_the_broader_approval_applies_once_the_narrower_one_is_revoked(self, tmp_path):
+        snap = snapshot(
+            approvals=(
+                approval(
+                    id="a-key", scope_type="key", scope_id="k" * 64, tools=("a",), status="revoked"
+                ),
+                approval(id="a-team", tools=("a", "b")),
+            )
+        )
+        outcome = decide(harness(tmp_path, snap), request(tool_name="b"))
+        assert outcome.allowed and outcome.snapshot.selected_approval_id == "a-team"
+
+    @pytest.mark.parametrize(
+        "narrow",
+        [
+            {"status": "revoked"},
+            {"valid_until": NOW - timedelta(seconds=1)},
+            {"valid_from": NOW + timedelta(seconds=1)},
+        ],
+        ids=["revoked", "expired", "not-started"],
+    )
+    def test_an_invalid_narrower_approval_does_not_cover_the_broader_one(self, tmp_path, narrow):
+        snap = snapshot(
+            approvals=(
+                approval(id="a-key", scope_type="key", scope_id="k" * 64, tools=("a",), **narrow),
+                approval(id="a-team", tools=("a", "b")),
+            )
+        )
+        outcome = decide(harness(tmp_path, snap), request(tool_name="b"))
+        assert outcome.allowed and outcome.snapshot.selected_approval_id == "a-team"
+
+    def test_a_broader_approval_applies_when_there_is_no_narrower_one(self, tmp_path):
+        snap = snapshot(approvals=(approval(id="a-team", tools=("a", "b")),))
+        outcome = decide(harness(tmp_path, snap), request(tool_name="b"))
+        assert outcome.allowed and outcome.snapshot.selected_approval_id == "a-team"
+
+    def test_within_one_scope_the_approval_that_lists_the_tool_is_chosen(self, tmp_path):
+        snap = snapshot(
+            approvals=(
+                approval(id="a-new", tools=("other",), valid_from=NOW - timedelta(hours=1)),
+                approval(id="a-old", tools=("search",), valid_from=NOW - timedelta(days=5)),
+            )
+        )
+        outcome = decide(harness(tmp_path, snap))
+        assert outcome.allowed and outcome.snapshot.selected_approval_id == "a-old"
+
+    def test_the_org_scope_is_consulted_only_when_nothing_narrower_is_valid(self, tmp_path):
+        snap = snapshot(
+            approvals=(
+                approval(id="a-org", scope_type="org", scope_id="org1", tools=("a", "b")),
+                approval(id="a-user", scope_type="user", scope_id="u1", tools=("a",)),
+            )
+        )
+        blocked = decide(harness(tmp_path, snap), request(tool_name="b"))
+        assert code(blocked) == "MINT-TOOL-NOT-IN-APPROVAL"
+        only_org = snapshot(approvals=(approval(id="a-org", scope_type="org", scope_id="org1"),))
+        assert decide(harness(tmp_path, only_org)).snapshot.selected_approval_id == "a-org"
+
+    def test_observe_mode_converts_the_missing_tool_finding_of_a_covering_scope(self, tmp_path):
+        snap = snapshot(
+            approvals=(
+                approval(id="a-key", scope_type="key", scope_id="k" * 64, tools=("a",)),
+                approval(id="a-team", tools=("a", "b")),
+            ),
+            settings=SettingsRow(mode=Mode.OBSERVE),
+        )
+        h = harness(tmp_path, snap, cfg=config(tmp_path, mode_ceiling=Mode.OBSERVE))
+        outcome = decide(h, request(tool_name="b"))
+        assert outcome.allowed and outcome.snapshot.selected_approval_id is None
 
     def test_approval_for_another_principal_scope_does_not_match(self, tmp_path):
         snap = snapshot(approvals=(approval(scope_id="t2"),))
@@ -1045,3 +1132,83 @@ def test_missing_principal_values_are_left_out_of_the_policy_input(tmp_path):
     sent = calls[0]["principal"]
     assert sent["type"] == "team_key" and sent["id"] == "k" * 64
     assert sent["claimed_end_user_id"] is None and sent["team_id"] == "t1"
+
+
+class TestUnregisteredServer:
+    """MINT 서버 행이 없어도 정책은 server 객체를 받아 관측 모드 전환이 막히지 않는다."""
+
+    def block_r1(self):
+        return evaluator("Block", policy_ids=("R1",), observable=True)
+
+    def test_observe_mode_records_every_finding_and_allows(self, tmp_path):
+        settings = SettingsRow(
+            mode=Mode.OBSERVE, observable_policy_ids=frozenset({"R1"}), settings_version=2
+        )
+        snap = snapshot(server=None, approvals=(), settings=settings)
+        h = harness(
+            tmp_path,
+            snap,
+            evaluate=self.block_r1(),
+            cfg=config(tmp_path, mode_ceiling=Mode.OBSERVE),
+        )
+        outcome = decide(h)
+        assert outcome.allowed
+        assert [f.reason_code for f in outcome.snapshot.findings] == [
+            "SERVER_UNREGISTERED",
+            "APPROVAL_ABSENT",
+            "POLICY_DETECT_R1",
+        ]
+        assert outcome.snapshot.evaluated_decision is Action.BLOCK
+        assert outcome.snapshot.enforced_action is Action.ALLOW
+        assert outcome.snapshot.stop is None
+        (event,) = h.store.of_kind("decision_evaluated")
+        assert len(event.payload["findings"]) == 3
+
+    def test_enforce_mode_reports_the_first_finding(self, tmp_path):
+        snap = snapshot(server=None, approvals=())
+        outcome = decide(harness(tmp_path, snap, evaluate=self.block_r1()))
+        assert code(outcome) == "MINT-SERVER-UNREGISTERED"
+        assert [f.reason_code for f in outcome.snapshot.findings][-1] == "POLICY_DETECT_R1"
+
+    def test_the_policy_input_names_the_server_as_unregistered(self, tmp_path):
+        calls: list = []
+        snap = snapshot(server=None, approvals=())
+        decide(harness(tmp_path, snap, evaluate=evaluator(calls=calls)))
+        assert calls[0]["server"]["status"] == "unregistered"
+        assert has_only_policy_fields(calls[0])
+
+    def test_a_registered_server_reports_its_state_and_active_allowlist_kinds(self):
+        server = server_row(basis_allowlist_ids=("al1", "al2"), status="suspended")
+        allowlists = {
+            "al1": allowlist(id="al1", kind="provider"),
+            "al2": allowlist(id="al2", kind="auth_server"),
+        }
+        doc = TestPolicyInput().build(snap=snapshot(server=server, allowlists=allowlists))
+        assert doc["server"]["status"] == "suspended"
+        assert doc["server"]["provider_allowed"] is True
+        assert doc["server"]["auth_server_allowed"] is True
+
+    def test_a_lifted_allowlist_entry_does_not_count(self):
+        server = server_row(basis_allowlist_ids=("al1",))
+        snap = snapshot(server=server, allowlists={"al1": allowlist(status="lifted")})
+        assert TestPolicyInput().build(snap=snap)["server"]["provider_allowed"] is False
+
+    def test_a_server_without_a_url_is_unsupported(self, tmp_path):
+        def resolver(hook):
+            raise ServerResolutionError(Reason.UNSUPPORTED, "server_without_url")
+
+        req = build_request(
+            {"mcp_server_name": "local", "mcp_tool_name": "t", "mcp_arguments": {}},
+            None,
+            operation=OperationType.TOOL_CALL,
+            instance_id="inst",
+            hook_parser=lambda d: HookData("local", "t", {}, None, None),
+            resolver=resolver,
+            principal_factory=lambda auth, instance_id: user_principal(),
+        )
+        h = harness(tmp_path)
+        outcome = decide(h, req)
+        assert code(outcome) == "MINT-UNSUPPORTED"
+        assert outcome.snapshot.stop.detail == "server_without_url"
+        assert h.snapshots.queries == []
+        assert len(h.store.of_kind("decision_evaluated")) == 1
