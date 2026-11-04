@@ -21,6 +21,8 @@ DEFAULT_BUFFER_DIR = "/var/lib/mint/buffer"
 DEFAULT_BUFFER_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_DECISION_BUDGET_MS = 300
 MIN_FINGERPRINT_KEY_BYTES = 16
+DEFAULT_SELFCHECK_GRACE_SECONDS = 120.0
+SELFCHECK_GRACE_RANGE = (10, 600)
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,7 @@ class PluginConfig:
     fingerprint_key: bytes | None = None
     fingerprint_key_version: int = 1
     readiness_url: str | None = None
-    selfcheck_grace_seconds: float = 30.0
+    selfcheck_grace_seconds: float = DEFAULT_SELFCHECK_GRACE_SECONDS
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> PluginConfig:
@@ -74,7 +76,15 @@ class PluginConfig:
             fingerprint_key=key.encode("utf-8") if key is not None else None,
             fingerprint_key_version=_integer(env, "MINT_FINGERPRINT_KEY_VERSION", 1, 1),
             readiness_url=env.get("MINT_READINESS_URL") or None,
-            selfcheck_grace_seconds=float(_integer(env, "MINT_SELFCHECK_GRACE_SECONDS", 30, 0)),
+            selfcheck_grace_seconds=float(
+                _integer(
+                    env,
+                    "MINT_SELFCHECK_GRACE_SECONDS",
+                    int(DEFAULT_SELFCHECK_GRACE_SECONDS),
+                    SELFCHECK_GRACE_RANGE[0],
+                    SELFCHECK_GRACE_RANGE[1],
+                )
+            ),
         )
 
 
@@ -97,7 +107,9 @@ def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
     raise RuntimeError(f"{name} must be true or false")
 
 
-def _integer(env: Mapping[str, str], name: str, default: int, minimum: int) -> int:
+def _integer(
+    env: Mapping[str, str], name: str, default: int, minimum: int, maximum: int | None = None
+) -> int:
     raw = env.get(name)
     if raw is None:
         return default
@@ -107,4 +119,6 @@ def _integer(env: Mapping[str, str], name: str, default: int, minimum: int) -> i
         raise RuntimeError(f"{name} must be an integer") from None
     if value < minimum:
         raise RuntimeError(f"{name} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(f"{name} must be at most {maximum}")
     return value

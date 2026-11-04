@@ -344,22 +344,27 @@ class PluginRuntime:
         self._task = loop.create_task(self._startup())
 
     async def _startup(self) -> None:
+        grace = self.config.selfcheck_grace_seconds
+        url = self.config.readiness_url or (
+            f"http://localhost:{os.environ.get('PORT', '4000')}/health/readiness"
+        )
         try:
-            url = self.config.readiness_url or (
-                f"http://localhost:{os.environ.get('PORT', '4000')}/health/readiness"
-            )
-            await self.readiness(url, 300.0)
-            deadline = time.monotonic() + self.config.selfcheck_grace_seconds
-            while True:
-                if await self.verify():
-                    log.info("MINT 자가 점검 통과")
-                    await self._report_mismatches()
-                    return
-                if time.monotonic() >= deadline:
-                    break
-                await asyncio.sleep(self.retry_seconds)
-            await self._report_mismatches()
-            await self._fail()
+            deadline = time.monotonic() + grace
+            error: str | None = "readiness_timeout"
+            # 준비 신호와 8항목은 같은 유예 시간 안에 모두 통과해야 한다. 다른 워커가 낸 준비
+            # 신호로 시작했다면 이 워커의 레지스트리가 아직 비어 있을 수 있어 다시 확인한다.
+            if await self.readiness(url, grace):
+                error = None
+                while True:
+                    if await self.verify():
+                        log.info("MINT 자가 점검 통과")
+                        await self._report_mismatches()
+                        return
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(self.retry_seconds)
+                await self._report_mismatches()
+            await self._fail(error=error)
             if self.config.required:
                 self.terminate()
                 return

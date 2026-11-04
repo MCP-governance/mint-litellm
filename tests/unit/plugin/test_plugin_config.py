@@ -21,6 +21,7 @@ def test_defaults():
     assert config.buffer_max_bytes == 50 * 1024 * 1024
     assert config.decision_budget_seconds == 0.3
     assert config.fingerprint_key is None and config.opa_url == "http://opa:8181"
+    assert config.selfcheck_grace_seconds == 120.0
 
 
 def test_every_setting_can_be_given():
@@ -36,7 +37,7 @@ def test_every_setting_can_be_given():
         "MINT_FINGERPRINT_KEY": "k" * 32,
         "MINT_FINGERPRINT_KEY_VERSION": "3",
         "MINT_READINESS_URL": "http://localhost:4000/health/readiness",
-        "MINT_SELFCHECK_GRACE_SECONDS": "5",
+        "MINT_SELFCHECK_GRACE_SECONDS": "30",
     }
     config = PluginConfig.from_env(env)
     assert config.mode_ceiling is Mode.OBSERVE and config.required is False
@@ -44,7 +45,7 @@ def test_every_setting_can_be_given():
     assert config.buffer_dir == Path("/data/buf") and config.buffer_max_bytes == 2048
     assert config.db_pool_size == 4 and config.decision_budget_seconds == 0.5
     assert config.fingerprint_key == b"k" * 32 and config.fingerprint_key_version == 3
-    assert config.opa_url == "http://opa:8181" and config.selfcheck_grace_seconds == 5.0
+    assert config.opa_url == "http://opa:8181" and config.selfcheck_grace_seconds == 30.0
 
 
 @pytest.mark.parametrize(
@@ -62,6 +63,9 @@ def test_every_setting_can_be_given():
         {"MINT_DECISION_BUDGET_MS": "1"},
         {"MINT_FINGERPRINT_KEY": "short"},
         {"MINT_FINGERPRINT_KEY_VERSION": "0"},
+        {"MINT_SELFCHECK_GRACE_SECONDS": "9"},
+        {"MINT_SELFCHECK_GRACE_SECONDS": "601"},
+        {"MINT_SELFCHECK_GRACE_SECONDS": "two minutes"},
     ],
 )
 def test_invalid_values_raise_runtime_error_only(override):
@@ -81,3 +85,9 @@ def test_required_settings(missing):
 @pytest.mark.parametrize("text", ["1", "TRUE", "yes", "on"])
 def test_truthy_required_values(text):
     assert PluginConfig.from_env({**BASE, "MINT_REQUIRED": text}).required is True
+
+
+@pytest.mark.parametrize("seconds", ["10", "120", "600"])
+def test_the_startup_grace_accepts_its_whole_range(seconds):
+    config = PluginConfig.from_env({**BASE, "MINT_SELFCHECK_GRACE_SECONDS": seconds})
+    assert config.selfcheck_grace_seconds == float(seconds)

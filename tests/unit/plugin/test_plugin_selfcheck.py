@@ -251,7 +251,7 @@ def test_failure_details_never_contain_credentials_or_urls():
     assert "mcp.example" not in text
 
 
-def make_runtime(tmp_path, *, v=None, controlled=None, required=True, retry=0.01):
+def make_runtime(tmp_path, *, v=None, controlled=None, required=True, retry=0.01, ready=True):
     store = FakeStore()
     recorder = EvidenceRecorder(
         store,
@@ -270,8 +270,11 @@ def make_runtime(tmp_path, *, v=None, controlled=None, required=True, retry=0.01
     stopped: list[int] = []
     state = {"view": v or view()}
 
-    async def ready(url, timeout):
-        return True
+    waited: list[float] = []
+
+    async def readiness(url, timeout):
+        waited.append(timeout)
+        return ready
 
     runtime = PluginRuntime(
         config=config(tmp_path, required=required, selfcheck_grace_seconds=0.05),
@@ -280,11 +283,12 @@ def make_runtime(tmp_path, *, v=None, controlled=None, required=True, retry=0.01
         evaluate=None,
         view_collector=lambda: state["view"],
         terminate=lambda: stopped.append(1),
-        readiness=ready,
+        readiness=readiness,
         retry_seconds=retry,
         recheck_seconds=retry,
     )
     runtime.logger, runtime.guardrail = LOGGER, GUARDRAIL
+    runtime.readiness_waits = waited
     return runtime, store, stopped, state
 
 
@@ -448,3 +452,29 @@ def test_a_mismatch_is_also_recorded_when_another_item_stops_the_startup(tmp_pat
     assert stopped == [1]
     assert len(store.of_kind("server_identity_mismatch_observed")) == 1
     assert len(store.of_kind("enforcement_unverified")) == 1
+
+
+def test_readiness_is_awaited_for_at_most_the_grace_period(tmp_path):
+    runtime, _, _, _ = make_runtime(tmp_path)
+    asyncio.run(runtime._startup())
+    assert runtime.readiness_waits == [runtime.config.selfcheck_grace_seconds]
+
+
+def test_without_readiness_in_time_the_startup_is_recorded_and_stopped(tmp_path):
+    runtime, store, stopped, _ = make_runtime(tmp_path, ready=False)
+    runtime.view_collector = lambda: pytest.fail("no check runs before readiness")
+    asyncio.run(runtime._startup())
+    assert stopped == [1] and not runtime.verified
+    (event,) = store.of_kind("enforcement_unverified")
+    assert event.payload == {"failed": [], "error": "readiness_timeout"}
+
+
+def test_without_readiness_a_non_required_runtime_stays_blocked_and_recovers(tmp_path):
+    runtime, store, stopped, _ = make_runtime(tmp_path, ready=False, required=False)
+
+    async def scenario():
+        await runtime._startup()
+
+    asyncio.run(scenario())
+    assert stopped == [] and runtime.verified
+    assert store.of_kind("enforcement_unverified")[0].payload["error"] == "readiness_timeout"
