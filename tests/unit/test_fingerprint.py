@@ -45,6 +45,16 @@ def test_non_finite_numbers_are_rejected():
         canonical_arguments({"a": float("nan")})
 
 
+def test_values_outside_json_are_rejected():
+    with pytest.raises(ValueError):
+        canonical_arguments({"a": b"raw"})
+
+
+def test_number_spelling_and_unicode_form_are_kept_as_given():
+    assert canonical_arguments({"n": 1.0, "s": "é"}) == '{"n":1.0,"s":"é"}'.encode()
+    assert argument_fingerprint({"n": 1}, KEY) != argument_fingerprint({"n": 1.0}, KEY)
+
+
 def test_different_keys_give_different_fingerprints():
     other = bytes(reversed(range(32)))
     assert argument_fingerprint({"a": 1}, KEY) != argument_fingerprint({"a": 1}, other)
@@ -62,7 +72,21 @@ def test_decode_key_accepts_unpadded_base64url():
     assert decode_fingerprint_key(text + "==" if len(text) % 4 == 2 else text) == raw
 
 
-@pytest.mark.parametrize("text", ["", "not base64!", base64.urlsafe_b64encode(b"short").decode()])
+VALID_KEY_TEXT = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "not base64!",
+        base64.urlsafe_b64encode(b"short").decode(),
+        VALID_KEY_TEXT[:20] + "!!!!" + VALID_KEY_TEXT[20:],
+        VALID_KEY_TEXT[:20] + "    " + VALID_KEY_TEXT[20:],
+        base64.b64encode(bytes([0xFB]) * 33).decode(),
+        VALID_KEY_TEXT + "===",
+    ],
+)
 def test_decode_key_rejects_invalid_or_short_values(text):
     with pytest.raises(ValueError):
         decode_fingerprint_key(text)

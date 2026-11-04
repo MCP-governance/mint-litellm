@@ -102,7 +102,8 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         source=SettingSource.ENV,
         rule=(
             "기동 뒤 준비 상태와 자가 점검 8항목을 마쳐야 하는 시간(초, 기본 120, 범위 10~600). "
-            "범위 밖이면 기동을 거부하고, 시간 안에 마치지 못하면 사건을 남기고 기동을 중단한다."
+            "범위 밖이면 기동을 거부한다. 시간 안에 마치지 못하면 사건을 남기고, "
+            "`MINT_REQUIRED=true`이면 기동을 중단한다."
         ),
     ),
     MintSettingRow(
@@ -117,7 +118,8 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         key="MINT_FINGERPRINT_KEY_VERSION",
         source=SettingSource.ENV,
         rule=(
-            "지문 키의 판본(기본 1). 승인에 기록된 판본과 다르면 호출별 승인이 다시 필요하다."
+            "지문 키의 판본(1 이상 정수, 기본 1). 승인에 기록된 판본과 다르면 호출별 승인이 "
+            "다시 필요하다."
         ),
     ),
 )

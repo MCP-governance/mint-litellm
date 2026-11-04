@@ -9,6 +9,7 @@ from mint_litellm.types.decision import RevocationCheck
 from mint_litellm.types.events import (
     CALL_KINDS,
     CONTROL_ENTITY,
+    SYSTEM_KINDS,
     Event,
     EventKind,
     Evidence,
@@ -57,6 +58,7 @@ def test_call_source_key_rule():
         (EventKind.POLICY_ACTIVATED, "policy_version"),
         (EventKind.ORG_BINDING_CREATED, "org_binding"),
         (EventKind.BUFFER_REPLAYED, "buffer"),
+        (EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED, "selfcheck"),
     ],
 )
 def test_control_source_key_rule(kind, entity):
@@ -129,6 +131,17 @@ def test_control_events_need_an_actor_but_system_events_do_not():
         source_key=control_source_key(EventKind.BUFFER_REPLAYED, "batch-1", 1),
         payload={"duplicates": 1},
     )
+    Event(
+        instance_id="i",
+        inserted_at=NOW,
+        kind=EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED,
+        source_key=control_source_key(EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED, "srv-1", 1),
+        payload={},
+    )
+
+
+def test_event_kind_counts():
+    assert (len(CALL_KINDS), len(SYSTEM_KINDS), len(EventKind)) == (4, 4, 34)
 
 
 def test_control_source_key_must_match_the_kind():
