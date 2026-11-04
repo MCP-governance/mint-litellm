@@ -16,6 +16,7 @@ from mint_litellm.types.events import (
     ResponseObservation,
     call_source_key,
     control_source_key,
+    system_source_key,
 )
 from mint_litellm.types.ids import new_uuid7
 
@@ -57,12 +58,39 @@ def test_call_source_key_rule():
         (EventKind.SETTINGS_CHANGED, "settings"),
         (EventKind.POLICY_ACTIVATED, "policy_version"),
         (EventKind.ORG_BINDING_CREATED, "org_binding"),
-        (EventKind.BUFFER_REPLAYED, "buffer"),
-        (EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED, "selfcheck"),
     ],
 )
 def test_control_source_key_rule(kind, entity):
     assert control_source_key(kind, "abc-1", 4) == f"{entity}:abc-1:4:{kind.value}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "entity"),
+    [
+        (EventKind.ENFORCEMENT_UNVERIFIED, "selfcheck"),
+        (EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED, "selfcheck"),
+        (EventKind.BUFFER_OVERFLOW, "buffer"),
+        (EventKind.BUFFER_REPLAYED, "buffer"),
+    ],
+)
+def test_system_source_key_rule(kind, entity):
+    assert system_source_key(kind, INV, 2) == f"{entity}:{INV}:2:{kind.value}"
+    with pytest.raises(ValueError):
+        control_source_key(kind, "abc-1", 1)
+
+
+def test_system_source_key_needs_a_v7_run_and_a_positive_seq():
+    with pytest.raises(ValueError):
+        system_source_key(EventKind.BUFFER_REPLAYED, UUID(int=1), 1)
+    with pytest.raises(ValueError):
+        system_source_key(EventKind.BUFFER_REPLAYED, INV, 0)
+    with pytest.raises(ValueError):
+        system_source_key(EventKind.APPROVAL_GRANTED, INV, 1)
+
+
+def test_two_mismatched_servers_in_one_check_get_two_keys():
+    kind = EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED
+    assert system_source_key(kind, INV, 1) != system_source_key(kind, INV, 2)
 
 
 @pytest.mark.parametrize("bad_id", ["", "a:b", "a b", "-leading", "x" * 129])
@@ -128,16 +156,37 @@ def test_control_events_need_an_actor_but_system_events_do_not():
         instance_id="i",
         inserted_at=NOW,
         kind=EventKind.BUFFER_REPLAYED,
-        source_key=control_source_key(EventKind.BUFFER_REPLAYED, "batch-1", 1),
+        source_key=system_source_key(EventKind.BUFFER_REPLAYED, INV, 1),
         payload={"duplicates": 1},
     )
     Event(
         instance_id="i",
         inserted_at=NOW,
         kind=EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED,
-        source_key=control_source_key(EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED, "srv-1", 1),
+        source_key=system_source_key(EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED, INV, 1),
         payload={},
     )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "selfcheck:srv-1:1:server_identity_mismatch_observed",
+        f"selfcheck:{INV}:0:server_identity_mismatch_observed",
+        f"selfcheck:{INV}:01:server_identity_mismatch_observed",
+        f"selfcheck:{str(INV).upper()}:1:server_identity_mismatch_observed",
+        f"selfcheck:{UUID(int=1)}:1:server_identity_mismatch_observed",
+    ],
+)
+def test_system_events_reject_keys_outside_the_rule(key):
+    with pytest.raises(ValidationError):
+        Event(
+            instance_id="i",
+            inserted_at=NOW,
+            kind=EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED,
+            source_key=key,
+            payload={},
+        )
 
 
 def test_event_kind_counts():

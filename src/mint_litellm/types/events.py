@@ -129,7 +129,30 @@ def call_source_key(invocation_id: UUID, attempt_id: int, kind: EventKind) -> st
     return f"call:{invocation_id}:{attempt_id}:{kind.value}"
 
 
+def system_source_key(kind: EventKind, run_id: UUID, seq: int) -> str:
+    """자가 점검·버퍼 사건 키.
+
+    한 실행(점검 한 번, 재적재 배치 하나) 안에서 `seq`가 1부터 증가한다.
+    """
+    if kind not in SYSTEM_KINDS:
+        raise ValueError(f"{kind.value} is not a system event")
+    if run_id.version != 7:
+        raise ValueError("run_id must be a UUIDv7")
+    if seq < 1:
+        raise ValueError("seq starts at 1")
+    return f"{CONTROL_ENTITY[kind]}:{run_id}:{seq}:{kind.value}"
+
+
+def _is_system_key(kind: EventKind, match: re.Match[str]) -> bool:
+    try:
+        return system_source_key(kind, UUID(match["id"]), int(match["version"])) == match[0]
+    except ValueError:
+        return False
+
+
 def control_source_key(kind: EventKind, entity_id: str, state_version: int) -> str:
+    if kind in SYSTEM_KINDS:
+        raise ValueError(f"{kind.value} is a system event")
     entity = CONTROL_ENTITY.get(kind)
     if entity is None:
         raise ValueError(f"{kind.value} is not a control event")
@@ -180,6 +203,8 @@ class Event(BaseModel):
             or match["entity"] != CONTROL_ENTITY[self.kind]
             or match["kind"] != self.kind.value
         ):
+            raise ValueError(f"source_key does not match the rule for {self.kind.value}")
+        if self.kind in SYSTEM_KINDS and not _is_system_key(self.kind, match):
             raise ValueError(f"source_key does not match the rule for {self.kind.value}")
         if self.kind not in SYSTEM_KINDS and not self.actor:
             raise ValueError("control events require actor")
