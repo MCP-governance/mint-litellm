@@ -257,11 +257,19 @@ class TestServerResolution:
         assert raised.value.reason is Reason.SERVER_UNRESOLVED
         assert raised.value.detail == type(error).__name__
 
-    def test_a_server_without_a_url_cannot_be_bound_to_a_contract(self):
+    def test_a_server_without_a_url_is_unsupported_not_unresolved(self):
         manager = Manager([server(url=None)])
         with pytest.raises(ServerResolutionError) as raised:
             compat.resolve_server(compat.parse_hook_data(synthesized()), manager=manager)
-        assert raised.value.reason is Reason.SERVER_UNRESOLVED
+        assert raised.value.reason is Reason.UNSUPPORTED
+        assert raised.value.detail == "server_without_url"
+
+    def test_listing_a_server_without_a_url_is_unsupported_too(self):
+        with pytest.raises(ServerResolutionError) as raised:
+            compat.resolve_listed_server(
+                compat.parse_hook_data(synthesized()), manager=Manager([server(url=None)])
+            )
+        assert raised.value.reason is Reason.UNSUPPORTED
 
     def test_a_request_body_stage_cannot_be_resolved(self):
         with pytest.raises(ServerResolutionError):

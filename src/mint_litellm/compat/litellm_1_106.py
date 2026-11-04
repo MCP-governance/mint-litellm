@@ -123,7 +123,8 @@ def _matching_servers(manager: Any, server_name: str) -> list[Any]:
 
 def _to_resolved(server: Any, candidates: int) -> ResolvedServer:
     if not getattr(server, "url", None):
-        raise ServerResolutionError(Reason.SERVER_UNRESOLVED, "server has no url")
+        # 로컬 실행(stdio)·OpenAPI 서버는 계약 URL 해시를 만들 수 없어 1단계가 지원하지 않는다.
+        raise ServerResolutionError(Reason.UNSUPPORTED, "server_without_url")
     return ResolvedServer(
         server_id=server.server_id,
         url_sha256=url_sha256(server.url),
