@@ -29,6 +29,7 @@ from mint_litellm.control import (
     orgs,
     policy_versions,
     relations,
+    secrets_file,
     servers,
     settings_store,
     status,
@@ -142,7 +143,18 @@ def _init(run: Run) -> None:
             orgs.add(ctx, args.org_id, args.org_name)
         settings_store.set_default_org(ctx, args.org_id)
     text = litellm_config.snippet(servers_arg, no_spend_logs=args.no_spend_logs)
-    run.data.update(migrations=applied, login_roles=configured_roles)
+    secrets_path = Path(args.secrets_file or run.environ.get("MINT_SECRETS_FILE")
+                        or secrets_file.DEFAULT_PATH).expanduser()
+    try:
+        key_created = secrets_file.ensure_fingerprint_key(secrets_path)
+    except OSError as error:
+        raise ControlError(f"비밀 파일을 쓸 수 없습니다({secrets_path}): {error}") from None
+    run.data.update(
+        migrations=applied,
+        login_roles=configured_roles,
+        fingerprint_key_file=secrets_path.as_posix(),
+        fingerprint_key_created=key_created,
+    )
     if args.out == "-":
         run.say(text.rstrip("\n"))
         run.data["snippet"] = text
@@ -155,6 +167,10 @@ def _init(run: Run) -> None:
     print(f"마이그레이션 적용: {', '.join(applied) or '없음(이미 최신)'}", file=log)
     if args.out != "-":
         print(f"LiteLLM 설정 조각: {args.out}", file=log)
+    print(
+        f"인자 지문 키: {secrets_path}" + (" (새로 생성)" if key_created else " (기존 키 유지)"),
+        file=log,
+    )
     if configured_roles:
         print(f"로그인 역할 설정: {', '.join(configured_roles)}", file=log)
     elif not passwords:
@@ -499,6 +515,9 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--mcp-server", action="append", help="통제할 설정 서버(이름=URL, 반복 가능)"),
         _a("--out", default="config/litellm.mint.yaml",
            help="설정 조각을 쓸 파일(기본: config/litellm.mint.yaml, -는 표준 출력)"),
+        _a("--secrets-file",
+           help="인자 지문 키를 둘 저장소 밖 비밀 파일"
+                "(기본: MINT_SECRETS_FILE 또는 ~/.config/mint/secrets.env)"),
         _a("--no-spend-logs", action="store_true",
            help="disable_spend_logs: true를 설정 조각에 포함"),
     ],

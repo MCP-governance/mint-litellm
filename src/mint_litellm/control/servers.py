@@ -45,6 +45,12 @@ def register(
             f"서버 {server_id}는 LiteLLM에서 아직 승인되지 않았습니다"
             f"(approval_status={entry.get('approval_status')})."
         )
+    if entry.get("transport") == "stdio" or entry.get("spec_path") or entry.get("command"):
+        raise ControlError(
+            "MINT-UNSUPPORTED: server_without_url — URL이 없는 서버(stdio, OpenAPI 명세 기반)는 "
+            "등록할 수 없습니다. 계약 값을 URL 해시로 정하므로 HTTP URL로 연결되는 서버만 "
+            "통제할 수 있습니다."
+        )
     found = [
         (source, value)
         for source, value in (

@@ -252,12 +252,15 @@ def test_policy_activate_needs_a_valid_bundle_source_and_engine_address(mint, tm
 
 
 def test_init_writes_the_default_snippet_path_and_reports_json(mint):
-    code, out, _ = mint.run("--json", "init")
+    code, out, _ = mint.run("--json", "init", "--secrets-file", str(mint.tmp / "secrets.env"))
     result = json.loads(out)
     assert code == 0 and result["ok"] is True and result["command"] == "init"
     assert result["snippet_path"] == "config/litellm.mint.yaml"
     assert (mint.tmp / "config" / "litellm.mint.yaml").is_file()
     assert result["migrations"] == []  # 시험용 데이터베이스는 이미 최신이다
+    assert result["fingerprint_key_created"] is True
+    assert "MINT_FINGERPRINT_KEY=" in (mint.tmp / "secrets.env").read_text(encoding="utf-8")
+    assert result["fingerprint_key_file"] == (mint.tmp / "secrets.env").as_posix()
     assert [e["kind"] for e in result["events"]] == [
         "settings_changed", "org_created", "settings_changed"]
 
@@ -425,3 +428,27 @@ def test_status_shows_observed_server_identity_mismatches_until_reregistered(min
     code, out, _ = mint.run("--json", "status", token=boss)
     assert [a for a in json.loads(out)["alerts"]
             if a["kind"] == "server_identity_mismatch_observed"] == []
+
+
+def test_init_keeps_an_existing_fingerprint_key(mint):
+    path = mint.tmp / "secrets.env"
+    mint.env["MINT_SECRETS_FILE"] = str(path)
+    assert mint.run("init")[0] == 0
+    first = path.read_text(encoding="utf-8")
+    code, out, _ = mint.run("--json", "init")
+    assert code == 0 and json.loads(out)["fingerprint_key_created"] is False
+    assert path.read_text(encoding="utf-8") == first
+
+
+def test_servers_without_a_url_are_refused(mint, stub):
+    boss = bootstrap(mint)
+    body = dict(json.loads(json.dumps(stub.routes[("/v1/mcp/server/ctl-everything",
+                                                   frozenset())][1])), transport="stdio")
+    stub.set("/v1/mcp/server/ctl-everything", body)
+    code, _, err = mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp",
+                            token=boss)
+    assert code == 1 and "MINT-UNSUPPORTED" in err and "server_without_url" in err
+    stub.set("/v1/mcp/server/ctl-everything", dict(body, transport="http", spec_path="spec.yaml"))
+    code, _, err = mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp",
+                            token=boss)
+    assert code == 1 and "server_without_url" in err

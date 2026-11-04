@@ -69,12 +69,13 @@
 | `MINT_LITELLM_CONFIG` | `check`·`status`가 읽는 LiteLLM `config.yaml` 경로. `--config`로 대신할 수 있다. | 없음 |
 | `MINT_MODE` | 모드 상한. `enforce`이면 `settings mode observe`가 거부된다. | `enforce` |
 | `MINT_REPLICAS` | `check`가 공유 캐시 설정을 판단할 때 쓰는 복제본 수 | `1` |
+| `MINT_SECRETS_FILE` | `init`이 인자 지문 키를 쓰는 비밀 파일. `--secrets-file`로 대신할 수 있다. | `~/.config/mint/secrets.env` |
 | `MINT_PLUGIN_DB_PASSWORD`, `MINT_CONTROL_DB_PASSWORD` | `init`이 판정 프로세스용·제어 평면용 로그인 역할(`mint_plugin_app`, `mint_control_app`)을 만들 때 쓰는 비밀번호 | 없음(역할을 만들지 않음) |
 | `MINT_OPA_URL`, `MINT_POLICY_ROOT`, `MINT_OPA_BUNDLE_PATH` | `policy activate`의 정책 엔진 주소, `policy/`를 담은 루트, 정책 엔진이 감시하는 번들 파일. 각 옵션(`--opa-url`, `--policy-root`, `--bundle-path`)으로 대신할 수 있다. | `/opt/mint`, `/bundles/mint.tar.gz` |
 
 ## 설정 조각
 
-`init`은 LiteLLM 설정 조각을 `config/litellm.mint.yaml`에 쓴다. `--out <경로>`로 위치를 바꾸고 `--out -`로 표준 출력에 낸다. 통제할 설정 서버는 `--mcp-server <이름>=<URL>`로 줄 수 있으며 `server_id`는 이름과 같게 명시된다.
+`init`은 LiteLLM 설정 조각을 `config/litellm.mint.yaml`에 쓰고, 호출별 승인의 인자 지문 키가 없으면 저장소 밖 비밀 파일(`--secrets-file`, 기본 `~/.config/mint/secrets.env`, 권한 0600)에 만든다. 출력의 `fingerprint_key_file`·`fingerprint_key_created`로 확인하며 키 값은 출력하지 않는다. `--out <경로>`로 위치를 바꾸고 `--out -`로 표준 출력에 낸다. 통제할 설정 서버는 `--mcp-server <이름>=<URL>`로 줄 수 있으며 `server_id`는 이름과 같게 명시된다.
 
 ## 승인 조건과 대상 확인
 
@@ -91,7 +92,7 @@
 
 ## 서버 등록의 계약 URL
 
-`server register`는 서버의 URL 해시를 계약 값으로 저장한다. URL은 `--url`, LiteLLM 설정 파일(`--config` 또는 `MINT_LITELLM_CONFIG`의 `mcp_servers.<이름>.url`, `server_id`가 같은 항목), 관리 API 응답 순으로 정하며 출처는 사건의 `url_source`(`operator`, `config_file`, `registry`)에 남는다. 제어 평면 키는 제한된 키라서 관리 API가 URL을 응답하지 않는 것이 보통이다. 둘 이상의 출처가 보이면 모두 같아야 한다. 이미 등록된 서버에 다시 실행하면 계약 값을 갱신한다. `status`는 플러그인이 관측한 계약 불일치(`server_identity_mismatch_observed`)를 서버를 다시 등록하기 전까지 경보로 표시한다.
+`server register`는 서버의 URL 해시를 계약 값으로 저장한다. URL은 `--url`, LiteLLM 설정 파일(`--config` 또는 `MINT_LITELLM_CONFIG`의 `mcp_servers.<이름>.url`, `server_id`가 같은 항목), 관리 API 응답 순으로 정하며 출처는 사건의 `url_source`(`operator`, `config_file`, `registry`)에 남는다. 제어 평면 키는 제한된 키라서 관리 API가 URL을 응답하지 않는 것이 보통이다. 둘 이상의 출처가 보이면 모두 같아야 한다. URL이 없는 서버(stdio, OpenAPI 명세 기반)는 `MINT-UNSUPPORTED`(사유 `server_without_url`)로 거부한다. 이미 등록된 서버에 다시 실행하면 계약 값을 갱신한다. `status`는 플러그인이 관측한 계약 불일치(`server_identity_mismatch_observed`)를 서버를 다시 등록하기 전까지 경보로 표시한다.
 
 ## 출력 형식
 

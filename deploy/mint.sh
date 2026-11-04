@@ -12,17 +12,18 @@ env_value() {
     grep -E "^$1=" .env | head -n1 | cut -d= -f2-
 }
 
-random_hex() {
-    openssl rand -hex 32 2>/dev/null || od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
-}
-
-# 호출별 승인의 인자 지문 키는 배포마다 한 번 생성해 .env에 둔다. 바꾸면 이미 요청한 호출별
-# 승인이 맞지 않게 되므로 이미 있으면 건드리지 않는다.
+# 인자 지문 키는 저장소 밖 비밀 파일에 둔다. 디렉터리와 빈 파일(0600)만 준비하고, 키는 init이 만든다.
 ensure_secrets() {
-    if [ -z "$(env_value MINT_FINGERPRINT_KEY)" ]; then
-        sed -i '/^MINT_FINGERPRINT_KEY=/d' .env
-        printf 'MINT_FINGERPRINT_KEY=%s\n' "$(random_hex)" >> .env
+    local dir
+    dir="$(env_value MINT_SECRETS_DIR)"
+    if [ -z "$dir" ]; then
+        dir="$HOME/.config/mint"
+        sed -i '/^MINT_SECRETS_DIR=/d' .env
+        printf 'MINT_SECRETS_DIR=%s\n' "$dir" >> .env
     fi
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    [ -f "$dir/secrets.env" ] || (umask 077 && : > "$dir/secrets.env")
 }
 
 require_env() {
@@ -76,7 +77,8 @@ cmd_status() {
 # 백업은 데이터베이스 두 개, 정책 번들, LiteLLM 설정을 한 폴더에 모은다. 하나라도 비면 폴더를 지운다.
 cmd_backup() {
     require_env
-    local dir="backups/$(date -u +%Y%m%dT%H%M%SZ)"
+    local dir
+    dir="backups/$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$dir"
     for database in mint litellm; do
         "${COMPOSE[@]}" exec -T postgres pg_dump -U postgres -d "$database" > "$dir/$database.sql"
@@ -84,9 +86,9 @@ cmd_backup() {
     "${COMPOSE[@]}" run --rm --no-deps -T --entrypoint cat control "$BUNDLE_FILE" > "$dir/mint.tar.gz"
     cp config/litellm.config.yaml "$dir/litellm.config.yaml"
     for file in mint.sql litellm.sql mint.tar.gz litellm.config.yaml; do
-        [ -s "$dir/$file" ] || { rm -rf "$dir"; fail "백업에 $file이 비어 있어 폴더를 지웠습니다."; }
+        [ -s "$dir/$file" ] || { rm -rf "$dir"; fail "백업의 $file이 비어 있어 폴더를 지웠습니다."; }
     done
-    echo "백업: $dir (mint.sql, litellm.sql, mint.tar.gz, litellm.config.yaml; 비밀값이 담긴 .env는 포함하지 않습니다)"
+    echo "백업: $dir (mint.sql, litellm.sql, mint.tar.gz, litellm.config.yaml; 비밀값은 포함하지 않습니다)"
 }
 
 cmd_upgrade() {
