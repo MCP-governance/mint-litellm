@@ -48,9 +48,9 @@ async def run_server(replies, *, timeout=1):
             await writer.wait_closed()
 
     server = await asyncio.start_server(handler, "localhost", 0, family=2)
-    port = server.sockets[0].getsockname()[1]
+    host, port = server.sockets[0].getsockname()[:2]
     try:
-        client = OPAClient(f"http://localhost:{port}", timeout)
+        client = OPAClient(f"http://{host}:{port}", timeout)
         result = await client.evaluate(
             {"tool": {"name": "example"}}, policy_version_id="active", bundle_sha256=HASH
         )
@@ -112,10 +112,10 @@ def test_timeout_stops_as_dependency_failure():
 def test_connection_failure_stops_as_dependency_failure():
     async def run():
         server = await asyncio.start_server(lambda r, w: None, "localhost", 0, family=2)
-        port = server.sockets[0].getsockname()[1]
+        host, port = server.sockets[0].getsockname()[:2]
         server.close()
         await server.wait_closed()
-        return await OPAClient(f"http://localhost:{port}", 1).evaluate(
+        return await OPAClient(f"http://{host}:{port}", 1).evaluate(
             {}, policy_version_id="active", bundle_sha256=HASH
         )
 
