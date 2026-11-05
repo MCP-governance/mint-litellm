@@ -284,18 +284,39 @@ def prepare_bundle(
     )
 
 
-def publish_bundle(path: Path, archive: bytes) -> None:
-    path = path.resolve()
+def _write_atomic(path: Path, data: bytes) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=".bundle-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as output:
-            output.write(archive)
+            output.write(data)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temp_name, path)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
+
+
+def _previous_path(path: Path) -> Path:
+    return path.with_name(path.name + ".previous")
+
+
+def publish_bundle(path: Path, archive: bytes) -> None:
+    """번들을 원자적으로 게시한다. 이미 게시된 파일은 `<이름>.previous`로 보관한다."""
+    path = path.resolve()
+    if path.is_file():
+        _write_atomic(_previous_path(path), path.read_bytes())
+    _write_atomic(path, archive)
+
+
+def restore_bundle(path: Path) -> bool:
+    """보관한 이전 번들을 원자적으로 되돌린다. 보관본이 없으면 False."""
+    path = path.resolve()
+    previous = _previous_path(path)
+    if not previous.is_file():
+        return False
+    _write_atomic(path, previous.read_bytes())
+    return True
 
 
 async def register_bundle(conn, *, instance_id: str, bundle: PreparedBundle) -> None:
@@ -308,8 +329,38 @@ async def register_bundle(conn, *, instance_id: str, bundle: PreparedBundle) -> 
         )
 
 
+@dataclass(frozen=True)
+class _Served:
+    policy_version_id: str
+    bundle_sha256: str
+
+
+RESTORED = "restored"
+NOT_RESTORED_NO_ACTIVE = "not restored: no active version"
+NOT_RESTORED_NO_COPY = "not restored: no previous bundle file"
+
+
+async def _restore_previous(
+    restore: Callable[[], Awaitable[bool]],
+    previous: "_Served | None",
+    opa_url: str,
+    budget: float,
+) -> str:
+    """이전 활성 번들을 되돌리고 OPA가 그 메타와 내용을 다시 서빙하는지 확인한다."""
+    if previous is None:
+        return NOT_RESTORED_NO_ACTIVE
+    try:
+        if not await restore():
+            return NOT_RESTORED_NO_COPY
+        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
+            await _wait_until_loaded(client, opa_url, previous, max(budget, 0.1))
+    except Exception as exc:
+        return f"restore failed: {type(exc).__name__}: {exc}"
+    return RESTORED
+
+
 async def _wait_until_loaded(
-    client: httpx.AsyncClient, opa_url: str, bundle: "PreparedBundle", budget: float
+    client: httpx.AsyncClient, opa_url: str, bundle: "PreparedBundle | _Served", budget: float
 ) -> None:
     """남은 예산 안에서 메타와 적재 내용이 함께 등록 값과 같아질 때까지 다시 확인한다."""
     expected = {
@@ -347,7 +398,13 @@ async def activate_bundle(
     publish: Callable[[bytes], Awaitable[None]],
     opa_url: str,
     timeout_seconds: float,
+    restore: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
+    """번들을 게시하고 활성화한다.
+
+    ``restore``를 주면 게시 뒤 어느 단계에서든 실패할 때 이전 활성 번들로 되돌리고 OPA가
+    다시 서빙하는지 확인한다. 결과는 던져지는 예외의 ``restore_outcome``과 노트에 담긴다.
+    """
     if timeout_seconds <= 0 or not actor:
         raise ValueError("invalid activation parameters")
     async with asyncio.timeout(timeout_seconds), conn.transaction():
@@ -364,38 +421,61 @@ async def activate_bundle(
             "UPDATE mint.policy_versions SET status = 'staged' WHERE instance_id = %s AND id = %s",
             (instance_id, bundle.policy_version_id),
         )
-        await publish(bundle.archive)
-        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
-            await _wait_until_loaded(
-                client, opa_url, bundle, timeout_seconds - min(0.5, timeout_seconds / 5)
-            )
-        await conn.execute(
-            "UPDATE mint.policy_versions SET status = 'superseded' "
+        cursor = await conn.execute(
+            "SELECT id, bundle_sha256 FROM mint.policy_versions "
             "WHERE instance_id = %s AND status = 'active'", (instance_id,)
         )
-        cursor = await conn.execute(
-            "UPDATE mint.policy_versions SET status = 'active', activated_at = now(), "
-            "activated_by = %s "
-            "WHERE instance_id = %s AND id = %s AND status = 'staged' RETURNING state_version",
-            (actor, instance_id, bundle.policy_version_id),
-        )
-        version_row = await cursor.fetchone()
-        if version_row is None:
-            raise ValueError("policy activation failed")
-        source_key = control_source_key(
-            EventKind.POLICY_ACTIVATED, bundle.policy_version_id, version_row[0]
-        )
-        payload = json.dumps(
-            {"policy_version_id": bundle.policy_version_id, "bundle_sha256": bundle.bundle_sha256}
-        )
-        await conn.execute(
-            "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload) "
-            "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
-            (
-                new_uuid7(), instance_id, EventKind.POLICY_ACTIVATED.value,
-                source_key, actor, payload,
-            ),
-        )
+        active = await cursor.fetchone()
+        previous = _Served(*active) if active else None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        tail = min(0.5, timeout_seconds / 5)
+        try:
+            await publish(bundle.archive)
+            async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
+                await _wait_until_loaded(
+                    client, opa_url, bundle,
+                    (timeout_seconds - tail) * (0.7 if restore else 1),
+                )
+            await _switch_active(conn, instance_id, actor, bundle)
+        except Exception as exc:
+            if restore is not None:
+                outcome = await _restore_previous(
+                    restore, previous, opa_url, deadline - loop.time() - tail / 2
+                )
+                exc.restore_outcome = outcome
+                exc.add_note(f"previous bundle: {outcome}")
+            raise
+
+
+async def _switch_active(conn, instance_id: str, actor: str, bundle: PreparedBundle) -> None:
+    await conn.execute(
+        "UPDATE mint.policy_versions SET status = 'superseded' "
+        "WHERE instance_id = %s AND status = 'active'", (instance_id,)
+    )
+    cursor = await conn.execute(
+        "UPDATE mint.policy_versions SET status = 'active', activated_at = now(), "
+        "activated_by = %s "
+        "WHERE instance_id = %s AND id = %s AND status = 'staged' RETURNING state_version",
+        (actor, instance_id, bundle.policy_version_id),
+    )
+    version_row = await cursor.fetchone()
+    if version_row is None:
+        raise ValueError("policy activation failed")
+    source_key = control_source_key(
+        EventKind.POLICY_ACTIVATED, bundle.policy_version_id, version_row[0]
+    )
+    payload = json.dumps(
+        {"policy_version_id": bundle.policy_version_id, "bundle_sha256": bundle.bundle_sha256}
+    )
+    await conn.execute(
+        "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload) "
+        "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+        (
+            new_uuid7(), instance_id, EventKind.POLICY_ACTIVATED.value,
+            source_key, actor, payload,
+        ),
+    )
 
 
 async def retry_activation(
@@ -407,6 +487,7 @@ async def retry_activation(
     publish: Callable[[bytes], Awaitable[None]],
     opa_url: str,
     timeout_seconds: float,
+    restore: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     """게시 후 DB 전환이 실패한 validated 판본을 다시 게시하고 활성화한다."""
     await activate_bundle(
@@ -417,4 +498,5 @@ async def retry_activation(
         publish=publish,
         opa_url=opa_url,
         timeout_seconds=timeout_seconds,
+        restore=restore,
     )
