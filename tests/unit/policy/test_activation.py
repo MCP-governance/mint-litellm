@@ -69,12 +69,12 @@ async def activate_against_fake_opa(served_rego, served_data):
         writer.close()
         await writer.wait_closed()
 
-    server = await asyncio.start_server(handler, "127.0.0.1", 0, family=socket.AF_INET)
+    server = await asyncio.start_server(handler, "localhost", 0, family=socket.AF_INET)
     try:
-        port = server.sockets[0].getsockname()[1]
+        host, port = server.sockets[0].getsockname()[:2]
         await activate_bundle(
             conn, instance_id="instance", actor="operator", bundle=bundle,
-            publish=publish, opa_url=f"http://127.0.0.1:{port}", timeout_seconds=3,
+            publish=publish, opa_url=f"http://{host}:{port}", timeout_seconds=3,
         )
     finally:
         server.close()
