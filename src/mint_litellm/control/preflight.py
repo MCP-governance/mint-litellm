@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -22,7 +23,8 @@ CONFIG_SOURCE_VARIABLES = (
     "LITELLM_CONFIG_BUCKET_OBJECT_KEY",
     "LITELLM_CONFIG_BUCKET_TYPE",
 )
-_KMS_ALIAS_PREFIX = "litellm_secret_aws_kms_"
+_KMS_PREFIX = "litellm_secret_aws_kms"
+_KMS_ALIAS = re.compile("litellm_secret_aws_kms_", re.IGNORECASE)
 
 
 def source_problems(env: Mapping[str, str]) -> list[str]:
@@ -33,16 +35,17 @@ def source_problems(env: Mapping[str, str]) -> list[str]:
         if name in env
     ]
     if env.get("USE_AWS_KMS") == "True":
-        # 이 설정이면 LiteLLM이 기동 중에 별칭(LITELLM_SECRET_AWS_KMS_<이름>)과 aws_kms/ 값을 풀어
-        # 같은 이름의 환경 변수로 만든다. 그 값은 이 검사가 볼 수 없다.
-        sources = set(CONFIG_SOURCE_VARIABLES)
-        for name in env:
-            if name.lower().startswith(_KMS_ALIAS_PREFIX):
-                if name[len(_KMS_ALIAS_PREFIX):].upper() in sources:
-                    problems.append(
-                        f"USE_AWS_KMS와 설정 경로 별칭({name})이 함께 있어 기동 중에 설정 출처가 "
-                        "바뀔 수 있습니다."
-                    )
+        # LiteLLM(decrypt_env_var)은 이름이 litellm_secret_aws_kms로 시작하거나 값이 aws_kms/로
+        # 시작하는 변수를 풀어, 이름에서 접두사(대소문자 무시, 모든 위치)를 지운 이름의 환경 변수로
+        # 만든다. 그 이름이 설정 출처 이름이면 기동 중에 설정이 바뀐다. 값은 이 검사가 볼 수 없다.
+        sources = {name.upper() for name in CONFIG_SOURCE_VARIABLES}
+        for name, value in env.items():
+            targeted = name.lower().startswith(_KMS_PREFIX) or str(value).startswith("aws_kms/")
+            if targeted and _KMS_ALIAS.sub("", name).upper() in sources:
+                problems.append(
+                    f"USE_AWS_KMS와 설정 경로 별칭({name})이 함께 있어 기동 중에 설정 출처가 "
+                    "바뀔 수 있습니다."
+                )
     return problems
 
 

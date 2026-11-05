@@ -86,38 +86,56 @@ def collect(
     }
 
 
-def enforcement_states(ctx: Context) -> list[dict[str, Any]]:
-    """워커마다 가장 최근의 ``enforcement_verified``·``enforcement_unverified``.
+def _failed_items(value: Any) -> list[dict[str, Any]]:
+    """실패 항목은 ``{"item", "name", "detail"}`` 객체의 목록이다. 다른 형식이어도 죽지 않는다."""
+    if not isinstance(value, list):
+        return []
+    items = []
+    for entry in value:
+        if isinstance(entry, dict):
+            items.append(entry)
+        else:
+            items.append({"name": str(entry), "detail": ""})
+    return items
 
-    표시는 최근 전환이며, 그 워커가 지금 살아 있다는 뜻이 아니다.
+
+def enforcement_states(ctx: Context) -> list[dict[str, Any]]:
+    """워커마다 가장 최근의 ``enforcement_verified``·``enforcement_unverified`` 한 건.
+
+    워커는 ``worker_id``(호스트 이름:프로세스 번호)로 묶으므로 재시작 전후는 한 줄이다. 줄마다 전환
+    시각과 실행 식별자(사건 키의 실행 uuid)를 함께 보인다. 표시는 최근 전환이며 그 워커가 지금
+    살아 있다는 뜻이 아니다.
     """
     rows = fetchall(
         ctx.conn,
-        "SELECT kind, inserted_at, payload FROM mint.events WHERE instance_id = %s"
+        "SELECT DISTINCT ON (payload->>'worker_id') kind, inserted_at, source_key, payload"
+        " FROM mint.events WHERE instance_id = %s"
         " AND kind IN ('enforcement_verified', 'enforcement_unverified')"
-        " ORDER BY inserted_at DESC, event_id DESC LIMIT 1000",
+        " ORDER BY payload->>'worker_id', inserted_at DESC, event_id DESC",
         (ctx.instance_id,),
     )
-    latest: dict[str, dict[str, Any]] = {}
+    states = []
     for row in rows:
         payload = row["payload"] if isinstance(row["payload"], dict) else {}
-        worker = str(payload.get("worker_id") or "-")
-        if worker in latest:
-            continue
         passed = row["kind"] == "enforcement_verified"
-        failed = payload.get("failed") or []
-        latest[worker] = {
-            "worker_id": worker,
-            "passed": passed,
-            "cause": None if passed else payload.get("cause")
-            or ("startup_check" if failed else payload.get("error")),
-            "failed": failed,
-            "hooks": payload.get("hooks") or [],
-            "allowed_hooks_used": payload.get("allowed_hooks_used") if passed else None,
-            "last_transition_at": row["inserted_at"].isoformat(),
-            "payload": payload,
-        }
-    return sorted(latest.values(), key=lambda s: s["worker_id"])
+        failed = _failed_items(payload.get("failed"))
+        parts = str(row["source_key"]).split(":")
+        states.append(
+            {
+                "worker_id": str(payload.get("worker_id") or "-"),
+                "passed": passed,
+                "cause": None
+                if passed
+                else payload.get("cause") or ("startup_check" if failed else payload.get("error")),
+                "failed": failed,
+                "hooks": payload.get("hooks") if isinstance(payload.get("hooks"), list) else [],
+                "allowed_hooks_used": payload.get("allowed_hooks_used") if passed else None,
+                "run_id": parts[1] if len(parts) > 1 else None,
+                "last_transition_at": row["inserted_at"].isoformat(),
+                "payload": payload,
+            }
+        )
+    return sorted(states, key=lambda s: s["worker_id"])
 
 
 def allowed_pre_hooks(env: dict[str, str]) -> list[str]:
@@ -175,14 +193,18 @@ def render(info: dict[str, Any]) -> str:
     for state in info["enforcement"]:
         if state["passed"]:
             used = "허용 목록 사용" if state["allowed_hooks_used"] else "허용 목록 미사용"
-            lines.append(f"  {state['worker_id']}: 통과 ({used}) {state['last_transition_at']}")
+            lines.append(
+                f"  {state['worker_id']}: 통과 ({used}) {state['last_transition_at']}"
+                f" 실행 {state['run_id'] or '-'}"
+            )
         else:
             names = ", ".join(
                 f"{item.get('name', '?')}: {item.get('detail', '')}" for item in state["failed"]
-            ) or ", ".join(state["hooks"])
+            ) or ", ".join(str(hook) for hook in state["hooks"])
             reason = state["cause"] or "원인 미상"
             lines.append(
                 f"  {state['worker_id']}: 실패 ({reason}) {names} {state['last_transition_at']}"
+                f" 실행 {state['run_id'] or '-'}"
             )
     lines.append("관측 항목")
     lines.extend(f"  {k}: {v}" for k, v in info["observations"].items())

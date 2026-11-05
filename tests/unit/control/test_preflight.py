@@ -337,3 +337,34 @@ def test_a_dotenv_loaded_by_the_loader_is_seen_after_loading(tmp_path, monkeypat
     monkeypatch.setitem(sys.modules, "litellm.proxy.proxy_server", module)
     problems = preflight.preflight(path, environ)
     assert any("CONFIG_FILE_PATH" in line for line in problems)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        # 접두사를 두 번 쓴 이름: LiteLLM은 이름 전체에서 접두사를 지운다
+        {"USE_AWS_KMS": "True",
+         "LITELLM_SECRET_AWS_KMS_LITELLM_SECRET_AWS_KMS_CONFIG_FILE_PATH": "x"},
+        # 이름 가운데 접두사가 들어간 이름
+        {"USE_AWS_KMS": "True",
+         "LITELLM_SECRET_AWS_KMS_CONFIG_litellm_secret_aws_kms_FILE_PATH": "x"},
+        # 이름은 접두사로 시작하지 않고 값만 aws_kms/ 인 경우
+        {"USE_AWS_KMS": "True", "CONFIG_litellm_secret_aws_kms_FILE_PATH": "aws_kms/abc"},
+        {"USE_AWS_KMS": "True", "litellm_secret_aws_kms_litellm_config_bucket_type": "x"},
+    ],
+)
+def test_the_kms_name_normalization_matches_litellms(env):
+    assert preflight.source_problems(env)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"USE_AWS_KMS": "True", "CONFIG_litellm_secret_aws_kms_FILE_PATH": "plain-value"},
+        {"USE_AWS_KMS": "True", "OTHER": "aws_kms/abc"},
+        {"USE_AWS_KMS": "True", "LITELLM_SECRET_AWS_KMS_LITELLM_CONFIG": "x"},
+        {"CONFIG_litellm_secret_aws_kms_FILE_PATH": "aws_kms/abc"},
+    ],
+)
+def test_names_that_do_not_become_a_configuration_source_are_not_refused(env):
+    assert preflight.source_problems(env) == []
