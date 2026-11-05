@@ -17,7 +17,6 @@ def context(**override):
         "invocation_id": INVOCATION,
         "attempt_id": 1,
         "decision_ref": f"{INVOCATION}:1",
-        "arguments_digest": "d" * 64,
         "allowed": True,
         "state_epoch": 7,
         "server_id": "srv-1",
@@ -76,7 +75,6 @@ def test_an_unchanged_epoch_needs_no_state_lookup(tmp_path):
     assert payload["snapshot_state_epoch"] == payload["current_state_epoch"] == 7
     assert payload["size_bytes"] == 42 and payload["is_error"] is False
     assert payload["decision_ref"] == f"{INVOCATION}:1"
-    assert "d" * 64 not in response_event(store).to_json_line()
     assert database.queries == []
 
 

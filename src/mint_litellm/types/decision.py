@@ -26,9 +26,6 @@ from mint_litellm.types.settings import Mode, ObservationSettings
 MINT_CTX_KEY = "mint_ctx"
 """``litellm_logging_obj.model_call_details``에서 호출 컨텍스트를 싣는 키."""
 
-MINT_DECISION_REF_KEY = "mint_decision_ref"
-"""사전 훅 ``data``에서 판정이 끝났음을 가드레일에 알리는 표식 키."""
-
 
 class PolicyDecision(StrEnum):
     ALLOW = "Allow"

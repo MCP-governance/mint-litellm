@@ -22,18 +22,13 @@ from mint_litellm.types.events import (
     EventKind,
     ResponseObservation,
     call_source_key,
-    control_source_key,
 )
-from mint_litellm.types.reason_codes import Reason
 
 
 class RevocationSource(Protocol):
     async def read_epoch(self, instance_id: str) -> int | None: ...
 
     async def has_negative_state(self, query: NegativeStateQuery) -> bool: ...
-
-
-PLUGIN_ACTOR = "mint-plugin"
 
 
 @dataclass
@@ -56,34 +51,6 @@ def _event(ctx: Mapping[str, Any], kind: EventKind, payload: dict[str, Any], dep
         attempt_id=attempt_id,
         payload={"decision_ref": ctx["decision_ref"], **payload},
     )
-
-
-async def record_consumed_without_dispatch(ctx: Mapping[str, Any], deps: ResultDeps) -> bool:
-    """판정 뒤 인자가 바뀌어 전송하지 못한 호출의, 이미 소비된 호출별 승인을 사건으로 남긴다.
-
-    소비는 복구하지 않는다. 인자 원문과 요약값은 담지 않는다. 소비된 승인이 없으면 남기지 않는다.
-    """
-    consumed = ctx.get("consumed_call_approval")
-    if not isinstance(consumed, Mapping):
-        return False
-    kind = EventKind.CALL_APPROVAL_CONSUMED_WITHOUT_DISPATCH
-    await deps.recorder.record(
-        Event(
-            instance_id=deps.config.instance_id,
-            inserted_at=deps.clock(),
-            kind=kind,
-            source_key=control_source_key(kind, consumed["id"], consumed["state_version"]),
-            invocation_id=UUID(ctx["invocation_id"]),
-            attempt_id=int(ctx["attempt_id"]),
-            actor=PLUGIN_ACTOR,
-            payload={
-                "reason": Reason.ARGUMENTS_CHANGED.value,
-                "decision_ref": ctx["decision_ref"],
-                "call_approval_id": consumed["id"],
-            },
-        )
-    )
-    return True
 
 
 async def check_revocation(
@@ -143,10 +110,14 @@ async def observe_unknown_outcome(
     if not ctx.get("allowed"):
         return
     cause = "timeout" if http_status == 504 else "failure"
-    event = _event(
-        ctx,
-        EventKind.CALL_OUTCOME_UNKNOWN,
-        {"cause": cause, "exception_type": exception_type, "http_status": http_status},
-        deps,
-    )
+    payload: dict[str, Any] = {
+        "cause": cause,
+        "exception_type": exception_type,
+        "http_status": http_status,
+    }
+    consumed = ctx.get("consumed_call_approval")
+    if isinstance(consumed, Mapping):
+        # 판정 뒤 다른 병렬 가드레일이 막은 호출도 여기에 닿는다. 소비된 승인을 사건에 묶어 둔다.
+        payload["call_approval_id"] = consumed["id"]
+    event = _event(ctx, EventKind.CALL_OUTCOME_UNKNOWN, payload, deps)
     await deps.recorder.record(event)

@@ -14,7 +14,6 @@ from pathlib import Path
 from mint_litellm.types.fingerprint import decode_fingerprint_key
 from mint_litellm.types.settings import Mode
 
-_CLASS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
@@ -42,7 +41,6 @@ class PluginConfig:
     fingerprint_key_version: int = 1
     readiness_url: str | None = None
     selfcheck_grace_seconds: float = DEFAULT_SELFCHECK_GRACE_SECONDS
-    allowed_pre_hooks: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> PluginConfig:
@@ -74,7 +72,6 @@ class PluginConfig:
             fingerprint_key=key,
             fingerprint_key_version=_integer(env, "MINT_FINGERPRINT_KEY_VERSION", 1, 1),
             readiness_url=env.get("MINT_READINESS_URL") or None,
-            allowed_pre_hooks=_class_names(env.get("MINT_ALLOWED_PRE_HOOKS", "")),
             selfcheck_grace_seconds=float(
                 _integer(
                     env,
@@ -101,14 +98,6 @@ def _fingerprint_key(raw: str | None) -> bytes | None:
         return decode_fingerprint_key(raw)
     except ValueError as exc:
         raise RuntimeError(f"MINT_FINGERPRINT_KEY is invalid: {exc}") from None
-
-
-def _class_names(raw: str) -> frozenset[str]:
-    names = [item.strip() for item in raw.split(",") if item.strip()]
-    for name in names:
-        if not _CLASS_NAME.fullmatch(name):
-            raise RuntimeError("MINT_ALLOWED_PRE_HOOKS must list class names separated by commas")
-    return frozenset(names)
 
 
 def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
