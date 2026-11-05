@@ -205,20 +205,25 @@ def test_decision_event_for_a_tool_call():
     assert event.payload["enforced_action"] == "allow"
 
 
-def test_decision_event_for_discovery_is_per_tool_with_attempt_one():
+def test_decision_event_for_discovery_starts_per_tool_at_attempt_one():
     snap = snapshot(operation=OperationType.RUNTIME_DISCOVERY)
     event = decision_event(snap)
     assert event.kind is EventKind.DISCOVERY_EVALUATED
     assert event.source_key == f"call:{INV}:1:discovery_evaluated"
+
+
+def test_a_discovery_block_after_an_unknown_record_is_the_next_attempt():
     ctx = MintContext(invocation_id=INV, attempt_id=2)
-    with pytest.raises(ValueError):
-        decision_event(
-            snapshot(
-                operation=OperationType.RUNTIME_DISCOVERY,
-                attempt_id=2,
-                decision_ref=ctx.decision_ref,
-            )
+    event = decision_event(
+        snapshot(
+            operation=OperationType.RUNTIME_DISCOVERY,
+            attempt_id=2,
+            decision_ref=ctx.decision_ref,
+            original_decision_ref=f"{INV}:1",
         )
+    )
+    assert event.kind is EventKind.DISCOVERY_EVALUATED
+    assert event.source_key == f"call:{INV}:2:discovery_evaluated" and event.attempt_id == 2
 
 
 def test_a_stop_placed_in_the_findings_slot_is_rejected():

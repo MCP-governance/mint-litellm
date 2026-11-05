@@ -594,6 +594,8 @@ class _Run:
     # 판정 사건의 기록이 시작됐는지(결과가 불명일 수 있다), 어느 위치든 남겨졌는지.
     event_started: bool = False
     event_written: bool = False
+    # 이 호출에서 기록을 시작한 가장 큰 시도 번호. 취소 사건은 그보다 큰 번호를 쓴다.
+    last_attempt: int = 0
 
 
 def _decision_snapshot(
@@ -843,7 +845,6 @@ async def _record_cancelled(run: _Run, deps: PipelineDeps) -> None:
     남긴다. 버퍼 기록은 예산과 무관하게 한 번 시도한다.
     """
     try:
-        req = run.req
         kept = [(stage, result) for stage, result in run.stages.items if stage is not run.current]
         stages = _Stages()
         stages.items = kept
@@ -855,7 +856,7 @@ async def _record_cancelled(run: _Run, deps: PipelineDeps) -> None:
             findings=(),
             stop=StageResult.stop(Reason.CANCELLED),
         )
-        attempt = req.attempt_id + 1 if run.event_started else None
+        attempt = run.last_attempt + 1 if run.event_started else None
         event = decision_event(_decision_snapshot(run, conclusion, None, attempt_id=attempt))
         stored = await deps.recorder.try_database(event, timeout=run.deadline.remaining())
         if not stored.stored:
@@ -885,6 +886,7 @@ async def _evaluate(run: _Run, deps: PipelineDeps) -> Outcome:
     consume = run.consume if conclusion.enforced_action is Action.ALLOW else None
     event = decision_event(_decision_snapshot(run, conclusion, consume))
     run.event_started = True
+    run.last_attempt = req.attempt_id
     stored = await deps.recorder.try_database(event, consume, timeout=run.deadline.remaining())
     evidence = Evidence.DB
     attempt: int | None = None
@@ -907,6 +909,7 @@ async def _evaluate(run: _Run, deps: PipelineDeps) -> Outcome:
                 conclusion = apply_record_failure(conclusion)
                 consume = None
                 attempt = req.attempt_id + 1
+                run.last_attempt = attempt
                 event = decision_event(
                     _decision_snapshot(run, conclusion, None, attempt_id=attempt)
                 )

@@ -1237,6 +1237,57 @@ class TestCancellation:
         (event,) = h.store.of_kind("decision_evaluated")
         self.one_cancelled_event(event)
 
+    def test_a_cancel_during_the_audit_failure_write_is_the_attempt_after_it(self, tmp_path):
+        h = harness(tmp_path)
+        recorder = h.deps.recorder
+        commit = h.store.insert_event
+        state = {"inserts": 0, "writes": 0, "down": False}
+        entered = asyncio.Event()
+
+        async def commits_then_loses_the_response(event, consume=None):
+            state["inserts"] += 1
+            if state["down"]:
+                raise RuntimeError("database down")
+            inserted = await commit(event, consume)
+            if state["inserts"] == 1:
+                state["down"] = True
+                raise RuntimeError("connection lost after the commit")
+            return inserted
+
+        h.store.insert_event = commits_then_loses_the_response
+        write = recorder._write_local
+
+        async def written_but_never_returns(event):
+            state["writes"] += 1
+            evidence = await write(event)
+            if state["writes"] == 1:
+                # 쓰기 스레드는 끝났지만 기다리는 쪽은 아직 돌아오지 못한 때
+                entered.set()
+                await asyncio.sleep(3600)
+            return evidence
+
+        recorder._write_local = written_but_never_returns
+
+        async def main():
+            task = asyncio.ensure_future(evaluate_request(request(), h.deps))
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            state["down"] = False
+            await recorder.replay()
+
+        run(main())
+        events = sorted(h.store.of_kind("decision_evaluated"), key=lambda e: e.attempt_id)
+        assert [e.attempt_id for e in events] == [1, 2, 3]
+        assert events[0].payload["enforced_action"] == "allow"
+        assert events[1].payload["stop"]["reason_code"] == "AUDIT_FAILURE"
+        assert events[2].payload["stop"]["reason_code"] == "CANCELLED"
+        first_ref = events[0].payload["decision_ref"]
+        assert events[1].payload["original_decision_ref"] == first_ref
+        assert events[2].payload["original_decision_ref"] == first_ref
+        assert len({e.source_key for e in events}) == 3 and buffered(h) == []
+
     def test_a_cancel_after_the_decision_event_was_written_adds_nothing(self, tmp_path):
         h = harness(tmp_path)
         h.store.fail = RuntimeError("database down")
@@ -1331,6 +1382,40 @@ class TestRecording:
         # 호출자가 받은 참조는 최종(차단) 사건을 가리킨다.
         assert outcome.error.reference == both[1].payload["decision_ref"]
         assert outcome.snapshot.attempt_id == 2 and outcome.context["attempt_id"] == 2
+        assert buffered(h) == []
+
+    def test_a_listing_decision_with_the_database_down_still_records_the_hide(self, tmp_path):
+        h = harness(tmp_path)
+        h.store.fail = RuntimeError("write failed")
+        outcome = decide(h, request(operation=OperationType.RUNTIME_DISCOVERY))
+        assert code(outcome) == "MINT-AUDIT-FAILURE" and outcome.evidence.value == "buffer"
+        (event,) = buffered(h)
+        assert event.kind.value == "discovery_evaluated" and event.attempt_id == 2
+        assert event.payload["stop"]["reason_code"] == "AUDIT_FAILURE"
+        assert event.payload["original_decision_ref"] == f"{event.invocation_id}:1"
+
+    def test_a_listing_block_after_a_lost_commit_response_survives_replay(self, tmp_path):
+        h = harness(tmp_path)
+        commit = h.store.insert_event
+        seen = {"calls": 0}
+
+        async def lose_the_response(event, consume=None):
+            seen["calls"] += 1
+            inserted = await commit(event, consume)
+            if seen["calls"] == 1:
+                raise RuntimeError("connection lost after the commit")
+            return inserted
+
+        h.store.insert_event = lose_the_response
+        outcome = decide(h, request(operation=OperationType.RUNTIME_DISCOVERY))
+        assert code(outcome) == "MINT-AUDIT-FAILURE"
+        (first,) = h.store.of_kind("discovery_evaluated")
+        assert first.payload["enforced_action"] == "allow" and first.attempt_id == 1
+        asyncio.run(h.deps.recorder.replay())
+        both = sorted(h.store.of_kind("discovery_evaluated"), key=lambda e: e.attempt_id)
+        assert [e.payload["enforced_action"] for e in both] == ["allow", "block"]
+        assert both[1].payload["original_decision_ref"] == first.payload["decision_ref"]
+        assert outcome.error.reference == both[1].payload["decision_ref"]
         assert buffered(h) == []
 
     def test_a_block_path_failure_keeps_the_first_attempt(self, tmp_path):
