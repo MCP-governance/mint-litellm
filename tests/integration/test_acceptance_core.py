@@ -377,26 +377,37 @@ def timed_calls(key: str, ports: tuple[int, ...], count: int, workers: int) -> l
         return list(pool.map(one, range(count)))
 
 
-def test_mint_overhead_percentiles(world, evidence, plain, approved):
-    """같은 스택에서 플러그인 적재(복제본 2, 동시 8)와 순정 이미지(복제본당 같은 부하)의 지연 차이.
+def measure(
+    label: str, key: str, plain: int, mint_ports: tuple[int, ...], workers: int, count: int
+):
+    base = percentiles(timed_calls(key, (plain,), count, workers))
+    mint = percentiles(timed_calls(key, mint_ports, count, workers))
+    print(
+        f"latency_ms {label} (p50, p95, p99) plain={tuple(round(v, 1) for v in base)} "
+        f"mint={tuple(round(v, 1) for v in mint)}"
+    )
+    return [m - b for b, m in zip(base, mint, strict=True)]
 
-    세 번 측정한 백분위의 중앙값으로 판정하고 원 측정값을 모두 출력한다.
+
+def test_mint_overhead_percentiles(world, evidence, plain, approved):
+    """같은 스택에서 플러그인 적재와 순정 이미지의 종단 지연 차이를 세 조건에서 잰다.
+
+    판정 대상은 복제본 2·동시 8 조건이다(순정 이미지도 같은 동시 8을 같은 업스트림으로 보낸다).
+    순차 호출과 복제본 1·동시 8 조건은 원 측정값만 출력한다.
     """
     subject, _, _ = approved
     key = subject.key
     timed_calls(key, (plain,), 20, 4)
     timed_calls(key, support.LITELLM_PORTS, 20, 8)
-    rounds = []
-    for _ in range(3):
-        base = percentiles(timed_calls(key, (plain,), 100, 4))
-        mint = percentiles(timed_calls(key, support.LITELLM_PORTS, 200, 8))
-        rounds.append((base, mint))
-        print(
-            "latency_ms (p50, p95, p99) "
-            f"plain={tuple(round(v, 1) for v in base)} mint={tuple(round(v, 1) for v in mint)}"
-        )
-    overhead = [statistics.median(m[i] - b[i] for b, m in rounds) for i in range(3)]
-    print("overhead_ms (p50, p95, p99, median of rounds)", tuple(round(v, 1) for v in overhead))
+    first = support.LITELLM_PORTS[:1]
+    measure("sequential", key, plain, first, 1, 60)
+    measure("one-replica-concurrent-8", key, plain, first, 8, 160)
+    rounds = [
+        measure("two-replicas-concurrent-8", key, plain, support.LITELLM_PORTS, 8, 200)
+        for _ in range(3)
+    ]
+    overhead = [statistics.median(r[i] for r in rounds) for i in range(3)]
+    print("overhead_ms (p50, p95, p99, median of 3 rounds)", tuple(round(v, 1) for v in overhead))
     limits = [
         float(os.environ.get(n, d))
         for n, d in (("MINT_E_P50_MS", "30"), ("MINT_E_P95_MS", "100"), ("MINT_E_P99_MS", "300"))
