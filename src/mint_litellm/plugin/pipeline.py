@@ -594,9 +594,15 @@ class _Run:
 
 
 def _decision_snapshot(
-    run: _Run, conclusion: Conclusion, consumed: ConsumeRequest | None
+    run: _Run,
+    conclusion: Conclusion,
+    consumed: ConsumeRequest | None,
+    *,
+    attempt_id: int | None = None,
 ) -> DecisionSnapshot:
+    """판정 사건의 본문. ``attempt_id``를 주면 그 시도의 사건이고 처음 시도를 원래 참조로 담는다."""
     req, snap, policy = run.req, run.snapshot, run.policy
+    attempt = req.attempt_id if attempt_id is None else attempt_id
     resolved = req.resolved
     values: dict[str, Any] = {
         "litellm_call_id": req.hook.litellm_call_id,
@@ -627,11 +633,13 @@ def _decision_snapshot(
         for name in ("policy_version_id", "bundle_sha256", "policy_decision"):
             if name in reasons:
                 reasons[name] = "policy_stopped"
-    ref = MintContext(invocation_id=req.invocation_id, attempt_id=req.attempt_id)
+    ref = MintContext(invocation_id=req.invocation_id, attempt_id=attempt)
+    original = MintContext(invocation_id=req.invocation_id, attempt_id=req.attempt_id)
     return DecisionSnapshot(
         invocation_id=req.invocation_id,
-        attempt_id=req.attempt_id,
+        attempt_id=attempt,
         decision_ref=ref.decision_ref,
+        original_decision_ref=original.decision_ref if attempt != req.attempt_id else None,
         operation=req.operation,
         evaluated_at=run.evaluated_at,
         principal=run.principal,
@@ -823,6 +831,7 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
     event = decision_event(_decision_snapshot(run, conclusion, consume))
     stored = await deps.recorder.try_database(event, consume, timeout=run.deadline.remaining())
     evidence = Evidence.DB
+    attempt: int | None = None
     if not stored.stored:
         if stored.consumption_lost:
             conclusion = _block_with(conclusion, StageResult.stop(Reason.CALL_APPROVAL_REQUIRED))
@@ -833,12 +842,17 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
                 evidence = await deps.recorder.fallback(event)
         else:
             if conclusion.enforced_action is Action.ALLOW:
+                # 허용 사건이 커밋됐는지 알 수 없다. 같은 키로 차단 사건을 쓰면 재적재가 그것을
+                # 허용 사건의 중복으로 버리므로, 차단은 같은 호출의 다음 시도로 남긴다.
                 conclusion = apply_record_failure(conclusion)
                 consume = None
-                event = decision_event(_decision_snapshot(run, conclusion, None))
+                attempt = req.attempt_id + 1
+                event = decision_event(
+                    _decision_snapshot(run, conclusion, None, attempt_id=attempt)
+                )
             evidence = await deps.recorder.fallback(event)
 
-    snapshot_doc = _decision_snapshot(run, conclusion, consume)
+    snapshot_doc = _decision_snapshot(run, conclusion, consume, attempt_id=attempt)
     allowed = conclusion.enforced_action is Action.ALLOW
     error: MintError | None = None
     if not allowed:

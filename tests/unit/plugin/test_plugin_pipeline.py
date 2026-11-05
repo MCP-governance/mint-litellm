@@ -1122,6 +1122,48 @@ class TestRecording:
         outcome = decide(h)
         assert code(outcome) == "MINT-DENIED" and outcome.evidence.value == "buffer"
 
+    def test_a_block_after_a_commit_with_a_lost_response_is_the_next_attempt_and_survives_replay(
+        self, tmp_path
+    ):
+        h = harness(tmp_path)
+        commit = h.store.insert_event
+        seen = {"calls": 0}
+
+        async def lose_the_response(event, consume=None):
+            seen["calls"] += 1
+            inserted = await commit(event, consume)
+            if seen["calls"] == 1:
+                raise RuntimeError("connection lost after the commit")
+            return inserted
+
+        h.store.insert_event = lose_the_response
+        outcome = decide(h)
+        assert code(outcome) == "MINT-AUDIT-FAILURE" and outcome.evidence.value == "buffer"
+        (first,) = h.store.of_kind("decision_evaluated")
+        assert first.payload["enforced_action"] == "allow" and first.attempt_id == 1
+        (second,) = buffered(h)
+        assert second.attempt_id == 2 and second.source_key != first.source_key
+        assert second.source_key == f"call:{first.invocation_id}:2:decision_evaluated"
+
+        asyncio.run(h.deps.recorder.replay())
+        both = sorted(h.store.of_kind("decision_evaluated"), key=lambda e: e.attempt_id)
+        assert [e.payload["enforced_action"] for e in both] == ["allow", "block"]
+        assert both[1].payload["stop"]["reason_code"] == "AUDIT_FAILURE"
+        assert both[1].payload["original_decision_ref"] == first.payload["decision_ref"]
+        assert both[0].payload["original_decision_ref"] is None
+        # 호출자가 받은 참조는 최종(차단) 사건을 가리킨다.
+        assert outcome.error.reference == both[1].payload["decision_ref"]
+        assert outcome.snapshot.attempt_id == 2 and outcome.context["attempt_id"] == 2
+        assert buffered(h) == []
+
+    def test_a_block_path_failure_keeps_the_first_attempt(self, tmp_path):
+        h = harness(tmp_path, snapshot(denials=(denial(),)))
+        h.store.fail = RuntimeError("write failed")
+        outcome = decide(h)
+        (event,) = buffered(h)
+        assert event.attempt_id == 1 and outcome.snapshot.attempt_id == 1
+        assert event.payload["original_decision_ref"] is None
+
     def test_recording_over_budget_counts_as_a_failure(self, tmp_path):
         h = harness(tmp_path, cfg=config(tmp_path))
         h.deps.recorder._budget = 0.05

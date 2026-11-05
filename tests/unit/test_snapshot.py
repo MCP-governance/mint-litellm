@@ -105,6 +105,29 @@ def test_decision_ref_must_match_the_invocation():
         snapshot(decision_ref="someone-else")
 
 
+def test_a_later_attempt_may_name_the_earlier_one_it_follows():
+    second = snapshot(
+        attempt_id=2,
+        decision_ref=f"{INV}:2",
+        original_decision_ref=f"{INV}:1",
+        evaluated_decision=Action.BLOCK,
+        enforced_action=Action.BLOCK,
+        stop=StageResult.stop(Reason.AUDIT_FAILURE),
+    )
+    assert second.model_dump(mode="json")["original_decision_ref"] == f"{INV}:1"
+    assert snapshot().model_dump(mode="json")["original_decision_ref"] is None
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [f"{INV}:2", f"{INV}:3", "0192f7a0-7c1e-7a10-8000-0123456789ac:1", "someone-else"],
+    ids=["same-attempt", "later-attempt", "other-call", "text"],
+)
+def test_the_original_decision_ref_must_name_an_earlier_attempt_of_the_same_call(ref):
+    with pytest.raises(ValidationError):
+        snapshot(attempt_id=2, decision_ref=f"{INV}:2", original_decision_ref=ref)
+
+
 def test_null_without_a_missing_reason_is_rejected():
     reasons = dict(snapshot().missing_reasons)
     del reasons["revoked_after_snapshot"]
