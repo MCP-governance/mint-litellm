@@ -154,5 +154,35 @@ test_priority_and_obligations if {
 	d.decision == "Block"
 	d.policy_ids == ["R3"]
 	d.observable
-	d.obligations == [{"type": "require_consent", "purpose": "use"}]
+	d.obligations == [{"type": "require_call_approval"}, {"type": "require_consent", "purpose": "use"}]
+}
+
+test_r2_obligation_with_r2_alone if {
+	d := evaluate(object.union(sample, {"settings": {"high_risk_tools": ["read"]}}))
+	d.decision == "RequireApproval"
+	d.obligations == [{"type": "require_call_approval"}]
+}
+
+test_r2_with_r3_keeps_call_approval if {
+	a := object.union(sample.approval, {"conditions": {"business_hours_only": true}})
+	d := evaluate(object.union(sample, {"approval": a, "settings": {"high_risk_tools": ["read"]}, "time": {"iso": "instant", "ns": 378000000000000}}))
+	d.decision == "Block"
+	d.policy_ids == ["R3"]
+	d.observable
+	d.obligations == [{"type": "require_call_approval"}]
+}
+
+test_r2_with_r1_keeps_call_approval if {
+	d := evaluate(replace(sample, {"approval": {"present": false}, "settings": {"high_risk_tools": ["read"]}}))
+	d.decision == "Block"
+	d.policy_ids == ["R1"]
+	d.obligations == [{"type": "require_call_approval"}]
+}
+
+test_r2_r3_r4_collects_both_obligations if {
+	a := object.union(sample.approval, {"conditions": {"business_hours_only": true, "require_consent": "use"}})
+	d := evaluate(object.union(sample, {"approval": a, "settings": {"high_risk_tools": ["read"]}, "consent": {"status": "absent", "source": null}, "time": {"iso": "instant", "ns": 378000000000000}}))
+	d.decision == "Block"
+	d.policy_ids == ["R3"]
+	d.obligations == [{"type": "require_call_approval"}, {"type": "require_consent", "purpose": "use"}]
 }
