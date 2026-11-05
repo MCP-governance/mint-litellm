@@ -12,9 +12,11 @@ from mint_litellm.plugin.policy.bundle import (
     _validate_hours,
     bundle_content_sha256,
     canonical_json,
+    keep_active_bundle,
     parse_data_json,
     prepare_bundle,
     publish_bundle,
+    restore_bundle,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -119,9 +121,139 @@ def test_invalid_business_hours_rejected():
         _validate_hours({"tz": "invalid", "days": [1], "start": "09:00", "end": "18:00"})
 
 
+def _archive(name: str, *, content: str | None = None) -> tuple[bytes, str]:
+    """내용이 ``content``(기본은 ``name``)인 작은 번들 아카이브와 그 내용 해시."""
+    body = ("package p" + chr(10) + "# " + (content or name) + chr(10)).encode()
+    sha = bundle_content_sha256({"p.rego": body}, {})
+    meta = json.dumps({"policy_version_id": name, "bundle_sha256": sha}).encode()
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+        for member, data in (("p.rego", body), ("mint/meta/data.json", meta)):
+            info = tarfile.TarInfo(member)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return stream.getvalue(), sha
+
+
 def test_publish_replaces_complete_archive(tmp_path):
     path = tmp_path / "bundle.tar.gz"
     publish_bundle(path, b"first")
     publish_bundle(path, b"second")
     assert path.read_bytes() == b"second"
-    assert len(list(tmp_path.iterdir())) == 1
+    assert [p.name for p in tmp_path.iterdir()] == ["bundle.tar.gz"]
+
+
+def test_keep_and_restore_are_bound_to_the_active_bundle(tmp_path):
+    path = tmp_path / "bundle.tar.gz"
+    (a, sha_a), (b, _), (c, _) = _archive("a"), _archive("b"), _archive("c")
+    assert not restore_bundle(path, "a", sha_a)
+    publish_bundle(path, a)
+    keep_active_bundle(path, "a", sha_a)
+    publish_bundle(path, b)
+    assert restore_bundle(path, "a", sha_a)
+    assert path.read_bytes() == a
+    # 현재 파일이 활성 판본이 아니면 보관본을 덮지 않는다(실패한 b가 남은 상태에서 재시도)
+    publish_bundle(path, b)
+    keep_active_bundle(path, "a", sha_a)
+    publish_bundle(path, c)
+    keep_active_bundle(path, "a", sha_a)
+    assert restore_bundle(path, "a", sha_a) and path.read_bytes() == a
+
+
+def test_restore_rejects_stale_or_altered_copies(tmp_path):
+    path = tmp_path / "bundle.tar.gz"
+    previous = tmp_path / "bundle.tar.gz.previous"
+    (a, sha_a), (z, _) = _archive("a"), _archive("z")
+    publish_bundle(path, a)
+    previous.write_bytes(z)
+    assert not restore_bundle(path, "a", sha_a)
+    previous.write_bytes(b"not an archive")
+    assert not restore_bundle(path, "a", sha_a)
+    # 같은 판본 ID·메타지만 내용이 바뀐 아카이브
+    altered, _ = _archive("a", content="changed")
+    previous.write_bytes(_with_meta(altered, "a", sha_a))
+    assert not restore_bundle(path, "a", sha_a)
+    assert path.read_bytes() == a
+    keep_active_bundle(path, "a", sha_a)
+    assert restore_bundle(path, "a", sha_a)
+
+
+def test_truncated_archives_are_treated_as_missing(tmp_path):
+    path = tmp_path / "bundle.tar.gz"
+    previous = tmp_path / "bundle.tar.gz.previous"
+    (a, sha_a), (b, _) = _archive("a"), _archive("b")
+    previous.write_bytes(a[: len(a) // 2])
+    publish_bundle(path, b)
+    assert not restore_bundle(path, "a", sha_a)
+    publish_bundle(path, a[: len(a) // 2])
+    keep_active_bundle(path, "a", sha_a)
+    assert previous.read_bytes() == a[: len(a) // 2]
+
+
+def _with_meta(archive: bytes, name: str, sha: str) -> bytes:
+    stream = io.BytesIO()
+    meta = json.dumps({"policy_version_id": name, "bundle_sha256": sha}).encode()
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as source, tarfile.open(
+        fileobj=stream, mode="w:gz"
+    ) as target:
+        for member in source.getmembers():
+            data = source.extractfile(member).read()
+            if member.name == "mint/meta/data.json":
+                data = meta
+            info = tarfile.TarInfo(member.name)
+            info.size = len(data)
+            target.addfile(info, io.BytesIO(data))
+    return stream.getvalue()
+
+
+def _data_violations(text: str) -> list[str]:
+    """``data`` 참조 가운데 ``data.mint``나 ``data["mint"]``가 아닌 것. 주석과 문자열을 구분한다."""
+    import re
+
+    tokens = [
+        t for t in re.findall(r'"(?:\\.|[^"\\])*"|`[^`]*`|#[^\n]*|[A-Za-z_]\w*|\S', text)
+        if not t.startswith("#")
+    ]
+    found = []
+    for i, token in enumerate(tokens):
+        if token != "data" or (i and tokens[i - 1] == "."):
+            continue
+        following = tokens[i + 1 : i + 5]
+        if following[:2] == [".", "mint"] or following[:3] == ["[", '"mint"', "]"]:
+            continue
+        found.append(" ".join(tokens[i : i + 5]))
+    return found
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'probe := ["#", data.system.version]',
+        'x := data["system"]',
+        "x := data . system",
+        "y := walk(data, p)",
+        "y := data[key]",
+        "z := data",
+        "import data.system",
+        "x := `#` + data.system.bundles",
+    ],
+)
+def test_data_reference_check_catches_bypasses(text):
+    assert _data_violations(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["x := data.mint.data # data.system", 'x := data["mint"].a', "x := input.data.y",
+     'x := "data.system"', "import data.mint.rules"],
+)
+def test_data_reference_check_allows_mint_data(text):
+    assert not _data_violations(text)
+
+
+def test_rules_reference_only_policy_data_under_mint():
+    """판정 규칙은 ``data.mint`` 밖(특히 ``data.system``)과 ``data`` 전체 순회를 쓰지 않는다."""
+    sources = sorted((ROOT / "policy" / "bundle").rglob("*.rego"))
+    assert sources
+    for source in sources:
+        assert not _data_violations(source.read_text(encoding="utf-8")), source.name
