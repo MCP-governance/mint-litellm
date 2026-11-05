@@ -49,8 +49,14 @@ def test_every_reason_maps_to_a_pre_dispatch_error():
         err = error_for_reason(code, REF)
         assert re.fullmatch(r"MINT-[A-Z0-9-]+", err.code)
         assert err.dispatch_state is DispatchState.NOT_DISPATCHED
-        assert err.retry_safe is False
+        # 전송 전에 취소된 호출만 다시 보내도 안전하다.
+        assert err.retry_safe is (reason is Reason.CANCELLED)
         assert err.reference == REF
+
+
+def test_a_cancel_before_dispatch_is_the_same_error_from_either_constructor():
+    assert error_for_reason("CANCELLED", REF) == cancelled_error(REF, dispatched=False)
+    assert error_for_reason("CANCELLED", REF).retry_safe is True
 
 
 @pytest.mark.parametrize(

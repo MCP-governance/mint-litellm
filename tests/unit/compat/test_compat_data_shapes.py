@@ -40,7 +40,12 @@ def synthesized(**override):
         "mcp_arguments": {"query": "azure functions"},
         "mcp_server_name": "mslearn",
         "mcp_tool_name": "microsoft_docs_search",
-        "messages": [{"role": "user", "content": "Tool: microsoft_docs_search"}],
+        "messages": [
+            {
+                "role": "user",
+                "content": "Tool: microsoft_docs_search\nArguments: {'query': 'azure functions'}",
+            }
+        ],
         "metadata": {"headers": {}, "user_api_key_user_id": "user-a"},
         "model": "mcp-tool-call",
         "user_api_key_end_user_id": None,
@@ -149,6 +154,40 @@ class TestHookData:
         assert compat.effective_arguments(synthesized(modified_arguments=0)) == {
             "query": "azure functions"
         }
+
+    def test_arguments_are_confirmed_against_the_original_kept_in_the_first_message(self):
+        assert compat.parse_hook_data(synthesized()).arguments_confirmed
+        replaced = synthesized(mcp_arguments={"query": "masked"})
+        replaced["messages"] = synthesized()["messages"]
+        assert not compat.parse_hook_data(replaced).arguments_confirmed
+        # 참인 수정본이 있으면 전송 인자는 그것이라 원래 인자와 맞출 필요가 없다.
+        assert compat.parse_hook_data(
+            {**replaced, "modified_arguments": {"a": 1}}
+        ).arguments_confirmed
+        for messages in (None, [], [{}], [{"content": None}], [{"content": "Tool: t"}]):
+            assert not compat.parse_hook_data(synthesized(messages=messages)).arguments_confirmed
+
+    def test_the_message_witness_matches_the_real_converter_of_the_supported_version(self):
+        pytest.importorskip("litellm")
+        assert compat.arguments_witness_problem() is None
+
+    @pytest.mark.parametrize("both", [False, True], ids=["arguments-only", "arguments-and-message"])
+    def test_the_startup_probe_compares_with_the_known_original_input(self, monkeypatch, both):
+        pytest.importorskip("litellm")
+        from litellm.proxy.utils import ProxyLogging
+
+        real = ProxyLogging.convert_mcp_to_llm_format
+
+        def altered(self, request, kwargs):
+            data = real(self, request, kwargs)
+            data["mcp_arguments"] = {"changed": 1}
+            if both:
+                # 변환기가 두 곳을 함께 바꿔도 알려진 원래 입력과 다르면 잡혀야 한다.
+                data["messages"][0]["content"] = "Tool: probe\nArguments: {'changed': 1}"
+            return data
+
+        monkeypatch.setattr(ProxyLogging, "convert_mcp_to_llm_format", altered)
+        assert compat.arguments_witness_problem() is not None
 
     def test_the_call_id_is_read_from_the_logging_object_first(self):
         data = synthesized(litellm_call_id="from-data")

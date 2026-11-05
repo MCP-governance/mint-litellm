@@ -95,6 +95,8 @@ def error_for_reason(
             retry_safe=True,
             reference=reference,
         )
+    if family is Reason.CANCELLED:
+        return cancelled_error(reference, dispatched=False)
     return MintError(
         code=error_code(reason_code),
         dispatch_state=DispatchState.NOT_DISPATCHED,

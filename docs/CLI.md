@@ -150,7 +150,7 @@
 
 ## 원장 조회
 
-`ledger list`는 `--kind`, `--since`, `--until`, `--invocation-id`로 사건을 거른다. 호출이 차단되었을 때 오류 본문의 `reference`(`<호출 식별자>:<시도 번호>`)는 `--decision-ref`에 그대로 넣으면 그 판정 사건 하나를 찾는다. `--decision-ref`와 `--invocation-id`는 함께 쓸 수 없다.
+`ledger list`는 `--kind`, `--since`, `--until`, `--invocation-id`로 사건을 거른다. 호출이 차단되었을 때 오류 본문의 `reference`(`<호출 식별자>:<시도 번호>`)는 `--decision-ref`에 그대로 넣으면 그 판정 사건 하나를 찾는다. `--decision-ref`와 `--invocation-id`는 함께 쓸 수 없다. 한 호출의 판정 사건이 시도 번호별로 여럿이면(감사 기록 결과가 불명이어서 호출을 막은 경우 등) 시도 번호가 가장 큰 사건이 최종 집행이다.
 
 ## 지문 키 점검
 

@@ -461,6 +461,7 @@ class DecisionSnapshot(BaseModel):
     invocation_id: UUID
     attempt_id: int = Field(ge=1)
     decision_ref: str
+    original_decision_ref: str | None = None
     litellm_call_id: str | None = None
     operation: OperationType
     evaluated_at: AwareDatetime
@@ -505,6 +506,12 @@ class DecisionSnapshot(BaseModel):
             ).decision_ref
         ):
             raise ValueError("decision_ref does not match invocation_id and attempt_id")
+        if self.original_decision_ref is not None and not any(
+            self.original_decision_ref
+            == MintContext(invocation_id=self.invocation_id, attempt_id=attempt).decision_ref
+            for attempt in range(1, self.attempt_id)
+        ):
+            raise ValueError("original_decision_ref must name an earlier attempt of this call")
 
         _check_outcome(self.findings, self.stop, self.evaluated_decision, self.enforced_action)
         if self.findings and self.enforced_action is Action.ALLOW and self.mode is Mode.ENFORCE:

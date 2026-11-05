@@ -105,6 +105,29 @@ def test_decision_ref_must_match_the_invocation():
         snapshot(decision_ref="someone-else")
 
 
+def test_a_later_attempt_may_name_the_earlier_one_it_follows():
+    second = snapshot(
+        attempt_id=2,
+        decision_ref=f"{INV}:2",
+        original_decision_ref=f"{INV}:1",
+        evaluated_decision=Action.BLOCK,
+        enforced_action=Action.BLOCK,
+        stop=StageResult.stop(Reason.AUDIT_FAILURE),
+    )
+    assert second.model_dump(mode="json")["original_decision_ref"] == f"{INV}:1"
+    assert snapshot().model_dump(mode="json")["original_decision_ref"] is None
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [f"{INV}:2", f"{INV}:3", "0192f7a0-7c1e-7a10-8000-0123456789ac:1", "someone-else"],
+    ids=["same-attempt", "later-attempt", "other-call", "text"],
+)
+def test_the_original_decision_ref_must_name_an_earlier_attempt_of_the_same_call(ref):
+    with pytest.raises(ValidationError):
+        snapshot(attempt_id=2, decision_ref=f"{INV}:2", original_decision_ref=ref)
+
+
 def test_null_without_a_missing_reason_is_rejected():
     reasons = dict(snapshot().missing_reasons)
     del reasons["revoked_after_snapshot"]
@@ -182,20 +205,25 @@ def test_decision_event_for_a_tool_call():
     assert event.payload["enforced_action"] == "allow"
 
 
-def test_decision_event_for_discovery_is_per_tool_with_attempt_one():
+def test_decision_event_for_discovery_starts_per_tool_at_attempt_one():
     snap = snapshot(operation=OperationType.RUNTIME_DISCOVERY)
     event = decision_event(snap)
     assert event.kind is EventKind.DISCOVERY_EVALUATED
     assert event.source_key == f"call:{INV}:1:discovery_evaluated"
+
+
+def test_a_discovery_block_after_an_unknown_record_is_the_next_attempt():
     ctx = MintContext(invocation_id=INV, attempt_id=2)
-    with pytest.raises(ValueError):
-        decision_event(
-            snapshot(
-                operation=OperationType.RUNTIME_DISCOVERY,
-                attempt_id=2,
-                decision_ref=ctx.decision_ref,
-            )
+    event = decision_event(
+        snapshot(
+            operation=OperationType.RUNTIME_DISCOVERY,
+            attempt_id=2,
+            decision_ref=ctx.decision_ref,
+            original_decision_ref=f"{INV}:1",
         )
+    )
+    assert event.kind is EventKind.DISCOVERY_EVALUATED
+    assert event.source_key == f"call:{INV}:2:discovery_evaluated" and event.attempt_id == 2
 
 
 def test_a_stop_placed_in_the_findings_slot_is_rejected():

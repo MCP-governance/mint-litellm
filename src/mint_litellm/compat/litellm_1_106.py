@@ -42,7 +42,8 @@ class HookData:
 
     REST 호출은 같은 호출에서 사전 훅 단계가 두 번 있다. 첫 번째는 요청 본문 단계라
     ``mcp_server_name``이 없고(LiteLLM이 가드레일을 건너뛴다), 두 번째(합성 단계)만 서버 이름과
-    도구 이름이 있다. ``arguments_ok``가 거짓이면 전송될 인자가 객체가 아니다.
+    도구 이름이 있다. ``arguments_ok``가 거짓이면 전송될 인자가 객체가 아니고,
+    ``arguments_confirmed``가 거짓이면 판정한 인자가 전송될 인자와 같다고 확인할 수 없다.
     """
 
     server_name: str | None
@@ -51,13 +52,52 @@ class HookData:
     litellm_call_id: str | None
     logging_obj: Any
     arguments_ok: bool = True
+    arguments_confirmed: bool = True
+
+
+_ARGUMENTS_MARK = "\nArguments: "
+
+
+def arguments_match_original(data: Mapping[str, Any], arguments: Any) -> bool:
+    """``arguments``가 사전 훅에 들어오기 전의 원래 인자와 같다고 확인할 수 있는지.
+
+    LiteLLM 전송부는 참인 ``modified_arguments``가 없으면 훅 진입 전의 원래 인자를 보내는데,
+    그 값은 사전 훅 데이터에 따로 남지 않는다(``mcp_arguments``는 사본이라 앞선 훅이 바꿀 수
+    있다). 변환 시점의 원래 인자는 첫 메시지 본문 끝의 ``Arguments: <값>``에만 문자열로 남는다.
+    ``arguments``의 문자열이 그와 같으면 원래 인자와 같다. 그 자리가 없거나 다르면 같다고 확인할
+    수 없다.
+    """
+    try:
+        content = data["messages"][0]["content"]
+    except (KeyError, IndexError, TypeError):
+        return False
+    return isinstance(content, str) and content.endswith(f"{_ARGUMENTS_MARK}{arguments}")
+
+
+def arguments_witness_problem() -> str | None:
+    """위 확인의 근거가 지원 판본의 실제 변환기에서 그대로인지. 어긋나면 이유를 돌려준다."""
+    try:
+        from litellm.proxy.utils import ProxyLogging
+
+        proxy = ProxyLogging.__new__(ProxyLogging)
+        original = {"k": ["v", 1], "한글": 'it\'s "q"\n', "n": {"a": None, "b": 1.5}}
+        kwargs = {"name": "probe", "arguments": original, "server_name": "probe"}
+        request = proxy.create_mcp_request_object_from_kwargs(kwargs)
+        data = proxy.convert_mcp_to_llm_format(request, kwargs)
+        # 변환기가 돌려준 값이 아니라 알려진 원래 입력과 직접 대조한다.
+        same = data["mcp_arguments"] == original and arguments_match_original(data, original)
+        other = arguments_match_original(data, {"k": ["x"]})
+    except Exception as exc:
+        return f"arguments witness: {type(exc).__name__}"
+    return None if same and not other else "arguments witness: unexpected message shape"
 
 
 def effective_arguments(data: Mapping[str, Any]) -> Mapping[str, Any] | None:
     """업스트림에 전달될 인자. 객체가 아니면 None이다.
 
     앞선 훅이 돌려준 수정본이 있으면 그것이다. LiteLLM은 비어 있는 값을 수정본으로 치지 않는다.
-    원래 인자는 키가 없을 때만 빈 객체이고, 값이 None이나 문자열 같은 비객체면 None이다.
+    수정본이 없을 때의 ``mcp_arguments``는 원래 인자와 같은지 ``arguments_match_original``로
+    따로 확인해야 한다. 키가 없으면 빈 객체이고, 값이 None이나 문자열 같은 비객체면 None이다.
     """
     modified = data.get("modified_arguments")
     arguments = modified if modified else data.get("mcp_arguments", {})
@@ -66,6 +106,9 @@ def effective_arguments(data: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 def parse_hook_data(data: Mapping[str, Any]) -> HookData:
     arguments = effective_arguments(data)
+    confirmed = bool(data.get("modified_arguments")) or arguments_match_original(
+        data, data.get("mcp_arguments", {})
+    )
     logging_obj = data.get("litellm_logging_obj")
     call_id = getattr(logging_obj, "litellm_call_id", None) or data.get("litellm_call_id")
     return HookData(
@@ -75,6 +118,7 @@ def parse_hook_data(data: Mapping[str, Any]) -> HookData:
         litellm_call_id=str(call_id) if call_id else None,
         logging_obj=logging_obj,
         arguments_ok=arguments is not None,
+        arguments_confirmed=confirmed,
     )
 
 

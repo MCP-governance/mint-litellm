@@ -200,11 +200,13 @@ class Event(BaseModel):
 def decision_event(
     snapshot: DecisionSnapshot, *, inserted_at: AwareDatetime | None = None
 ) -> Event:
-    """판정 스냅숏을 사건으로 만든다. 도구 목록 판정은 도구마다 시도 번호 1로 기록한다."""
+    """판정 스냅숏을 사건으로 만든다.
+
+    도구 목록 판정은 도구마다 새 호출 식별자로 시도 번호 1에서 시작하고, 호출과 같이 결과가
+    불명인 기록 뒤의 차단은 다음 시도 번호로 남긴다.
+    """
     if snapshot.operation is OperationType.RUNTIME_DISCOVERY:
         kind = EventKind.DISCOVERY_EVALUATED
-        if snapshot.attempt_id != 1:
-            raise ValueError("discovery events use attempt_id 1")
     else:
         kind = EventKind.DECISION_EVALUATED
     principal = snapshot.principal

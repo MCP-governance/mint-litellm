@@ -591,12 +591,23 @@ class _Run:
     consume: ConsumeRequest | None = None
     policy: PolicyStageResult | None = None
     observation: ObservationSettings = field(default_factory=ObservationSettings)
+    # 판정 사건의 기록이 시작됐는지(결과가 불명일 수 있다), 어느 위치든 남겨졌는지.
+    event_started: bool = False
+    event_written: bool = False
+    # 이 호출에서 기록을 시작한 가장 큰 시도 번호. 취소 사건은 그보다 큰 번호를 쓴다.
+    last_attempt: int = 0
 
 
 def _decision_snapshot(
-    run: _Run, conclusion: Conclusion, consumed: ConsumeRequest | None
+    run: _Run,
+    conclusion: Conclusion,
+    consumed: ConsumeRequest | None,
+    *,
+    attempt_id: int | None = None,
 ) -> DecisionSnapshot:
+    """판정 사건의 본문. ``attempt_id``를 주면 그 시도의 사건이고 처음 시도를 원래 참조로 담는다."""
     req, snap, policy = run.req, run.snapshot, run.policy
+    attempt = req.attempt_id if attempt_id is None else attempt_id
     resolved = req.resolved
     values: dict[str, Any] = {
         "litellm_call_id": req.hook.litellm_call_id,
@@ -627,11 +638,13 @@ def _decision_snapshot(
         for name in ("policy_version_id", "bundle_sha256", "policy_decision"):
             if name in reasons:
                 reasons[name] = "policy_stopped"
-    ref = MintContext(invocation_id=req.invocation_id, attempt_id=req.attempt_id)
+    ref = MintContext(invocation_id=req.invocation_id, attempt_id=attempt)
+    original = MintContext(invocation_id=req.invocation_id, attempt_id=req.attempt_id)
     return DecisionSnapshot(
         invocation_id=req.invocation_id,
-        attempt_id=req.attempt_id,
+        attempt_id=attempt,
         decision_ref=ref.decision_ref,
+        original_decision_ref=original.decision_ref if attempt != req.attempt_id else None,
         operation=req.operation,
         evaluated_at=run.evaluated_at,
         principal=run.principal,
@@ -780,6 +793,13 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
     run.consume = check.consume
 
 
+def _mark_written(run: _Run) -> Callable[[], None]:
+    def mark() -> None:
+        run.event_written = True
+
+    return mark
+
+
 def _block_with(conclusion: Conclusion, stop: StageResult) -> Conclusion:
     return Conclusion(
         evaluated_decision=Action.BLOCK,
@@ -793,7 +813,8 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
     """한 호출(또는 목록의 도구 하나)을 판정하고 증거를 남긴다.
 
     허용 경로에서 DB 선기록이 실패하면 호출은 ``AUDIT_FAILURE``로 차단된다. 차단 경로의 기록
-    실패는 결과를 바꾸지 않고 버퍼(안 되면 표준 오류)에 남긴다.
+    실패는 결과를 바꾸지 않고 버퍼(안 되면 표준 오류)에 남긴다. 도구 호출 판정이 외부 취소로
+    끝나면 아직 기록하지 못한 판정을 ``CANCELLED`` 사건으로 남기고 취소를 다시 전파한다.
     """
     run = _Run(
         req=req,
@@ -803,6 +824,49 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
         evaluated_at=deps.clock(),
         deadline=Deadline(deps.config.decision_budget_seconds),
     )
+    try:
+        return await _evaluate(run, deps)
+    except asyncio.CancelledError:
+        if req.operation is OperationType.TOOL_CALL and not run.event_written:
+            await _shielded(_record_cancelled(run, deps))
+        raise
+
+
+async def _shielded(coro: Awaitable[None]) -> None:
+    """취소가 한 번 더 와도 기록은 끝까지 가도록 별도 작업으로 돌린다."""
+    task = asyncio.ensure_future(coro)
+    await asyncio.shield(task)
+
+
+async def _record_cancelled(run: _Run, deps: PipelineDeps) -> None:
+    """남은 판정 예산 안에서 DB → 버퍼 → 표준 오류 순서로 ``CANCELLED`` 판정 사건을 남긴다.
+
+    기록이 이미 시작됐다면 그 사건이 커밋됐는지 알 수 없으므로 같은 키를 쓰지 않고 다음 시도로
+    남긴다. 버퍼 기록은 예산과 무관하게 한 번 시도한다.
+    """
+    try:
+        kept = [(stage, result) for stage, result in run.stages.items if stage is not run.current]
+        stages = _Stages()
+        stages.items = kept
+        stages.add(run.current, StageResult.stop(Reason.CANCELLED))
+        run.stages = stages
+        conclusion = Conclusion(
+            evaluated_decision=Action.BLOCK,
+            enforced_action=Action.BLOCK,
+            findings=(),
+            stop=StageResult.stop(Reason.CANCELLED),
+        )
+        attempt = run.last_attempt + 1 if run.event_started else None
+        event = decision_event(_decision_snapshot(run, conclusion, None, attempt_id=attempt))
+        stored = await deps.recorder.try_database(event, timeout=run.deadline.remaining())
+        if not stored.stored:
+            await deps.recorder.fallback(event)
+    except Exception as exc:
+        log.error("취소된 판정을 기록하지 못했습니다: %s", type(exc).__name__)
+
+
+async def _evaluate(run: _Run, deps: PipelineDeps) -> Outcome:
+    req = run.req
     try:
         await _run_stages(run, deps)
     except Exception as exc:
@@ -821,24 +885,37 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
     )
     consume = run.consume if conclusion.enforced_action is Action.ALLOW else None
     event = decision_event(_decision_snapshot(run, conclusion, consume))
+    run.event_started = True
+    run.last_attempt = req.attempt_id
     stored = await deps.recorder.try_database(event, consume, timeout=run.deadline.remaining())
     evidence = Evidence.DB
-    if not stored.stored:
+    attempt: int | None = None
+    if stored.stored:
+        run.event_written = True
+    else:
         if stored.consumption_lost:
             conclusion = _block_with(conclusion, StageResult.stop(Reason.CALL_APPROVAL_REQUIRED))
             consume = None
             event = decision_event(_decision_snapshot(run, conclusion, None))
             retry = await deps.recorder.try_database(event, timeout=run.deadline.remaining())
-            if not retry.stored:
-                evidence = await deps.recorder.fallback(event)
+            if retry.stored:
+                run.event_written = True
+            else:
+                evidence = await deps.recorder.fallback(event, on_written=_mark_written(run))
         else:
             if conclusion.enforced_action is Action.ALLOW:
+                # 허용 사건이 커밋됐는지 알 수 없다. 같은 키로 차단 사건을 쓰면 재적재가 그것을
+                # 허용 사건의 중복으로 버리므로, 차단은 같은 호출의 다음 시도로 남긴다.
                 conclusion = apply_record_failure(conclusion)
                 consume = None
-                event = decision_event(_decision_snapshot(run, conclusion, None))
-            evidence = await deps.recorder.fallback(event)
+                attempt = req.attempt_id + 1
+                run.last_attempt = attempt
+                event = decision_event(
+                    _decision_snapshot(run, conclusion, None, attempt_id=attempt)
+                )
+            evidence = await deps.recorder.fallback(event, on_written=_mark_written(run))
 
-    snapshot_doc = _decision_snapshot(run, conclusion, consume)
+    snapshot_doc = _decision_snapshot(run, conclusion, consume, attempt_id=attempt)
     allowed = conclusion.enforced_action is Action.ALLOW
     error: MintError | None = None
     if not allowed:
@@ -905,6 +982,10 @@ def build_request(
         failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="hook data has no server or tool")
     elif not hook.arguments_ok:
         failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="arguments are not an object")
+    elif not hook.arguments_confirmed:
+        failure = StageResult.stop(
+            Reason.SCHEMA_ERROR, detail="arguments cannot be matched with the original"
+        )
     else:
         try:
             resolved = resolver(hook)
