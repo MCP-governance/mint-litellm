@@ -454,3 +454,81 @@ def test_servers_without_a_url_are_refused(mint, stub):
     code, _, err = mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp",
                             token=boss)
     assert code == 1 and "server_without_url" in err
+
+
+def test_ledger_list_finds_a_decision_by_its_error_reference(mint):
+    boss = bootstrap(mint)
+    first, second = "01a19fbd-0000-7000-8000-000000000001", "01a19fbd-0000-7000-8000-000000000002"
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        for invocation, attempt in ((first, 1), (first, 2), (second, 1)):
+            conn.execute(
+                "INSERT INTO mint.events (event_id, instance_id, kind, source_key, invocation_id,"
+                " attempt_id, payload) VALUES (gen_random_uuid(), 'clitest', 'decision_evaluated',"
+                " %s, %s, %s, '{}')",
+                (f"call:{invocation}:{attempt}:decision_evaluated", invocation, attempt),
+            )
+        conn.commit()
+    code, out, _ = mint.run("--json", "ledger", "list", "--decision-ref", f"{first}:2", token=boss)
+    events = json.loads(out)["events"]
+    assert code == 0 and [e["source_key"] for e in events] == [
+        f"call:{first}:2:decision_evaluated"]
+    code, out, _ = mint.run("--json", "ledger", "list", "--invocation-id", first, token=boss)
+    assert len(json.loads(out)["events"]) == 2
+    for bad in ("nonsense", f"{first}:0", f"{first}:x", "not-a-uuid:1"):
+        code, _, err = mint.run("ledger", "list", "--decision-ref", bad, token=boss)
+        assert code == 1 and "--decision-ref" in err
+    code, _, err = mint.run("ledger", "list", "--decision-ref", f"{first}:1",
+                            "--invocation-id", first, token=boss)
+    assert code == 1 and "함께 쓸 수 없습니다" in err
+
+
+def test_call_approval_request_computes_the_same_fingerprint_as_the_shared_function(mint):
+    import base64
+
+    from mint_litellm.types import fingerprint
+
+    boss = bootstrap(mint)
+    key = base64.urlsafe_b64encode(b"k" * 32).decode()
+    mint.env["MINT_FINGERPRINT_KEY"] = key
+    mint.env["MINT_FINGERPRINT_KEY_VERSION"] = "3"
+    mint.run("org", "add", "acme", "--name", "ACME", token=boss)
+    mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp", token=boss)
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        conn.execute(
+            "INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256, bundle_sha256)"
+            " VALUES ('clitest', 'v1', %s, %s)", ("a" * 64, "a" * 64))
+        conn.commit()
+    arguments = {"b": 1, "a": "한글"}
+    base = ["call-approval", "request", "--org", "acme", "--principal-type", "user",
+            "--principal-id", "alice", "--server", "ctl-everything", "--tool", "echo",
+            "--policy-version", "v1"]
+    path = mint.tmp / "args.json"
+    path.write_text(json.dumps(arguments, ensure_ascii=False), encoding="utf-8")
+    for source in (["--arguments", json.dumps(arguments, ensure_ascii=False)],
+                   ["--args-file", str(path)]):
+        code, out, err = mint.run("--json", *base, *source, token=boss)
+        assert code == 0, err
+    expected = fingerprint.argument_fingerprint(arguments, b"k" * 32)
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        rows = conn.execute("SELECT args_fp, fp_key_version FROM mint.call_approvals").fetchall()
+    assert rows == [(expected, 3), (expected, 3)]
+    # 계산된 값을 직접 넣어도 같고, 인자 원문과 함께 쓸 수는 없다
+    with pytest.raises(SystemExit) as raised:
+        mint.run(*base, "--args-fp", expected, "--arguments", "{}", token=boss)
+    assert raised.value.code == 2
+    code, _, err = mint.run(*base, "--args-fp", expected, "--fp-key-version", "5", token=boss)
+    assert code == 0, err
+
+
+def test_call_approval_request_needs_a_key_or_a_ready_fingerprint(mint):
+    boss = bootstrap(mint)
+    mint.env["MINT_SECRETS_FILE"] = str(mint.tmp / "absent.env")
+    base = ["call-approval", "request", "--org", "acme", "--principal-type", "user",
+            "--principal-id", "alice", "--server", "ctl-everything", "--tool", "echo"]
+    code, _, err = mint.run(*base, "--arguments", "{}", token=boss)
+    assert code == 1 and "지문 키" in err
+    mint.env["MINT_FINGERPRINT_KEY"] = "short"
+    code, _, err = mint.run(*base, "--arguments", "{}", token=boss)
+    assert code == 1 and "인자 지문을 계산할 수 없습니다" in err
+    code, _, err = mint.run(*base, "--arguments", "[1]", token=boss)
+    assert code == 1

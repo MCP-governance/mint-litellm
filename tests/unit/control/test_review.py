@@ -23,6 +23,7 @@ from mint_litellm.control.db.connection import fetchall, fetchone  # noqa: E402
 from mint_litellm.control.errors import ControlError  # noqa: E402
 from mint_litellm.control.litellm_admin import LiteLLMError  # noqa: E402
 from mint_litellm.types.identity import SubjectType  # noqa: E402
+from mint_litellm.types.ids import new_uuid7  # noqa: E402
 
 URL = "http://upstream.test/mcp"
 HEX = "ab" * 32
@@ -400,3 +401,38 @@ def test_a_failed_event_insert_rolls_back_the_state_and_the_epoch(fresh_db, lite
         assert fetchone(conn, "SELECT count(*) AS n FROM mint.orgs")["n"] == 0
         now_epoch = fetchone(conn, "SELECT coalesce(max(epoch), 0) AS e FROM mint.state_epoch")
         assert now_epoch["e"] == epoch
+
+
+# --- 유효 기간 경계: valid_from <= now < valid_until ------------------------------------
+
+
+def test_an_allowlist_entry_ending_exactly_now_is_expired(ctx, litellm, conn):
+    relation = prepare(ctx, litellm)
+    entry = new_uuid7()
+    conn.execute(
+        "INSERT INTO mint.allowlists (id, instance_id, kind, value, valid_from, valid_until,"
+        " created_by) VALUES (%s, %s, 'provider', 'edge.test', now() - interval '1 day', now(),"
+        " 'x')", (entry, INSTANCE))
+    with pytest.raises(ControlError, match="유효한 허용 목록"):
+        approve(ctx, litellm, relation, allowlist_ids=[str(entry)])
+
+
+def test_an_allowlist_entry_starting_exactly_now_is_valid(ctx, litellm, conn):
+    relation = prepare(ctx, litellm)
+    entry = new_uuid7()
+    conn.execute(
+        "INSERT INTO mint.allowlists (id, instance_id, kind, value, valid_from, valid_until,"
+        " created_by) VALUES (%s, %s, 'provider', 'edge.test', now(), now() + interval '1 day',"
+        " 'x')", (entry, INSTANCE))
+    approve(ctx, litellm, relation, allowlist_ids=[str(entry)])
+
+
+def test_a_call_approval_expiring_exactly_now_cannot_be_approved(ctx, litellm, conn):
+    prepare(ctx, litellm)
+    with_policy(conn)
+    call_id = request_call(ctx)
+    conn.execute("ALTER TABLE mint.call_approvals DISABLE TRIGGER call_approvals_2_frozen")
+    conn.execute("UPDATE mint.call_approvals SET expires_at = now()")
+    approver = make_ctx(conn, "carol", "approver", user_id="carol")
+    with pytest.raises(ControlError, match="만료되지 않은"):
+        approvals.call_approve(approver, call_id, None)

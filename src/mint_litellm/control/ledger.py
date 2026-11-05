@@ -59,6 +59,7 @@ def list_events(
     since: datetime | None = None,
     until: datetime | None = None,
     invocation_id: UUID | None = None,
+    attempt_id: int | None = None,
     limit: int = 100,
 ) -> list[dict]:
     clauses = ["instance_id = %s"]
@@ -68,6 +69,7 @@ def list_events(
         ("inserted_at >= %s", since),
         ("inserted_at < %s", until),
         ("invocation_id = %s", invocation_id),
+        ("attempt_id = %s", attempt_id),
     ):
         if value is not None:
             clauses.append(column)

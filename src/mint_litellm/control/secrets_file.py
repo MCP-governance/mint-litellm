@@ -3,6 +3,7 @@
 import os
 import secrets
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 
 from mint_litellm.control.errors import ControlError
@@ -70,3 +71,23 @@ def ensure_fingerprint_key(path: Path) -> bool:
     finally:
         temp.unlink(missing_ok=True)
     return True
+
+
+def load_fingerprint_key(environ: Mapping[str, str], path: Path | None = None) -> tuple[str, int]:
+    """환경 변수, 없으면 비밀 파일에서 지문 키 문자열과 키 판본을 읽는다."""
+    key = environ.get(KEY_NAME)
+    version = environ.get(VERSION_NAME)
+    if not key:
+        source = (path or Path(environ.get("MINT_SECRETS_FILE") or DEFAULT_PATH)).expanduser()
+        if source.exists():
+            values = _values(source)
+            key, version = values.get(KEY_NAME), version or values.get(VERSION_NAME)
+    if not key:
+        raise ControlError(
+            f"인자 지문 키({KEY_NAME})를 찾을 수 없습니다. init으로 키를 만들거나 "
+            "--args-fp에 계산된 지문을 직접 넣으십시오."
+        )
+    try:
+        return key, int(version or 1)
+    except ValueError:
+        raise ControlError(f"{VERSION_NAME}가 정수가 아닙니다.") from None

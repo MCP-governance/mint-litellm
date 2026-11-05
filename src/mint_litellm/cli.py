@@ -41,6 +41,7 @@ from mint_litellm.control.db.migrate import apply_migrations
 from mint_litellm.control.db.roles import LOGIN_ROLES, ensure_login_roles
 from mint_litellm.control.errors import AuthError, ControlError
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
+from mint_litellm.types import fingerprint
 from mint_litellm.types.cli_commands import (
     COMMANDS,
     CONTROL_PLANE_ALLOWED_ROUTES,
@@ -311,15 +312,33 @@ def _subject(a: argparse.Namespace) -> tuple[SubjectType, str]:
     return (SubjectType.TEAM, a.team) if a.team else (SubjectType.USER, a.user)
 
 
+def _decision_ref(text: str) -> tuple[UUID, int]:
+    """오류 본문의 ``reference``(``{invocation_id}:{attempt_id}``)를 나눈다."""
+    invocation, sep, attempt = text.rpartition(":")
+    try:
+        parsed = (UUID(invocation), int(attempt))
+    except ValueError:
+        parsed = None
+    if not sep or parsed is None or parsed[1] < 1:
+        raise ControlError("--decision-ref는 <호출 식별자>:<시도 번호> 형식이어야 합니다.")
+    return parsed
+
+
 def _ledger_list(run: Run) -> None:
     a = run.args
+    invocation_id, attempt_id = a.invocation_id, None
+    if a.decision_ref:
+        if a.invocation_id:
+            raise ControlError("--decision-ref와 --invocation-id는 함께 쓸 수 없습니다.")
+        invocation_id, attempt_id = _decision_ref(a.decision_ref)
     rows = ledger.list_events(
         run.conn,
         run.cfg.instance_id,
         kind=a.kind,
         since=a.since,
         until=a.until,
-        invocation_id=a.invocation_id,
+        invocation_id=invocation_id,
+        attempt_id=attempt_id,
         limit=a.limit,
     )
     run.data["events"] = [json.loads(json.dumps(row, default=str)) for row in rows]
@@ -389,8 +408,24 @@ def _denial(run: Run) -> None:
     )
 
 
+def _fingerprint(run: Run) -> tuple[str, int]:
+    """``--args-fp``는 그대로, 인자 원문은 플러그인과 같은 함수로 지문을 계산한다."""
+    a = run.args
+    if a.args_fp:
+        return a.args_fp, a.fp_key_version or 1
+    text = a.arguments if a.arguments is not None else Path(a.args_file).read_text("utf-8")
+    try:
+        arguments = json.loads(text)
+        key_text, version = secrets_file.load_fingerprint_key(run.environ)
+        key = fingerprint.decode_fingerprint_key(key_text)
+        return fingerprint.argument_fingerprint(arguments, key), a.fp_key_version or version
+    except (ValueError, OSError) as error:
+        raise ControlError(f"인자 지문을 계산할 수 없습니다: {error}") from None
+
+
 def _call_request(run: Run) -> None:
     a, ctx = run.args, run.context()
+    args_fp, fp_key_version = _fingerprint(run)
     _created(
         run,
         approvals.call_request(
@@ -400,8 +435,8 @@ def _call_request(run: Run) -> None:
             principal_id=a.principal_id,
             server_id=a.server,
             tool=a.tool,
-            args_fp=a.args_fp,
-            fp_key_version=a.fp_key_version,
+            args_fp=args_fp,
+            fp_key_version=fp_key_version,
             policy_version_id=a.policy_version,
             expires_in_minutes=a.expires_in_minutes,
             requested_by=a.requested_by or ctx.operator.user_id or ctx.operator.name,
@@ -583,8 +618,9 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--principal-id", required=True),
         _a("--server", required=True),
         _a("--tool", required=True),
-        _a("--args-fp", required=True, help="차단 사건에 기록된 인자 지문"),
-        _a("--fp-key-version", type=int, default=1),
+        "FINGERPRINT",
+        _a("--fp-key-version", type=int,
+           help="지문 키 판본(기본: MINT_FINGERPRINT_KEY_VERSION 또는 1)"),
         _a("--policy-version", help="기본: 활성 정책 판본"),
         _a("--expires-in-minutes", type=int, default=30),
         _a("--requested-by", help="기본: 운영자의 사용자 식별자"),
@@ -640,6 +676,8 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--since", type=_when),
         _a("--until", type=_when),
         _a("--invocation-id", type=UUID),
+        _a("--decision-ref",
+           help="오류 본문의 reference(<호출 식별자>:<시도 번호>)로 판정 사건을 찾는다"),
         _a("--limit", type=int, default=100),
     ],
 }
@@ -651,6 +689,11 @@ def _add_arguments(parser: argparse.ArgumentParser, name: str) -> None:
             group = parser.add_mutually_exclusive_group(required=True)
             group.add_argument("--team")
             group.add_argument("--user")
+        elif spec == "FINGERPRINT":
+            group = parser.add_mutually_exclusive_group(required=True)
+            group.add_argument("--args-fp", help="차단 사건에 기록된 인자 지문(소문자 16진 64자)")
+            group.add_argument("--arguments", help="호출 인자(JSON 객체), 지문 키로 지문을 계산")
+            group.add_argument("--args-file", help="호출 인자를 담은 JSON 파일")
         elif spec == "ORG_OR_CLEAR":
             group = parser.add_mutually_exclusive_group(required=True)
             group.add_argument("--org")

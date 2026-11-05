@@ -133,4 +133,13 @@
 
 ## 호출별 승인의 인자 지문
 
-`call-approval request --args-fp`에는 차단 사건에 기록된 지문이나 같은 규칙으로 계산한 값을 넣는다. 지문은 HMAC-SHA256이며 키는 `MINT_FINGERPRINT_KEY`의 UTF-8 바이트, 입력은 호출 인자를 키로 정렬하고 구분자 공백 없이(`,`와 `:`) 비ASCII 문자를 그대로 둔 JSON의 UTF-8 바이트이다. `--fp-key-version`은 `MINT_FINGERPRINT_KEY_VERSION`과 같은 값을 쓴다. 키가 설정되어 있지 않으면 호출별 승인은 항상 요구 상태로 남는다.
+`call-approval request`는 인자 지문을 세 가지 방법 중 하나로 받는다.
+
+- `--arguments '<JSON 객체>'` 또는 `--args-file <파일>`: 호출 인자 원문으로 플러그인과 같은 함수(HMAC-SHA256, 키를 정렬하고 구분자 공백 없이 비ASCII 문자를 그대로 둔 JSON)로 지문을 계산한다. 키는 `MINT_FINGERPRINT_KEY`(없으면 비밀 파일)에서 읽고 키 판본은 `MINT_FINGERPRINT_KEY_VERSION`(`--fp-key-version`으로 바꿀 수 있다)을 쓴다.
+- `--args-fp <지문>`: 차단 사건에 기록된 지문(소문자 16진 64자)을 그대로 넣는다.
+
+키가 없으면 인자 원문으로는 요청할 수 없고, 지문 키가 설정되어 있지 않으면 플러그인에서 호출별 승인은 항상 요구 상태로 남는다.
+
+## 원장 조회
+
+`ledger list`는 `--kind`, `--since`, `--until`, `--invocation-id`로 사건을 거른다. 호출이 차단되었을 때 오류 본문의 `reference`(`<호출 식별자>:<시도 번호>`)는 `--decision-ref`에 그대로 넣으면 그 판정 사건 하나를 찾는다. `--decision-ref`와 `--invocation-id`는 함께 쓸 수 없다.
