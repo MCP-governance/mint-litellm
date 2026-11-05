@@ -116,7 +116,7 @@
 | --- | --- |
 | `init` | `migrations`(이번에 적용한 마이그레이션), `login_roles`(설정한 로그인 역할), `snippet_path`(설정 조각 파일) 또는 `snippet`(`--out -`일 때 본문) |
 | `check` | `incomplete`(확인하지 못한 필수 행), `findings`(각 항목 `item`, `level`=`OK`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
-| `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `policy_bundle`(`state`: `match`·`mismatch`·`unverified`·`none`, `detail`), `servers`(상태별 개수), `alerts`, `observations` |
+| `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `policy_bundle`(`state`: `match`·`mismatch`·`unverified`·`none`, `detail`), `servers`(상태별 개수), `enforcement`(워커별 최근 집행 점검 전환: `worker_id`, `passed`, `cause`, `failed`, `hooks`, `allowed_hooks_used`, `last_transition_at`), `allowed_pre_hooks`(`MINT_ALLOWED_PRE_HOOKS`), `alerts`, `observations` |
 | `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`) |
 
 ## 종료 코드
@@ -133,7 +133,7 @@
 
 ## 정책 번들 내용 대조
 
-`check`와 `status`는 활성 정책 판본의 번들 해시를 정책 엔진(`MINT_OPA_URL`)이 실제로 적재한 규칙 원문과 정책 데이터에서 다시 계산해 등록된 값과 대조한다. 다르면 두 명령 모두 종료 코드 1로 끝나고(`ok`는 `false`, `status`는 경보도 표시한다), 정책 엔진에서 적재 내용을 읽지 못하면 필수 확인을 하지 못한 것이므로 두 명령 모두 종료 코드 3으로 끝난다. 활성 판본이 없으면 `check`는 경고만 하고 `status`는 성공으로 끝난다. 활성 판본이 없으면 경고만 한다. 대조 시점 사이에 정책 엔진의 내용이 바뀌면 다음 대조까지 알 수 없다.
+`check`와 `status`는 활성 정책 판본의 번들 해시를 정책 엔진(`MINT_OPA_URL`)이 실제로 적재한 규칙 원문과 정책 데이터에서 다시 계산해 등록된 값과 대조한다. 다르면 두 명령 모두 종료 코드 1로 끝나고(`ok`는 `false`, `status`는 경보도 표시한다), 정책 엔진에서 적재 내용을 읽지 못하면 필수 확인을 하지 못한 것이므로 두 명령 모두 종료 코드 3으로 끝난다. 활성 판본이 없으면 `check`는 경고만 하고 `status`는 성공으로 끝난다. 대조 시점 사이에 정책 엔진의 내용이 바뀌면 다음 대조까지 알 수 없다.
 
 ## 호출별 승인의 인자 지문
 
@@ -151,3 +151,11 @@
 ## 지문 키 점검
 
 `check`는 `MINT_FINGERPRINT_KEY`(base64url, 32바이트 이상)와 `MINT_FINGERPRINT_KEY_VERSION`(1 이상의 정수)을 필수 행으로 확인한다. 환경 변수에 없으면 `MINT_SECRETS_FILE`의 비밀 파일을 읽는다. 키가 없거나 형식이 틀리면 종료 코드 1이고, 파일의 권한·링크·디렉터리 정책 위반이나 읽기·해독 오류로 읽을 수 없으면 확인하지 못한 것으로 종료 코드 3이다. 결과 줄에는 검사한 값의 출처(이 프로세스의 환경 변수, `--env-file`, 비밀 파일 경로)가 함께 나온다. 이 행은 제공된 값의 유효성만 확인하며, 이미 실행 중인 LiteLLM 서비스가 실제로 받은 값과 대조하지는 않는다. 서비스를 다시 만든 뒤에 같은 비밀 파일을 읽는 `check`를 실행해야 서비스와 같은 값을 검사한다.
+
+## 집행 점검 상태
+
+`status`는 워커마다 가장 최근의 `enforcement_verified`·`enforcement_unverified` 사건을 읽어 통과 여부, 실패와 원인, 마지막 전환 시각, 허용 목록 사용 여부를 보여 준다. 표시는 「최근 전환」이며, 그 워커가 지금 살아 있다는 뜻이 아니다. 허용 사전 훅은 `status`를 실행하는 환경의 `MINT_ALLOWED_PRE_HOOKS`(쉼표로 구분한 클래스 이름)를 그대로 보여 준다.
+
+## 설정 조각과 기동 전 검사
+
+`init`이 만드는 설정 조각에는 `litellm_settings.callbacks`가 없다. MINT 로거는 MINT 가드레일이 등록하므로 `callbacks`에 로거가 적혀 있으면 기동 전 검사와 `check`가 거부하고, MINT 가드레일은 가드레일 목록의 마지막이어야 한다. 기동 전 검사와 `check`는 주 설정 파일이 아니라 LiteLLM의 설정 로더가 `include`까지 병합한 설정을 검사한다. 이 로더를 쓸 수 없으면 `include`가 있는 설정을 거부하고, 파생 이미지의 기동 전 검사는 로더가 없으면 통과시키지 않는다.
