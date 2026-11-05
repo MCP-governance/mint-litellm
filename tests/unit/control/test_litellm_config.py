@@ -45,3 +45,45 @@ def test_load_config_and_env_file(tmp_path):
     env = tmp_path / ".env"
     env.write_text("# 주석\nA=1\nB = \"two\"\n\nbroken\n", encoding="utf-8")
     assert litellm_config.load_env_file(env) == {"A": "1", "B": "two"}
+
+
+def test_the_loader_reads_with_utf8_only_while_it_runs(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    from mint_litellm.compat import litellm_config_loader as compat
+
+    module = types.ModuleType("fake_loader_module")
+    source = (
+        "async def loader(config_file_path):\n"
+        "    with open(config_file_path) as handle:\n"
+        "        return {'text': handle.read()}\n"
+    )
+    exec(source, module.__dict__)  # 로더의 전역이 이 모듈이라 open은 모듈 속성을 먼저 본다
+    monkeypatch.setitem(sys.modules, "fake_loader_module", module)
+    config = tmp_path / "c.yaml"
+    config.write_text("# 한국어 설명\n", encoding="utf-8")
+    seen = []
+    real = compat._utf8_open
+    monkeypatch.setattr(
+        compat, "_utf8_open", lambda *a, **k: (seen.append(k), real(*a, **k))[1]
+    )
+    assert compat._run_loader(module.loader, config) == {"text": "# 한국어 설명\n"}
+    assert seen  # 로더의 open이 UTF-8 고정 함수로 바뀌어 호출되었다
+    assert "open" not in vars(module)
+
+
+def test_the_loader_patch_is_removed_when_the_loader_fails(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    import pytest
+
+    from mint_litellm.compat import litellm_config_loader as compat
+
+    module = types.ModuleType("failing_loader_module")
+    exec("async def loader(config_file_path):\n    raise RuntimeError('boom')\n", module.__dict__)
+    monkeypatch.setitem(sys.modules, "failing_loader_module", module)
+    with pytest.raises(RuntimeError):
+        compat._run_loader(module.loader, tmp_path / "c.yaml")
+    assert "open" not in vars(module)

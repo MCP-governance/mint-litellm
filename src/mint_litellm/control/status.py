@@ -127,11 +127,7 @@ def enforcement_states(ctx: Context) -> list[dict[str, Any]]:
             {
                 "worker_id": str(payload.get("worker_id") or "-"),
                 "passed": passed,
-                "cause": None
-                if passed
-                else payload.get("cause") or ("startup_check" if failed else payload.get("error")),
                 "failed": failed,
-                "hooks": payload.get("hooks") if isinstance(payload.get("hooks"), list) else [],
                 "run_id": parts[1] if len(parts) > 1 else None,
                 "last_transition_at": row["inserted_at"].isoformat(),
                 "payload": payload,
@@ -194,10 +190,9 @@ def render(info: dict[str, Any]) -> str:
         else:
             names = ", ".join(
                 f"{item.get('name', '?')}: {item.get('detail', '')}" for item in state["failed"]
-            ) or ", ".join(str(hook) for hook in state["hooks"])
-            reason = state["cause"] or "원인 미상"
+            ) or "원인 미상"
             lines.append(
-                f"  {state['worker_id']}: 실패 ({reason}) {names} {state['last_transition_at']}"
+                f"  {state['worker_id']}: 실패 {names} {state['last_transition_at']}"
                 f" 실행 {state['run_id'] or '-'}"
             )
     lines.append("관측 항목")

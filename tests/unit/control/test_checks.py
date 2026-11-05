@@ -168,7 +168,7 @@ def test_optout_metadata_on_keys_and_teams_is_counted_and_warned(healthy, stub):
     stub.set("/team/list", teams)
     report = run(good_config(), healthy)
     assert report.observations["guardrail_optout_subjects"] == 3
-    assert Level.WARN in levels(report)["가드레일 제외 대상"]
+    assert Level.INFO in levels(report)["가드레일 제외 대상"]
 
 
 def test_alias_formatted_object_permission_fails_with_guidance(stub, litellm):

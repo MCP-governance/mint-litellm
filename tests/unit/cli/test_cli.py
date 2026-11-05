@@ -631,31 +631,31 @@ def test_status_shows_the_latest_enforcement_state_per_worker(mint):
     assert code == 0 and first["enforcement"] == []
     assert "allowed_pre_hooks" not in first
     add_event(mint, "enforcement_unverified", "selfcheck:r1:1:enforcement_unverified",
-              {"worker_id": "w1", "cause": "callbacks_changed", "hooks": ["Other"]}, 300)
+              {"worker_id": "w1", "failed": [{"name": "OTHER", "detail": "x"}]}, 300)
     add_event(mint, "enforcement_verified", "selfcheck:r2:1:enforcement_verified",
-              {"worker_id": "w1", "allowed_hooks_used": True, "summary": {"1": "ok"}}, 200)
+              {"worker_id": "w1", "summary": {"1": "ok"}}, 200)
     add_event(mint, "enforcement_verified", "selfcheck:r3:1:enforcement_verified",
-              {"worker_id": "w2", "allowed_hooks_used": False}, 100)
+              {"worker_id": "w2"}, 100)
     add_event(mint, "enforcement_unverified", "selfcheck:r4:1:enforcement_unverified",
               {"worker_id": "w2", "failed": [{"item": 8, "name": "REQUIRED_SETTINGS",
                                               "detail": "bad row"}]}, 50)
     code, out, _ = mint.run("--json", "status", token=boss)
     states = {s["worker_id"]: s for s in json.loads(out)["enforcement"]}
     assert states["w1"]["passed"] is True
-    assert states["w2"]["passed"] is False and states["w2"]["cause"] == "startup_check"
+    assert states["w2"]["passed"] is False and "cause" not in states["w2"]
     assert states["w2"]["failed"][0]["detail"] == "bad row"
     assert states["w2"]["last_transition_at"] > states["w1"]["last_transition_at"]
     code, out, _ = mint.run("status", token=boss)
     assert "허용 사전 훅" not in out and "워커가 살아 있다는 뜻은 아님" in out
-    assert "w1: 통과" in out and "w2: 실패 (startup_check)" in out
+    assert "w1: 통과" in out and "w2: 실패 REQUIRED_SETTINGS" in out
     assert "REQUIRED_SETTINGS: bad row" in out
     # 가장 최근 전환만 보인다: w1은 실패 뒤 통과로 돌아왔으므로 통과이다
     add_event(mint, "enforcement_unverified", "selfcheck:r5:1:enforcement_unverified",
-              {"worker_id": "w1", "cause": "callbacks_changed", "hooks": ["Rogue"]}, 0)
+              {"worker_id": "w1", "failed": [{"name": "ROGUE", "detail": "r"}]}, 0)
     code, out, _ = mint.run("--json", "status", token=boss)
     states = {s["worker_id"]: s for s in json.loads(out)["enforcement"]}
-    assert states["w1"]["passed"] is False and states["w1"]["hooks"] == ["Rogue"]
-    assert states["w1"]["cause"] == "callbacks_changed"
+    assert states["w1"]["passed"] is False and states["w1"]["failed"][0]["name"] == "ROGUE"
+    assert "hooks" not in states["w1"]
 
 
 def test_policy_activate_reports_the_restore_outcome_when_it_fails(mint, monkeypatch):
@@ -688,7 +688,7 @@ def test_policy_activate_success_reports_no_restore_outcome(mint, monkeypatch):
 def test_status_keeps_every_worker_even_when_another_floods_the_log(mint):
     boss = bootstrap(mint)
     add_event(mint, "enforcement_verified", "selfcheck:old1:1:enforcement_verified",
-              {"worker_id": "quiet", "allowed_hooks_used": []}, 5000)
+              {"worker_id": "quiet"}, 5000)
     with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
         conn.execute(
             "INSERT INTO mint.events (event_id, instance_id, kind, source_key, inserted_at,"
@@ -708,12 +708,12 @@ def test_status_survives_unexpected_failed_item_shapes_and_shows_run_and_time(mi
     add_event(mint, "enforcement_unverified", "selfcheck:RUN-A:1:enforcement_unverified",
               {"worker_id": "w1", "failed": ["MCP_ORDER", 7, {"name": "X", "detail": "d"}]})
     add_event(mint, "enforcement_unverified", "selfcheck:RUN-B:1:enforcement_unverified",
-              {"worker_id": "w2", "failed": "not a list", "hooks": "oops"})
+              {"worker_id": "w2", "failed": "not a list"})
     code, out, _ = mint.run("--json", "status", token=boss)
     states = {s["worker_id"]: s for s in json.loads(out)["enforcement"]}
     assert code == 0
     assert [f["name"] for f in states["w1"]["failed"]] == ["MCP_ORDER", "7", "X"]
-    assert states["w2"]["failed"] == [] and states["w2"]["hooks"] == []
+    assert states["w2"]["failed"] == []
     code, out, _ = mint.run("status", token=boss)
     assert code == 0 and "실행 RUN-A" in out and "실행 RUN-B" in out
 
@@ -721,9 +721,9 @@ def test_status_survives_unexpected_failed_item_shapes_and_shows_run_and_time(mi
 def test_a_restart_with_the_same_worker_id_is_one_line_with_the_latest_run(mint):
     boss = bootstrap(mint)
     add_event(mint, "enforcement_verified", "selfcheck:FIRST:1:enforcement_verified",
-              {"worker_id": "host:1", "allowed_hooks_used": []}, 100)
+              {"worker_id": "host:1"}, 100)
     add_event(mint, "enforcement_unverified", "selfcheck:SECOND:1:enforcement_unverified",
-              {"worker_id": "host:1", "cause": "callbacks_changed", "hooks": ["Rogue"]}, 10)
+              {"worker_id": "host:1", "failed": [{"name": "ROGUE", "detail": "r"}]}, 10)
     code, out, _ = mint.run("--json", "status", token=boss)
     states = json.loads(out)["enforcement"]
     assert len(states) == 1 and states[0]["run_id"] == "SECOND" and states[0]["passed"] is False
