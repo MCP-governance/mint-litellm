@@ -14,6 +14,7 @@ import logging
 import multiprocessing
 import os
 import signal
+import socket
 import time
 import urllib.request
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -432,7 +433,7 @@ class PluginRuntime:
                 kind=kind,
                 source_key=keys.next(kind),
                 payload={
-                    "worker_id": str(os.getpid()),
+                    "worker_id": worker_id(),
                     "checks": [
                         {"item": int(r.item), "name": r.item.name, "ok": r.ok}
                         for r in self.last_results
@@ -451,7 +452,11 @@ class PluginRuntime:
                 inserted_at=datetime.now(UTC),
                 kind=kind,
                 source_key=SystemEventKeys().next(kind),
-                payload={"cause": "callbacks_changed", "hooks": list(offenders)},
+                payload={
+                    "worker_id": worker_id(),
+                    "cause": "callbacks_changed",
+                    "hooks": list(offenders),
+                },
             )
         )
 
@@ -579,7 +584,7 @@ class PluginRuntime:
             for r in self.last_results
             if not r.ok
         ]
-        payload: dict[str, Any] = {"failed": failed}
+        payload: dict[str, Any] = {"worker_id": worker_id(), "failed": failed}
         if error is not None:
             payload["error"] = error
         event = Event(
@@ -595,6 +600,11 @@ class PluginRuntime:
             ", ".join(f"{SELF_CHECK_DESCRIPTIONS[r.item]}" for r in self.last_results if not r.ok)
             or (error or "unknown"),
         )
+
+
+def worker_id() -> str:
+    """이 워커를 가리키는 값. 복제본마다 호스트 이름이 다르므로 프로세스 번호가 겹쳐도 구분된다."""
+    return f"{socket.gethostname()}:{os.getpid()}"
 
 
 def callbacks_snapshot(callbacks: Sequence[Any]) -> tuple[int, tuple[int, ...]]:

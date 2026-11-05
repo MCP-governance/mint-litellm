@@ -33,7 +33,7 @@ from mint_litellm.plugin import logger as logger_module  # noqa: E402
 from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer  # noqa: E402
 from mint_litellm.plugin.guardrail import MintGuardrail  # noqa: E402
 from mint_litellm.plugin.logger import MintLogger  # noqa: E402
-from mint_litellm.plugin.selfcheck import PluginRuntime  # noqa: E402
+from mint_litellm.plugin.selfcheck import PluginRuntime, worker_id  # noqa: E402
 from mint_litellm.types.decision import (  # noqa: E402
     MINT_CTX_KEY,
     MINT_DECISION_REF_KEY,
@@ -1007,7 +1007,11 @@ class TestCallbacksAddedAfterStartup(ChainRunner):
         assert first.error.code == second.error.code == "MINT-ENFORCEMENT-UNVERIFIED"
         assert first.sent is None and second.sent is None
         (event,) = rig.store.of_kind("enforcement_unverified")
-        assert event.payload == {"cause": "callbacks_changed", "hooks": ["ArgumentsRewriter"]}
+        assert event.payload == {
+            "worker_id": worker_id(),
+            "cause": "callbacks_changed",
+            "hooks": ["ArgumentsRewriter"],
+        }
 
 
 class TestOrderRestoredAfterStartup(ChainRunner):
@@ -1030,7 +1034,7 @@ class TestOrderRestoredAfterStartup(ChainRunner):
         assert len(rig.store.of_kind("enforcement_unverified")) == 1
         (event,) = rig.store.of_kind("enforcement_verified")
         assert event.payload["allowed_hooks_used"] == []
-        assert event.payload["worker_id"].isdigit()
+        assert event.payload["worker_id"] == worker_id()
 
 
 class TestConstructors:

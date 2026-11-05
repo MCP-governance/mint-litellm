@@ -1,6 +1,5 @@
 import asyncio
 import io
-import os
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -19,6 +18,7 @@ from mint_litellm.plugin.selfcheck import (
     collect_view,
     contract_mismatches,
     order_check,
+    worker_id,
 )
 from mint_litellm.plugin.snapshot import RegisteredServer
 from mint_litellm.types.decision import url_sha256
@@ -713,7 +713,7 @@ class TestVerifiedEvent:
         for event in events:
             assert event.source_key.startswith("selfcheck:")
             assert event.source_key.endswith(":1:enforcement_verified")
-            assert event.payload["worker_id"] == str(os.getpid())
+            assert event.payload["worker_id"] == worker_id()
             assert [c["item"] for c in event.payload["checks"]] == list(range(1, 9))
             assert all(c["ok"] for c in event.payload["checks"])
             assert event.payload["checks"][2]["name"] == SelfCheckItem.GUARDRAIL_ORDER.name
@@ -832,7 +832,11 @@ class TestCallbacksChangedAfterStartup:
             asyncio.run(runtime.refresh_order())
             assert runtime.deps.verified() is False
         (event,) = store.of_kind("enforcement_unverified")
-        assert event.payload == {"cause": "callbacks_changed", "hooks": ["Late"]}
+        assert event.payload == {
+            "worker_id": worker_id(),
+            "cause": "callbacks_changed",
+            "hooks": ["Late"],
+        }
         assert event.source_key.startswith("selfcheck:") and event.source_key.endswith(
             ":1:enforcement_unverified"
         )
@@ -876,7 +880,7 @@ def test_without_readiness_in_time_the_startup_is_recorded_and_stopped(tmp_path)
     asyncio.run(runtime._startup())
     assert stopped == [1] and not runtime.verified
     (event,) = store.of_kind("enforcement_unverified")
-    assert event.payload == {"failed": [], "error": "readiness_timeout"}
+    assert event.payload == {"worker_id": worker_id(), "failed": [], "error": "readiness_timeout"}
 
 
 def test_readiness_and_checks_share_one_time_limit(tmp_path):
@@ -886,7 +890,7 @@ def test_readiness_and_checks_share_one_time_limit(tmp_path):
     asyncio.run(runtime._startup())
     assert stopped == [1] and not runtime.verified
     (event,) = store.of_kind("enforcement_unverified")
-    assert event.payload == {"failed": [], "error": "startup_timeout"}
+    assert event.payload == {"worker_id": worker_id(), "failed": [], "error": "startup_timeout"}
 
 
 def test_a_check_that_finishes_after_the_limit_is_not_a_pass(tmp_path):
