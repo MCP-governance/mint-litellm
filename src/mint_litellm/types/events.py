@@ -26,7 +26,6 @@ class EventKind(StrEnum):
     # 호출 사건
     DECISION_EVALUATED = "decision_evaluated"
     DISCOVERY_EVALUATED = "discovery_evaluated"
-    CALL_DISPATCH_ATTEMPTED = "call_dispatch_attempted"
     CALL_RESPONSE_RECEIVED = "call_response_received"
     CALL_OUTCOME_UNKNOWN = "call_outcome_unknown"
     # 시스템 사건
@@ -67,7 +66,6 @@ CALL_KINDS: frozenset[EventKind] = frozenset(
     {
         EventKind.DECISION_EVALUATED,
         EventKind.DISCOVERY_EVALUATED,
-        EventKind.CALL_DISPATCH_ATTEMPTED,
         EventKind.CALL_RESPONSE_RECEIVED,
         EventKind.CALL_OUTCOME_UNKNOWN,
     }

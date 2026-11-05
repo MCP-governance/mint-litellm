@@ -93,8 +93,33 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         key="MINT_DECISION_BUDGET_MS",
         source=SettingSource.ENV,
         rule=(
-            "판정 하나의 시간 예산(밀리초, 기본 300). 상태 조회·정책 평가·선기록이 남은 시간만큼만 "
-            "기다리며, 시간 초과는 결과 불명으로 다룬다. 저장된 설정으로 덮지 않는다."
+            "판정 하나의 시간 예산(밀리초, 기본 300). 상태 조회·정책 평가·선기록은 남은 시간만큼만 "
+            "기다리고, 시간 초과는 결과 불명으로 다룬다. 저장된 설정으로 덮지 않는다."
+        ),
+    ),
+    MintSettingRow(
+        key="MINT_SELFCHECK_GRACE_SECONDS",
+        source=SettingSource.ENV,
+        rule=(
+            "기동 뒤 준비 상태와 자가 점검 8항목을 마쳐야 하는 시간(초, 기본 120, 범위 10~600). "
+            "범위 밖이면 기동을 거부한다. 시간 안에 마치지 못하면 사건을 남기고, "
+            "`MINT_REQUIRED=true`이면 기동을 중단한다."
+        ),
+    ),
+    MintSettingRow(
+        key="MINT_FINGERPRINT_KEY",
+        source=SettingSource.ENV,
+        rule=(
+            "호출별 승인 인자 지문의 키(32바이트 이상 무작위 값의 base64url). `init`이 만들어 "
+            "저장소 밖 비밀 파일(권한 0600)에 기록한다. 없으면 호출별 승인을 충족할 수 없다."
+        ),
+    ),
+    MintSettingRow(
+        key="MINT_FINGERPRINT_KEY_VERSION",
+        source=SettingSource.ENV,
+        rule=(
+            "지문 키의 판본(1 이상 정수, 기본 1). 승인에 기록된 판본과 다르면 호출별 승인이 "
+            "다시 필요하다."
         ),
     ),
 )
