@@ -15,7 +15,7 @@ on:
       - "uv.lock"
       - ".github/workflows/integration.yml"
   push:
-    branches: ["**"]
+    branches: [main]
     paths:
       - "src/mint_litellm/**"
       - "deploy/**"
