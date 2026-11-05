@@ -13,6 +13,9 @@ class FakeConnection:
     def __init__(self):
         self.pgconn = object()
 
+    async def execute(self, sql):
+        return None
+
 
 def database_with(connection_context):
     db = PluginDatabase("postgresql://unused")
@@ -119,3 +122,79 @@ def test_giving_up_before_a_connection_is_borrowed_cancels_the_borrowing():
 
     run(go())
     assert state["cancelled"] is True
+
+
+def test_a_connection_that_fails_its_idle_check_is_dropped_and_another_one_is_used():
+    from psycopg import OperationalError
+
+    handed = []
+
+    class Stale(FakeConnection):
+        async def execute(self, sql):
+            raise OperationalError("server closed the connection unexpectedly")
+
+    @contextlib.asynccontextmanager
+    async def connection():
+        conn = Stale() if not handed else FakeConnection()
+        handed.append(conn)
+        yield conn
+
+    db = database_with(connection)
+
+    async def go():
+        async def work(conn):
+            return conn
+
+        return await db._run(work)
+
+    used = run(go())
+    assert len(handed) == 2 and used is handed[1] and isinstance(handed[0], Stale)
+
+
+def test_a_connection_used_a_moment_ago_is_not_checked_again():
+    probes = []
+
+    class Counting(FakeConnection):
+        async def execute(self, sql):
+            probes.append(sql)
+
+    conn = Counting()
+
+    @contextlib.asynccontextmanager
+    async def connection():
+        yield conn
+
+    db = database_with(connection)
+
+    async def go():
+        async def work(c):
+            return 1
+
+        await db._run(work)
+        await db._run(work)
+
+    run(go())
+    assert probes == [""]
+
+
+def test_every_connection_stale_ends_with_an_operational_error():
+    from psycopg import OperationalError
+
+    class Stale(FakeConnection):
+        async def execute(self, sql):
+            raise OperationalError("closed")
+
+    @contextlib.asynccontextmanager
+    async def connection():
+        yield Stale()
+
+    db = database_with(connection)
+
+    async def go():
+        async def work(conn):
+            return 1
+
+        with pytest.raises(OperationalError):
+            await db._run(work)
+
+    run(go())

@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import math
 import socket
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -391,6 +392,15 @@ class RegisteredServer:
     auth_type: str
 
 
+# 이 시간(초) 넘게 쓰지 않은 연결은 쓰기 전에 확인한다. 풀의 확인 기능은 실패마다 1초 넘게
+# 쉬므로 쓰지 않는다.
+_IDLE_CHECK_SECONDS = 0.2
+
+
+class _StaleConnection(Exception):
+    pass
+
+
 def _retrieve(task: asyncio.Future[Any]) -> None:
     """버려진 작업의 결과를 읽어 「처리되지 않은 예외」 경고를 막는다."""
     if not task.cancelled():
@@ -414,7 +424,8 @@ def _sever(conn: Any) -> None:
 class PluginDatabase:
     """판정 프로세스 전용 연결. 상태 표 조회와 사건 추가, 호출별 승인 소비만 한다.
 
-    DB가 응답하지 않아도 호출한 쪽의 시간 제한(판정 예산)에서 끝나도록 세 겹으로 건다.
+    DB가 응답하지 않아도 호출한 쪽의 시간 제한(판정 예산)에서 끝나도록 세 겹으로 건다. 한동안 쓰지
+    않은 연결은 쓰기 전에 살아 있는지 확인해, 재시작된 서버가 끊은 연결이 판정에 쓰이지 않게 한다.
     서버 쪽 잠금 제한(``lock_timeout``)은 ``acquire_timeout``과 같고 문장 제한
     (``statement_timeout``)은 그 열 배(최소 1초)이며, 연결 시도에는 ``connect_timeout``을 건다.
     응답이 아예 없는 연결에는 이 제한들이 소용없으므로 호출한 쪽이 기다리기를 그만두면 연결을
@@ -470,12 +481,29 @@ class PluginDatabase:
         끊어 그 기다림 없이 실패하게 한다. 끊어진 연결은 풀이 버리고 새로 만든다. 연결을 아직 빌리지
         못했다면 빌리는 일을 취소한다.
         """
+        from psycopg import OperationalError
+
         held: list[Any] = []
 
         async def job() -> Any:
-            async with await self._connection() as conn:
-                held.append(conn)
-                return await work(conn)
+            for _ in range(self.max_size + 1):
+                try:
+                    async with await self._connection() as conn:
+                        held[:] = [conn]
+                        idle = time.monotonic() - getattr(conn, "_mint_used", 0.0)
+                        if idle > _IDLE_CHECK_SECONDS:
+                            try:
+                                await conn.execute("")
+                            except OperationalError:
+                                # 나가면 풀이 끊어진 연결을 버리고, 다음에는 다른 연결을 받는다.
+                                raise _StaleConnection from None
+                        try:
+                            return await work(conn)
+                        finally:
+                            conn._mint_used = time.monotonic()
+                except _StaleConnection:
+                    continue
+            raise OperationalError("no usable database connection")
 
         task = asyncio.ensure_future(job())
         try:

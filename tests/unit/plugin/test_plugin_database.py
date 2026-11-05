@@ -921,3 +921,26 @@ def test_the_loser_of_a_concurrent_consumption_is_always_blocked_as_already_cons
         (scenario.iid,),
     ).fetchone()
     assert consumed == (rounds,)
+
+
+def test_connections_the_server_closed_are_not_handed_to_a_call(scenario, plugin_dsn):
+    """서버가 연결을 끊은 뒤에도 첫 조회가 끊어진 연결 때문에 실패하지 않는다."""
+    role = conninfo_to_dict(plugin_dsn)["user"]
+
+    async def go():
+        db = database(plugin_dsn, max_size=4, acquire_timeout=2.0)
+        try:
+            await asyncio.gather(*(db.read_snapshot(scenario.query()) for _ in range(3)))
+            scenario.conn.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = %s",
+                (role,),
+            )
+            await asyncio.sleep(0.6)
+            snap = await db.read_snapshot(scenario.query())
+            stored = await db.insert_event(scenario.event())
+            return snap, stored
+        finally:
+            await db.close()
+
+    snap, stored = run(go())
+    assert snap.server.status == "approved" and stored is True
