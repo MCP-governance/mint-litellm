@@ -47,6 +47,7 @@ REQUIRED_MODES = ("pre_mcp_call", "post_mcp_call")
 # 통제 대상 서버 상태. 그 밖의 상태 서버는 LiteLLM에 없어도 기동을 막지 않는다.
 CONTROLLED_SERVER_STATUSES = frozenset({"approved", "suspended"})
 CONTRACT_FIELDS = ("url_sha256", "transport", "auth_type")
+REGISTRY_MISSING = "registry_missing"
 
 
 @dataclass(frozen=True)
@@ -171,7 +172,10 @@ def check_items(
             if not strict
             else f"allow_all_keys is set on {', '.join(open_servers[:5])}",
         )
-        absent = [s.server_id for s in active if s.server_id not in by_id]
+        # 중지된 서버는 호출이 이미 막혀 있으므로, 레지스트리에서 지워졌어도 기동을 막지 않는다.
+        absent = [
+            s.server_id for s in active if s.status == "approved" and s.server_id not in by_id
+        ]
         add(
             SelfCheckItem.SERVER_REGISTRY_MATCH,
             not absent,
@@ -214,12 +218,20 @@ def check_items(
 def contract_mismatches(
     view: LiteLLMView, controlled: Sequence[RegisteredServer]
 ) -> list[tuple[str, str]]:
-    """레지스트리에 있지만 승인된 계약 값과 다른 통제 서버의 (서버, 항목). 기동을 막지 않는다."""
+    """승인된 계약 값과 다른 통제 서버의 (서버, 항목). 기동을 막지 않는다.
+
+    레지스트리에서 지워진 중지 서버는 항목 ``registry_missing``으로 센다. 승인된 서버가 지워진
+    경우는 자가 점검 5번이 기동을 막는다.
+    """
     by_id = {entry.server_id: entry for entry in view.registry}
     found = []
     for server in controlled:
+        if server.status not in CONTROLLED_SERVER_STATUSES:
+            continue
         entry = by_id.get(server.server_id)
-        if server.status not in CONTROLLED_SERVER_STATUSES or entry is None:
+        if entry is None:
+            if server.status == "suspended":
+                found.append((server.server_id, REGISTRY_MISSING))
             continue
         found.extend(
             (server.server_id, name)

@@ -287,10 +287,16 @@ def _check_registry_rows(
     problems: list[str] = []
     unverified: list[str] = []
     open_servers: list[str] = []
+    suspended_missing: list[str] = []
     for row in registered:
         entry = by_id.get(row["server_id"])
         if entry is None:
-            problems.append(f"{row['server_id']}: 레지스트리에 없음")
+            # 플러그인 자가 점검 5번과 같다: 승인된 서버만 기동을 막고, 중지된 서버는 알리기만 한다.
+            status = row.get("status", "approved")
+            if status == "approved":
+                problems.append(f"{row['server_id']}: 레지스트리에 없음")
+            elif status == "suspended":
+                suspended_missing.append(row["server_id"])
             continue
         if _truthy(entry.get("allow_all_keys")):
             open_servers.append(row["server_id"])
@@ -308,6 +314,10 @@ def _check_registry_rows(
     if open_servers:
         report.add("mcp_servers.<이름>.allow_all_keys", Level.FAIL,
                    "allow_all_keys가 true인 등록 서버: " + ", ".join(open_servers))
+    if suspended_missing:
+        report.add("중지된 서버의 레지스트리 항목", Level.INFO,
+                   "LiteLLM 레지스트리에 없는 중지 서버(기동을 막지 않고 플러그인이 "
+                   "registry_missing 사건을 남깁니다): " + ", ".join(suspended_missing))
     if not registered:
         return
     if problems:

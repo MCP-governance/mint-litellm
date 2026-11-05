@@ -218,6 +218,25 @@ def test_registered_servers_must_match_the_registry(healthy):
             "등록 서버의 계약 값"]
 
 
+def test_a_registered_server_missing_from_the_registry_blocks_only_when_it_is_approved(healthy):
+    from mint_litellm.types.decision import url_sha256
+
+    gone = {"server_id": "ghost", "url_sha256": url_sha256("http://u.test/mcp"),
+            "transport": "http", "auth_type": "none"}
+
+    def check(status):
+        return run(good_config(), healthy, registered_servers=[{**gone, "status": status}])
+
+    assert Level.FAIL in levels(check("approved"))["등록 서버의 계약 값"]
+    suspended = check("suspended")
+    assert Level.INFO in levels(suspended)["중지된 서버의 레지스트리 항목"]
+    assert "ghost" in next(
+        f.message for f in suspended.findings if f.item == "중지된 서버의 레지스트리 항목"
+    )
+    assert Level.FAIL not in levels(suspended).get("등록 서버의 계약 값", [])
+    assert Level.FAIL not in levels(check("awaiting_approval")).get("등록 서버의 계약 값", [])
+
+
 def test_registered_guardrail_must_match_the_running_one(healthy, stub):
     stub.set("/guardrails/list", fixture("guardrails_empty"))
     assert Level.FAIL in levels(run(good_config(), healthy))["guardrails[MINT]"]
