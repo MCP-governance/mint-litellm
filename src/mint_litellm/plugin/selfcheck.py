@@ -111,6 +111,9 @@ def guardrail_definition_check(callbacks: Sequence[Any], guardrail: Any) -> tupl
     expected = getattr(cls, "mint_should_run_guardrail", None)
     if expected is None or getattr(cls, "should_run_guardrail", None) is not expected:
         return False, "the MINT guardrail's should_run_guardrail was replaced"
+    for name in ("should_run_guardrail", "async_pre_call_hook"):
+        if name in getattr(guardrail, "__dict__", {}):
+            return False, f"the MINT guardrail's {name} was replaced on the instance"
     return True, ""
 
 

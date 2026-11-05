@@ -185,6 +185,16 @@ def test_item_3_the_guardrail_must_run_in_parallel_and_skip_the_raw_request():
     assert definition_failed([LOGGER, scanning], guard=scanning)
 
 
+@pytest.mark.parametrize("name", ["should_run_guardrail", "async_pre_call_hook"])
+def test_item_3_a_method_replaced_on_the_instance_fails(name):
+    replaced = FakeGuardrail(**GUARDRAIL.__dict__)
+    assert not definition_failed([LOGGER, replaced], guard=replaced)
+    setattr(replaced, name, lambda *args, **kwargs: True)
+    assert definition_failed([LOGGER, replaced], guard=replaced)
+    ok, detail = guardrail_definition_check([LOGGER, replaced], replaced)
+    assert not ok and name in detail and "instance" in detail
+
+
 def test_item_3_a_replaced_judgment_override_fails():
     class Replaced(FakeGuardrail):
         def should_run_guardrail(self, data, event_type):
