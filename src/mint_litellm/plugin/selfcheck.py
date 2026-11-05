@@ -34,7 +34,7 @@ from mint_litellm.plugin.pipeline import (
     build_request,
     evaluate_request,
 )
-from mint_litellm.plugin.policy.opa_client import OPAClient
+from mint_litellm.plugin.policy.opa_client import Evaluation, OPAClient
 from mint_litellm.plugin.result import ResultDeps
 from mint_litellm.plugin.snapshot import PluginDatabase, RegisteredServer
 from mint_litellm.types.decision import OperationType, StageResult
@@ -463,6 +463,58 @@ def _unverified(deps: PipelineDeps) -> PipelineDeps:
     )
 
 
+class PolicyEngine:
+    """OPA 클라이언트를 이벤트 루프마다 하나씩 만들어 쓰고, 그 루프가 끝나면 닫는다.
+
+    클라이언트는 만든 프로세스·루프 밖에서 쓰면 ``RuntimeError``를 내므로, 프로세스나 루프가
+    바뀌면 새로 만든다. 클라이언트를 닫는 일은 그 루프에 남겨 둔 작업이 맡는다. 루프가 끝나며
+    남은 작업을 취소할 때 그 작업이 연결을 닫는다.
+    """
+
+    def __init__(self, base_url: str, timeout_seconds: float) -> None:
+        self._base_url = base_url
+        self._timeout = timeout_seconds
+        self._client: OPAClient | None = None
+        self._owner: tuple[int, asyncio.AbstractEventLoop] | None = None
+        self._guard: asyncio.Task[None] | None = None
+
+    async def evaluate(
+        self,
+        policy_input: dict[str, Any],
+        *,
+        policy_version_id: str,
+        bundle_sha256: str,
+        budget_seconds: float | None = None,
+    ) -> Evaluation:
+        loop = asyncio.get_running_loop()
+        owner = (os.getpid(), loop)
+        if self._client is None or self._owner != owner:
+            client = OPAClient(self._base_url, self._timeout)
+            self._client, self._owner = client, owner
+            self._guard = loop.create_task(self._close_with_loop(client))
+        return await self._client.evaluate(
+            policy_input,
+            policy_version_id=policy_version_id,
+            bundle_sha256=bundle_sha256,
+            budget_seconds=budget_seconds,
+        )
+
+    @staticmethod
+    async def _close_with_loop(client: OPAClient) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await client.aclose()
+
+    async def aclose(self) -> None:
+        client, guard = self._client, self._guard
+        self._client = self._owner = self._guard = None
+        if guard is not None:
+            guard.cancel()
+        if client is not None:
+            await client.aclose()
+
+
 _runtime: PluginRuntime | None = None
 
 
@@ -486,6 +538,6 @@ def get_runtime(env: Mapping[str, str] | None = None) -> PluginRuntime:
             config=config,
             database=database,
             recorder=recorder,
-            evaluate=OPAClient(config.opa_url, config.decision_budget_seconds).evaluate,
+            evaluate=PolicyEngine(config.opa_url, config.decision_budget_seconds).evaluate,
         )
     return _runtime

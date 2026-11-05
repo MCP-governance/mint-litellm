@@ -284,7 +284,7 @@ def evaluator(
 ):
     """정책 클라이언트 대역. 운영의 ``OPAClient.evaluate``와 같은 반환 형태를 돌려준다."""
 
-    async def evaluate(policy_input, *, policy_version_id, bundle_sha256):
+    async def evaluate(policy_input, *, policy_version_id, bundle_sha256, budget_seconds=None):
         if calls is not None:
             calls.append(policy_input)
         if failure is not None:

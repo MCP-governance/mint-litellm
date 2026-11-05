@@ -12,6 +12,7 @@ from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer, SystemEven
 from mint_litellm.plugin.selfcheck import (
     LiteLLMView,
     PluginRuntime,
+    PolicyEngine,
     check_items,
     collect_view,
     contract_mismatches,
@@ -439,9 +440,79 @@ def test_view_reports_missing_symbols_when_litellm_is_absent_or_other(monkeypatc
     )
 
 
+class FakeOPAClient:
+    """OPAClient 대역: 만들어진 개수와 닫힘, 받은 시간 예산을 센다."""
+
+    created: list = []
+
+    def __init__(self, base_url, timeout_seconds):
+        self.closed = False
+        self.budgets: list = []
+        FakeOPAClient.created.append(self)
+
+    async def evaluate(
+        self, policy_input, *, policy_version_id, bundle_sha256, budget_seconds=None
+    ):
+        self.budgets.append(budget_seconds)
+        return "evaluated"
+
+    async def aclose(self):
+        self.closed = True
+
+
+class TestPolicyEngine:
+    @pytest.fixture(autouse=True)
+    def fake_client(self, monkeypatch):
+        from mint_litellm.plugin import selfcheck
+
+        FakeOPAClient.created = []
+        monkeypatch.setattr(selfcheck, "OPAClient", FakeOPAClient)
+
+    @staticmethod
+    async def ask(engine, budget=None):
+        return await engine.evaluate(
+            {}, policy_version_id="v", bundle_sha256="b", budget_seconds=budget
+        )
+
+    def test_one_client_serves_a_loop_and_gets_the_remaining_budget(self):
+        engine = PolicyEngine("http://opa", 0.3)
+
+        async def scenario():
+            await self.ask(engine, 0.2)
+            await self.ask(engine, 0.1)
+
+        asyncio.run(scenario())
+        (client,) = FakeOPAClient.created
+        assert client.budgets == [0.2, 0.1]
+
+    def test_the_client_is_closed_when_its_loop_ends(self):
+        engine = PolicyEngine("http://opa", 0.3)
+        asyncio.run(self.ask(engine))
+        (client,) = FakeOPAClient.created
+        assert client.closed
+
+    def test_a_new_loop_gets_a_new_client_and_the_old_one_stays_closed(self):
+        engine = PolicyEngine("http://opa", 0.3)
+        asyncio.run(self.ask(engine))
+        asyncio.run(self.ask(engine))
+        first, second = FakeOPAClient.created
+        assert first.closed and second.closed and first is not second
+
+    def test_closing_the_engine_closes_the_client_once(self):
+        engine = PolicyEngine("http://opa", 0.3)
+
+        async def scenario():
+            await self.ask(engine)
+            await engine.aclose()
+            return FakeOPAClient.created[0].closed
+
+        assert asyncio.run(scenario()) is True
+        asyncio.run(self.ask(engine))
+        assert len(FakeOPAClient.created) == 2
+
+
 def test_the_runtime_is_built_from_the_environment_with_the_policy_client(tmp_path, monkeypatch):
     from mint_litellm.plugin import selfcheck
-    from mint_litellm.plugin.policy.opa_client import OPAClient
 
     monkeypatch.setattr(selfcheck, "_runtime", None)
     env = {
@@ -454,7 +525,7 @@ def test_the_runtime_is_built_from_the_environment_with_the_policy_client(tmp_pa
     runtime = selfcheck.get_runtime(env)
     assert runtime is selfcheck.get_runtime(env)
     assert runtime.config.decision_budget_seconds == 0.25
-    assert isinstance(runtime.evaluate.__self__, OPAClient)
+    assert isinstance(runtime.evaluate.__self__, PolicyEngine)
     assert runtime.database.acquire_timeout == 0.25 and runtime.verified is False
     monkeypatch.setattr(selfcheck, "_runtime", None)
 

@@ -1371,7 +1371,7 @@ class TestDecisionBudget:
         cfg = config(tmp_path, decision_budget_seconds=0.3)
         seen = {}
 
-        async def evaluate(policy_input, *, policy_version_id, bundle_sha256):
+        async def evaluate(policy_input, *, policy_version_id, bundle_sha256, budget_seconds=None):
             started = asyncio.get_running_loop().time()
             try:
                 await asyncio.sleep(0.25)

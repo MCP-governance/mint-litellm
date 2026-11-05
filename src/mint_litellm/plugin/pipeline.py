@@ -73,7 +73,7 @@ _SCOPE_ORDER = ("key", "user", "team", "org")
 
 
 PolicyEvaluate = Callable[..., Awaitable[Evaluation]]
-"""``evaluate(policy_input, *, policy_version_id, bundle_sha256)``. 운영은 OPAClient."""
+"""``evaluate(policy_input, *, policy_version_id, bundle_sha256, budget_seconds)``."""
 
 
 class Deadline:
@@ -429,7 +429,10 @@ async def policy_stage(
     try:
         async with asyncio.timeout(timeout):
             evaluation = await deps.evaluate(
-                policy_input, policy_version_id=version.id, bundle_sha256=version.bundle_sha256
+                policy_input,
+                policy_version_id=version.id,
+                bundle_sha256=version.bundle_sha256,
+                budget_seconds=timeout,
             )
     except Exception:
         return stopped(StageResult.stop(Reason.DEPENDENCY_FAILURE), Dependency.OPA)
