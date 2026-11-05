@@ -50,7 +50,7 @@ NOW = datetime(2026, 11, 3, 9, 0, tzinfo=UTC)
 INSTANCE = "inst"
 KEY = "k" * 64
 URL = "https://mcp.example/api"
-FP_KEY = b"fingerprint-key-for-tests"
+FP_KEY = bytes(range(32))
 BUNDLE = "b" * 64
 
 
@@ -124,7 +124,7 @@ def approval(**override: Any) -> ApprovalRow:
 
 
 def call_approval(**override: Any) -> CallApprovalRow:
-    from mint_litellm.plugin.pipeline import argument_fingerprint
+    from mint_litellm.types.fingerprint import argument_fingerprint
 
     args = {
         "id": UUID("00000000-0000-0000-0000-0000000000c1"),

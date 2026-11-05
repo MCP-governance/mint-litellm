@@ -8,8 +8,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import time
@@ -57,6 +55,7 @@ from mint_litellm.types.decision import (
 )
 from mint_litellm.types.errors import Dependency, MintError, error_for_reason
 from mint_litellm.types.events import Evidence, decision_event
+from mint_litellm.types.fingerprint import argument_fingerprint
 from mint_litellm.types.identity import (
     Principal,
     PrincipalType,
@@ -119,15 +118,6 @@ class Outcome:
     error: MintError | None
     evidence: Evidence
     context: dict[str, Any]
-
-
-def argument_fingerprint(arguments: Mapping[str, Any], key: bytes) -> str:
-    """인자의 HMAC-SHA256 지문. 키 정렬 JSON(UTF-8)을 입력으로 한다.
-
-    호출별 승인 요청도 같은 함수로 지문을 만들어야 현재 호출과 일치한다.
-    """
-    canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def scope_matches(scope_type: str, scope_id: str, principal: Principal, server_id: str) -> bool:
@@ -488,7 +478,12 @@ def match_call_approval(
             Reason.CALL_APPROVAL_REQUIRED, detail="fingerprint key not set"
         ), None
     version = snapshot.policy_version
-    fingerprint = argument_fingerprint(arguments, config.fingerprint_key)
+    try:
+        fingerprint = argument_fingerprint(arguments, config.fingerprint_key)
+    except ValueError:
+        return StageResult.stop(
+            Reason.CALL_APPROVAL_REQUIRED, detail="arguments cannot be fingerprinted"
+        ), None
 
     def same_call(row: CallApprovalRow) -> bool:
         return (

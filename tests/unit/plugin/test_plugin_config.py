@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 
 import pytest
@@ -5,6 +6,7 @@ import pytest
 from mint_litellm.plugin.config import PluginConfig
 from mint_litellm.types.settings import Mode
 
+KEY_TEXT = base64.urlsafe_b64encode(bytes(range(32))).decode()
 BASE = {
     "MINT_INSTANCE_ID": "prod-1",
     "MINT_DATABASE_URL": "postgresql://mint@db/mint",
@@ -34,7 +36,7 @@ def test_every_setting_can_be_given():
         "MINT_BUFFER_MAX_BYTES": "2048",
         "MINT_DB_POOL_SIZE": "4",
         "MINT_DECISION_BUDGET_MS": "500",
-        "MINT_FINGERPRINT_KEY": "k" * 32,
+        "MINT_FINGERPRINT_KEY": KEY_TEXT,
         "MINT_FINGERPRINT_KEY_VERSION": "3",
         "MINT_READINESS_URL": "http://localhost:4000/health/readiness",
         "MINT_SELFCHECK_GRACE_SECONDS": "30",
@@ -44,7 +46,7 @@ def test_every_setting_can_be_given():
     assert config.high_risk_tools == {"delete_repo", "drop_table"}
     assert config.buffer_dir == Path("/data/buf") and config.buffer_max_bytes == 2048
     assert config.db_pool_size == 4 and config.decision_budget_seconds == 0.5
-    assert config.fingerprint_key == b"k" * 32 and config.fingerprint_key_version == 3
+    assert config.fingerprint_key == bytes(range(32)) and config.fingerprint_key_version == 3
     assert config.opa_url == "http://opa:8181" and config.selfcheck_grace_seconds == 30.0
 
 
@@ -62,6 +64,9 @@ def test_every_setting_can_be_given():
         {"MINT_DB_POOL_SIZE": "0"},
         {"MINT_DECISION_BUDGET_MS": "1"},
         {"MINT_FINGERPRINT_KEY": "short"},
+        {"MINT_FINGERPRINT_KEY": "k" * 20},
+        {"MINT_FINGERPRINT_KEY": "not base64url!" + "a" * 40},
+        {"MINT_FINGERPRINT_KEY": ""},
         {"MINT_FINGERPRINT_KEY_VERSION": "0"},
         {"MINT_SELFCHECK_GRACE_SECONDS": "9"},
         {"MINT_SELFCHECK_GRACE_SECONDS": "601"},

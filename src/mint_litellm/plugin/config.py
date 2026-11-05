@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from mint_litellm.types.fingerprint import decode_fingerprint_key
 from mint_litellm.types.settings import Mode
 
 _IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -20,7 +21,6 @@ _FALSE = frozenset({"0", "false", "no", "off"})
 DEFAULT_BUFFER_DIR = "/var/lib/mint/buffer"
 DEFAULT_BUFFER_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_DECISION_BUDGET_MS = 300
-MIN_FINGERPRINT_KEY_BYTES = 16
 DEFAULT_SELFCHECK_GRACE_SECONDS = 120.0
 SELFCHECK_GRACE_RANGE = (10, 600)
 
@@ -52,11 +52,7 @@ class PluginConfig:
             ceiling = Mode(mode_text)
         except ValueError:
             raise RuntimeError("MINT_MODE must be enforce or observe") from None
-        key = env.get("MINT_FINGERPRINT_KEY")
-        if key is not None and len(key.encode("utf-8")) < MIN_FINGERPRINT_KEY_BYTES:
-            raise RuntimeError(
-                f"MINT_FINGERPRINT_KEY must be at least {MIN_FINGERPRINT_KEY_BYTES} bytes"
-            )
+        key = _fingerprint_key(env.get("MINT_FINGERPRINT_KEY"))
         return cls(
             instance_id=instance_id,
             database_url=_required(env, "MINT_DATABASE_URL"),
@@ -73,7 +69,7 @@ class PluginConfig:
                 env, "MINT_DECISION_BUDGET_MS", DEFAULT_DECISION_BUDGET_MS, 10
             )
             / 1000,
-            fingerprint_key=key.encode("utf-8") if key is not None else None,
+            fingerprint_key=key,
             fingerprint_key_version=_integer(env, "MINT_FINGERPRINT_KEY_VERSION", 1, 1),
             readiness_url=env.get("MINT_READINESS_URL") or None,
             selfcheck_grace_seconds=float(
@@ -93,6 +89,15 @@ def _required(env: Mapping[str, str], name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} is required")
     return value
+
+
+def _fingerprint_key(raw: str | None) -> bytes | None:
+    if raw is None:
+        return None
+    try:
+        return decode_fingerprint_key(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"MINT_FINGERPRINT_KEY is invalid: {exc}") from None
 
 
 def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:

@@ -22,7 +22,7 @@ from mint_litellm.plugin.buffer import (  # noqa: E402
     EvidenceRecorder,
     LocalBuffer,
 )
-from mint_litellm.plugin.pipeline import PipelineDeps, argument_fingerprint, evaluate_request  # noqa: E402
+from mint_litellm.plugin.pipeline import PipelineDeps, evaluate_request  # noqa: E402
 from mint_litellm.plugin.snapshot import (  # noqa: E402
     NegativeStateQuery,
     PluginDatabase,
@@ -30,12 +30,13 @@ from mint_litellm.plugin.snapshot import (  # noqa: E402
 )
 from mint_litellm.types.decision import url_sha256  # noqa: E402
 from mint_litellm.types.events import Event, EventKind, Evidence, call_source_key  # noqa: E402
+from mint_litellm.types.fingerprint import argument_fingerprint  # noqa: E402
 from mint_litellm.types.identity import OrgStatus, SubjectType  # noqa: E402
 from mint_litellm.types.ids import new_uuid7  # noqa: E402
 from mint_litellm.types.settings import Mode  # noqa: E402
 
 URL_HASH = url_sha256("https://mcp.example/api")
-FP_KEY = b"fingerprint-key-for-tests"
+FP_KEY = bytes(range(32))
 ARGS_FP = argument_fingerprint({"q": "x"}, FP_KEY)
 
 

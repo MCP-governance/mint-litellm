@@ -27,7 +27,6 @@ from plugin_helpers import (
 from mint_litellm.compat.litellm_1_106 import HookData, ServerResolutionError
 from mint_litellm.plugin.pipeline import (
     Deadline,
-    argument_fingerprint,
     blocking_reason,
     build_policy_input,
     build_request,
@@ -44,6 +43,7 @@ from mint_litellm.types.decision import (
     url_sha256,
 )
 from mint_litellm.types.errors import DispatchState
+from mint_litellm.types.fingerprint import argument_fingerprint
 from mint_litellm.types.identity import OrgStatus, SubjectType
 from mint_litellm.types.reason_codes import OBSERVATION_CANDIDATES, Reason
 from mint_litellm.types.settings import Mode, ObservationSettings
@@ -798,7 +798,7 @@ class TestObligations:
         assert a == b and len(a) == 64
         assert a != argument_fingerprint({"a": 1, "b": {"y": [2, 1], "x": "한글"}}, FP_KEY)
         assert a != argument_fingerprint(
-            {"a": 1, "b": {"y": [1, 2], "x": "한글"}}, b"other key 123456"
+            {"a": 1, "b": {"y": [1, 2], "x": "한글"}}, bytes(range(1, 33))
         )
 
     def test_a_lost_consumption_blocks_and_records_the_block_without_consuming(self, tmp_path):
