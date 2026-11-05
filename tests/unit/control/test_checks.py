@@ -395,7 +395,7 @@ def test_the_mint_guardrail_name_comes_from_the_config(healthy, stub):
     config = good_config()
     config["guardrails"][0]["guardrail_name"] = "mint-prod"
     report = run(config, healthy)
-    assert report.observations["guardrail_optout_subjects"] == 3  # 이름이 다른 'mint'도 MINT 외 이름이다
+    assert report.observations["guardrail_optout_subjects"] == 3  # 'mint'도 이 설정에서는 다른 이름
     message = next(f.message for f in report.findings if f.item == "가드레일 제외 대상")
     assert "다른 가드레일뿐입니다" in message and "호출할 수 없게" not in message
 
