@@ -1,6 +1,7 @@
 """OPA 판정 요청과 활성 판본 확인."""
 
 import asyncio
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +37,10 @@ class OPAClient:
 
     연결이 끊기거나 OPA가 재시작되어 요청이 실패하면 그 호출은 ``DEPENDENCY_FAILURE``로
     차단되며, 끊어진 연결은 풀에서 제거되어 다음 호출이 새로 연결한다.
+
+    수명 계약: 인스턴스는 워커 프로세스의 이벤트 루프마다 하나씩 만들고, 그 루프가 끝나기 전
+    종료 훅에서 ``aclose()``를 호출한다. 연결을 만든 뒤 다른 이벤트 루프나 fork된 자식
+    프로세스에서 쓰면 ``RuntimeError``가 난다.
     """
 
     def __init__(self, base_url: str, timeout_seconds: float) -> None:
@@ -44,15 +49,20 @@ class OPAClient:
         self._url = base_url.rstrip("/") + "/v1/data/mint/decision"
         self._timeout = timeout_seconds
         self._client: httpx.AsyncClient | None = None
+        self._owner: tuple[int, asyncio.AbstractEventLoop] | None = None
 
     async def aclose(self) -> None:
-        client, self._client = self._client, None
+        client, self._client, self._owner = self._client, None, None
         if client is not None:
             await client.aclose()
 
     def _http(self) -> httpx.AsyncClient:
+        owner = (os.getpid(), asyncio.get_running_loop())
         if self._client is None:
             self._client = httpx.AsyncClient(follow_redirects=False, trust_env=False)
+            self._owner = owner
+        elif self._owner != owner:
+            raise RuntimeError("OPAClient is bound to the process and event loop that created it")
         return self._client
 
     async def evaluate(
