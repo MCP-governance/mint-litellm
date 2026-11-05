@@ -1258,6 +1258,68 @@ class TestDiscoveryOperation:
         hidden = harness(tmp_path, snapshot(denials=(denial(),), settings=settings), cfg=cfg)
         assert not decide(hidden, request(operation=OperationType.RUNTIME_DISCOVERY)).allowed
 
+    @pytest.mark.parametrize("mode", [Mode.ENFORCE, Mode.OBSERVE])
+    @pytest.mark.parametrize("failure", ["error", "timeout"])
+    def test_a_tool_whose_decision_cannot_be_made_is_hidden(self, tmp_path, mode, failure):
+        cfg = config(tmp_path, mode_ceiling=mode, decision_budget_seconds=0.05)
+        h = harness(tmp_path, snapshot(settings=SettingsRow(mode=mode)), cfg=cfg)
+
+        async def broken(query):
+            if failure == "error":
+                raise ConnectionError("down")
+            await asyncio.sleep(1)
+
+        h.snapshots.read_snapshot = broken
+        outcome = decide(h, request(operation=OperationType.RUNTIME_DISCOVERY))
+        assert not outcome.allowed and code(outcome) == "MINT-DEPENDENCY-DB"
+        assert len(h.store.of_kind("discovery_evaluated")) == 1
+
+    def test_every_listed_tool_gets_its_own_decision_budget(self, tmp_path):
+        snap = snapshot(approvals=(approval(tools=("a", "b", "c")),))
+        h = harness(tmp_path, snap, cfg=config(tmp_path, decision_budget_seconds=0.5))
+        original = h.snapshots.read_snapshot
+
+        async def slowly(query):
+            await asyncio.sleep(0.25)
+            return await original(query)
+
+        h.snapshots.read_snapshot = slowly
+
+        async def listing():
+            return [
+                await evaluate_request(
+                    request(operation=OperationType.RUNTIME_DISCOVERY, tool_name=name), h.deps
+                )
+                for name in ("a", "b", "c")
+            ]
+
+        outcomes = run(listing())
+        assert [o.allowed for o in outcomes] == [True, True, True]
+
+    def test_a_tool_that_runs_out_of_budget_does_not_hide_the_others(self, tmp_path):
+        snap = snapshot(approvals=(approval(tools=("first", "slow", "last")),))
+        h = harness(tmp_path, snap, cfg=config(tmp_path, decision_budget_seconds=0.1))
+        original = h.snapshots.read_snapshot
+
+        async def only_one_is_slow(query):
+            if query.tool == "slow":
+                await asyncio.sleep(1)
+            return await original(query)
+
+        h.snapshots.read_snapshot = only_one_is_slow
+
+        async def listing():
+            return {
+                name: (
+                    await evaluate_request(
+                        request(operation=OperationType.RUNTIME_DISCOVERY, tool_name=name), h.deps
+                    )
+                ).allowed
+                for name in ("first", "slow", "last")
+            }
+
+        assert run(listing()) == {"first": True, "slow": False, "last": True}
+
     def test_a_listing_is_hidden_while_unverified(self, tmp_path):
         h = harness(tmp_path, verified=False)
         outcome = decide(h, request(operation=OperationType.RUNTIME_DISCOVERY))
