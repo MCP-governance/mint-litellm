@@ -48,6 +48,10 @@
 | `mint-litellm policy activate` | `admin` | 정책 번들을 검증하고 정책 엔진에 적재한 뒤 활성 판본으로 전환한다. | - | `policy_activated` |
 | `mint-litellm ledger list` | 모든 역할 | 원장 사건을 종류·기간·호출 식별자로 조회한다. | - | - |
 
+## 정책 활성화 실패와 복원
+
+`policy activate`가 시간 초과나 취소로 끝나면 이전 활성 번들을 복원하려고 시도하며, 결과를 `restore_outcome` 필드에 담는다(`--json`). 성공하면 값은 `null`이다. 복원도 확인하지 못했다면 그 사실이 필드에 남으므로 운영자가 현재 적재된 번들을 `status`로 다시 확인해야 한다.
+
 ## 서버와 승인의 활성화 순서
 
 1. LiteLLM에 서버를 구성한다. 설정 서버는 `server_id`를 명시한다.
@@ -154,7 +158,7 @@
 
 ## 집행 점검 상태
 
-`status`는 워커마다 가장 최근의 `enforcement_verified`·`enforcement_unverified` 사건을 읽어 통과 여부, 실패와 원인, 마지막 전환 시각, 허용 목록 사용 여부를 보여 준다. 표시는 「최근 전환」이며, 그 워커가 지금 살아 있다는 뜻이 아니다. 허용 사전 훅은 `status`를 실행하는 환경의 `MINT_ALLOWED_PRE_HOOKS`(쉼표로 구분한 클래스 이름)를 그대로 보여 준다.
+`status`는 워커마다 가장 최근의 `enforcement_verified`·`enforcement_unverified` 사건을 읽어 통과 여부, 실패와 원인, 마지막 전환 시각, 그 전환을 일으킨 실행 식별자, 허용 목록 사용 여부를 보여 준다. 재시작한 워커는 같은 워커 식별자의 기록이 한 줄로 합쳐지며, 다른 워커의 기록이 밀려나지 않는다. 표시는 「최근 전환」이며, 그 워커가 지금 살아 있다는 뜻이 아니다. 허용 사전 훅은 `status`를 실행하는 환경의 `MINT_ALLOWED_PRE_HOOKS`(쉼표로 구분한 클래스 이름)를 그대로 보여 준다.
 
 ## 설정 조각과 기동 전 검사
 
