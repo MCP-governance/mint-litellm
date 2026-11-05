@@ -626,11 +626,10 @@ def add_event(mint, kind, source_key, payload, seconds_ago=0):
 
 def test_status_shows_the_latest_enforcement_state_per_worker(mint):
     boss = bootstrap(mint)
-    mint.env["MINT_ALLOWED_PRE_HOOKS"] = "ZHook, AHook,AHook"
     code, out, _ = mint.run("--json", "status", token=boss)
     first = json.loads(out)
     assert code == 0 and first["enforcement"] == []
-    assert first["allowed_pre_hooks"] == ["AHook", "ZHook"]
+    assert "allowed_pre_hooks" not in first
     add_event(mint, "enforcement_unverified", "selfcheck:r1:1:enforcement_unverified",
               {"worker_id": "w1", "cause": "callbacks_changed", "hooks": ["Other"]}, 300)
     add_event(mint, "enforcement_verified", "selfcheck:r2:1:enforcement_verified",
@@ -642,13 +641,13 @@ def test_status_shows_the_latest_enforcement_state_per_worker(mint):
                                               "detail": "bad row"}]}, 50)
     code, out, _ = mint.run("--json", "status", token=boss)
     states = {s["worker_id"]: s for s in json.loads(out)["enforcement"]}
-    assert states["w1"]["passed"] is True and states["w1"]["allowed_hooks_used"] is True
+    assert states["w1"]["passed"] is True
     assert states["w2"]["passed"] is False and states["w2"]["cause"] == "startup_check"
     assert states["w2"]["failed"][0]["detail"] == "bad row"
     assert states["w2"]["last_transition_at"] > states["w1"]["last_transition_at"]
     code, out, _ = mint.run("status", token=boss)
-    assert "허용 사전 훅: AHook, ZHook" in out and "워커가 살아 있다는 뜻은 아님" in out
-    assert "w1: 통과 (허용 목록 사용)" in out and "w2: 실패 (startup_check)" in out
+    assert "허용 사전 훅" not in out and "워커가 살아 있다는 뜻은 아님" in out
+    assert "w1: 통과" in out and "w2: 실패 (startup_check)" in out
     assert "REQUIRED_SETTINGS: bad row" in out
     # 가장 최근 전환만 보인다: w1은 실패 뒤 통과로 돌아왔으므로 통과이다
     add_event(mint, "enforcement_unverified", "selfcheck:r5:1:enforcement_unverified",

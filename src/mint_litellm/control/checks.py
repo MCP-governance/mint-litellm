@@ -373,7 +373,7 @@ def _check_keys_and_teams(
     if subjects:
         report.add("가드레일 제외 대상", Level.WARN,
                    f"MINT 가드레일을 제외했거나 전역 가드레일을 끈 키·팀이 {subjects}개 있습니다. "
-                   "이 키·팀은 MCP를 호출할 수 없게 됩니다.")
+                   "이 키·팀도 MINT 로거가 판정하며 가드레일 전용 기능만 적용되지 않습니다.")
     bad: list[str] = []
     for owner, kind, objects in (("키", "key", keys), ("팀", "team", teams)):
         for obj in objects:

@@ -120,7 +120,7 @@
 | --- | --- |
 | `init` | `migrations`(이번에 적용한 마이그레이션), `login_roles`(설정한 로그인 역할), `snippet_path`(설정 조각 파일) 또는 `snippet`(`--out -`일 때 본문) |
 | `check` | `incomplete`(확인하지 못한 필수 행), `findings`(각 항목 `item`, `level`=`OK`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
-| `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `policy_bundle`(`state`: `match`·`mismatch`·`unverified`·`none`, `detail`), `servers`(상태별 개수), `enforcement`(워커별 최근 집행 점검 전환: `worker_id`, `passed`, `cause`, `failed`, `hooks`, `allowed_hooks_used`, `last_transition_at`), `allowed_pre_hooks`(`MINT_ALLOWED_PRE_HOOKS`), `alerts`, `observations` |
+| `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `policy_bundle`(`state`: `match`·`mismatch`·`unverified`·`none`, `detail`), `servers`(상태별 개수), `enforcement`(워커별 최근 집행 점검 전환: `worker_id`, `passed`, `cause`, `failed`, `hooks`, `last_transition_at`, `run_id`), `alerts`, `observations` |
 | `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`) |
 
 ## 종료 코드
@@ -158,7 +158,7 @@
 
 ## 집행 점검 상태
 
-`status`는 워커마다 가장 최근의 `enforcement_verified`·`enforcement_unverified` 사건을 읽어 통과 여부, 실패와 원인, 마지막 전환 시각, 그 전환을 일으킨 실행 식별자, 허용 목록 사용 여부를 보여 준다. 재시작한 워커는 같은 워커 식별자의 기록이 한 줄로 합쳐지며, 다른 워커의 기록이 밀려나지 않는다. 표시는 「최근 전환」이며, 그 워커가 지금 살아 있다는 뜻이 아니다. 허용 사전 훅은 `status`를 실행하는 환경의 `MINT_ALLOWED_PRE_HOOKS`(쉼표로 구분한 클래스 이름)를 그대로 보여 준다.
+`status`는 워커마다 가장 최근의 `enforcement_verified`·`enforcement_unverified` 사건을 읽어 통과 여부, 실패와 원인, 마지막 전환 시각, 그 전환을 일으킨 실행 식별자를 보여 준다. 재시작한 워커는 같은 워커 식별자의 기록이 한 줄로 합쳐지며, 다른 워커의 기록이 밀려나지 않는다. 표시는 「최근 전환」이며, 그 워커가 지금 살아 있다는 뜻이 아니다.
 
 ## 설정 조각과 기동 전 검사
 

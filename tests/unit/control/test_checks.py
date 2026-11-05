@@ -390,7 +390,7 @@ def test_the_mint_guardrail_name_comes_from_the_config(healthy, stub):
     report = run(config, healthy)
     assert report.observations["guardrail_optout_subjects"] == 3  # 이름이 다른 'mint'는 해당 없음
     message = next(f.message for f in report.findings if f.item == "가드레일 제외 대상")
-    assert "MCP를 호출할 수 없게 됩니다" in message
+    assert "호출할 수 없게" not in message and "판정하며" in message
 
 
 @pytest.mark.parametrize(
