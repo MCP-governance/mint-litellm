@@ -301,21 +301,56 @@ def _previous_path(path: Path) -> Path:
     return path.with_name(path.name + ".previous")
 
 
+def _archive_identity(data: bytes) -> tuple[str, str] | None:
+    """아카이브 메타의 (판본 ID, 내용 해시). 메타가 실제 내용과 다르거나 읽을 수 없으면 None."""
+    try:
+        modules: dict[str, bytes] = {}
+        documents: dict[str, object] = {}
+        meta = None
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                body = archive.extractfile(member).read()
+                if member.name == META_FILE:
+                    meta = json.loads(body)
+                elif member.name.endswith(".json"):
+                    documents[member.name] = parse_data_json(body)
+                else:
+                    modules[member.name] = body
+        identity = (meta["policy_version_id"], meta["bundle_sha256"])
+        if bundle_content_sha256(modules, documents) != identity[1]:
+            return None
+    except (tarfile.TarError, OSError, KeyError, ValueError, TypeError, AttributeError):
+        return None
+    return identity if all(isinstance(part, str) for part in identity) else None
+
+
 def publish_bundle(path: Path, archive: bytes) -> None:
-    """번들을 원자적으로 게시한다. 이미 게시된 파일은 `<이름>.previous`로 보관한다."""
+    """번들을 원자적으로 게시한다."""
+    _write_atomic(path.resolve(), archive)
+
+
+def keep_active_bundle(path: Path, version_id: str, active_sha: str) -> None:
+    """게시 전에 현재 파일이 활성 판본의 온전한 번들이면 `<이름>.previous`로 보관한다.
+
+    현재 파일이 활성 판본이 아니면(실패한 게시가 남은 경우 등) 기존 보관본을 건드리지 않는다.
+    """
     path = path.resolve()
     if path.is_file():
-        _write_atomic(_previous_path(path), path.read_bytes())
-    _write_atomic(path, archive)
+        data = path.read_bytes()
+        if _archive_identity(data) == (version_id, active_sha):
+            _write_atomic(_previous_path(path), data)
 
 
-def restore_bundle(path: Path) -> bool:
-    """보관한 이전 번들을 원자적으로 되돌린다. 보관본이 없으면 False."""
+def restore_bundle(path: Path, version_id: str, active_sha: str) -> bool:
+    """활성 판본과 판본 ID·내용이 같은 온전한 보관본이 있을 때만 원자적으로 되돌린다."""
     path = path.resolve()
     previous = _previous_path(path)
     if not previous.is_file():
         return False
-    _write_atomic(path, previous.read_bytes())
+    data = previous.read_bytes()
+    if _archive_identity(data) != (version_id, active_sha):
+        return False
+    _write_atomic(path, data)
     return True
 
 
@@ -337,26 +372,58 @@ class _Served:
 
 RESTORED = "restored"
 NOT_RESTORED_NO_ACTIVE = "not restored: no active version"
-NOT_RESTORED_NO_COPY = "not restored: no previous bundle file"
+NOT_RESTORED_NO_COPY = "not restored: no verified copy of the active bundle"
+NOT_RESTORED_COMMITTED = "not restored: activation was committed"
+NOT_RESTORED_UNKNOWN = "not restored: connection lost, commit result unknown"
+RESTORE_INTERRUPTED = "restore interrupted"
 
 
-async def _restore_previous(
-    restore: Callable[[], Awaitable[bool]],
-    previous: "_Served | None",
+def _attach(exc: BaseException, outcome: str) -> None:
+    exc.restore_outcome = outcome
+    exc.add_note(f"previous bundle: {outcome}")
+
+
+async def _recover(
+    conn,
+    instance_id: str,
+    bundle: "PreparedBundle",
+    restore: Callable[[str, str], Awaitable[bool]],
     opa_url: str,
-    budget: float,
+    deadline: float,
 ) -> str:
-    """이전 활성 번들을 되돌리고 OPA가 그 메타와 내용을 다시 서빙하는지 확인한다."""
-    if previous is None:
-        return NOT_RESTORED_NO_ACTIVE
+    """실패 뒤 잠금 안에서 DB의 활성 판본을 다시 읽고, 그 판본의 번들로 되돌려 확인한다.
+
+    커밋 결과가 불명인 경우에도 DB가 새 판본을 활성으로 보이면 되돌리지 않는다.
+    """
+    loop = asyncio.get_running_loop()
     try:
-        if not await restore():
-            return NOT_RESTORED_NO_COPY
-        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
-            await _wait_until_loaded(client, opa_url, previous, max(budget, 0.1))
+        if conn.closed or conn.broken:
+            return NOT_RESTORED_UNKNOWN
+        async with asyncio.timeout_at(deadline), conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (instance_id,)
+            )
+            cursor = await conn.execute(
+                "SELECT id, bundle_sha256 FROM mint.policy_versions "
+                "WHERE instance_id = %s AND status = 'active'", (instance_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return NOT_RESTORED_NO_ACTIVE
+            active = _Served(*row)
+            if (active.policy_version_id, active.bundle_sha256) == (
+                bundle.policy_version_id, bundle.bundle_sha256
+            ):
+                return NOT_RESTORED_COMMITTED
+            if not await restore(active.policy_version_id, active.bundle_sha256):
+                return NOT_RESTORED_NO_COPY
+            async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
+                await _wait_until_loaded(
+                    client, opa_url, active, max(deadline - loop.time(), 0.1)
+                )
+            return RESTORED
     except Exception as exc:
         return f"restore failed: {type(exc).__name__}: {exc}"
-    return RESTORED
 
 
 async def _wait_until_loaded(
@@ -398,54 +465,72 @@ async def activate_bundle(
     publish: Callable[[bytes], Awaitable[None]],
     opa_url: str,
     timeout_seconds: float,
-    restore: Callable[[], Awaitable[bool]] | None = None,
+    keep: Callable[[str, str], Awaitable[None]] | None = None,
+    restore: Callable[[str, str], Awaitable[bool]] | None = None,
 ) -> None:
     """번들을 게시하고 활성화한다.
 
-    ``restore``를 주면 게시 뒤 어느 단계에서든 실패할 때 이전 활성 번들로 되돌리고 OPA가
-    다시 서빙하는지 확인한다. 결과는 던져지는 예외의 ``restore_outcome``과 노트에 담긴다.
+    ``keep(판본 ID, 해시)``는 게시 직전에, ``restore(판본 ID, 해시)``는 실패 뒤에 호출된다.
+    ``restore``를 주면 게시를 시작한 뒤의 실패(적재 불일치·시간 초과·취소·DB 확정 실패)에서
+    잠금 안에서 DB의 활성 판본을 다시 읽어 그 번들로 되돌리고 OPA가 다시 서빙하는지 확인한다.
+    결과는 던져지는 예외(취소 포함)의 ``restore_outcome``과 노트에 담긴다. 활성 판본과 내용이
+    같은 보관본이 없거나, 연결이 끊겨 커밋 결과를 알 수 없거나, DB가 이미 새 판본을 활성으로
+    보이면 되돌리지 않는다. 복원 시간은 전체 제한(``timeout_seconds``) 안에서 먼저 떼어 둔다.
     """
     if timeout_seconds <= 0 or not actor:
         raise ValueError("invalid activation parameters")
-    async with asyncio.timeout(timeout_seconds), conn.transaction():
-        await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (instance_id,))
-        cursor = await conn.execute(
-            "SELECT catalog_sha256, bundle_sha256, status FROM mint.policy_versions "
-            "WHERE instance_id = %s AND id = %s FOR UPDATE",
-            (instance_id, bundle.policy_version_id),
-        )
-        row = await cursor.fetchone()
-        if row != (bundle.catalog_sha256, bundle.bundle_sha256, "validated"):
-            raise ValueError("policy version does not match validated bundle")
-        await conn.execute(
-            "UPDATE mint.policy_versions SET status = 'staged' WHERE instance_id = %s AND id = %s",
-            (instance_id, bundle.policy_version_id),
-        )
-        cursor = await conn.execute(
-            "SELECT id, bundle_sha256 FROM mint.policy_versions "
-            "WHERE instance_id = %s AND status = 'active'", (instance_id,)
-        )
-        active = await cursor.fetchone()
-        previous = _Served(*active) if active else None
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_seconds
-        tail = min(0.5, timeout_seconds / 5)
-        try:
-            await publish(bundle.archive)
-            async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
-                await _wait_until_loaded(
-                    client, opa_url, bundle,
-                    (timeout_seconds - tail) * (0.7 if restore else 1),
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    tail = min(0.5, timeout_seconds / 5)
+    reserve = max(tail, timeout_seconds * 0.3) if restore else tail
+    published = False
+    try:
+        async with conn.transaction():
+            async with asyncio.timeout_at(deadline):
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (instance_id,)
                 )
+                cursor = await conn.execute(
+                    "SELECT catalog_sha256, bundle_sha256, status FROM mint.policy_versions "
+                    "WHERE instance_id = %s AND id = %s FOR UPDATE",
+                    (instance_id, bundle.policy_version_id),
+                )
+                row = await cursor.fetchone()
+                if row != (bundle.catalog_sha256, bundle.bundle_sha256, "validated"):
+                    raise ValueError("policy version does not match validated bundle")
+                await conn.execute(
+                    "UPDATE mint.policy_versions SET status = 'staged' "
+                    "WHERE instance_id = %s AND id = %s",
+                    (instance_id, bundle.policy_version_id),
+                )
+                cursor = await conn.execute(
+                    "SELECT id, bundle_sha256 FROM mint.policy_versions "
+                    "WHERE instance_id = %s AND status = 'active'", (instance_id,)
+                )
+                active = await cursor.fetchone()
+                if keep is not None and active is not None:
+                    await keep(*active)
+            published = True
+            async with asyncio.timeout_at(deadline - reserve):
+                await publish(bundle.archive)
+                async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
+                    await _wait_until_loaded(
+                        client, opa_url, bundle, max(deadline - reserve - loop.time() - 0.1, 0.001)
+                    )
             await _switch_active(conn, instance_id, actor, bundle)
-        except Exception as exc:
-            if restore is not None:
-                outcome = await _restore_previous(
-                    restore, previous, opa_url, deadline - loop.time() - tail / 2
+    except BaseException as exc:
+        if restore is not None and published:
+            try:
+                outcome = await _recover(
+                    conn, instance_id, bundle, restore, opa_url,
+                    max(deadline, loop.time() + 1.0),
                 )
-                exc.restore_outcome = outcome
-                exc.add_note(f"previous bundle: {outcome}")
-            raise
+            except asyncio.CancelledError as cancelled:
+                _attach(cancelled, RESTORE_INTERRUPTED)
+                _attach(exc, RESTORE_INTERRUPTED)
+                raise
+            _attach(exc, outcome)
+        raise
 
 
 async def _switch_active(conn, instance_id: str, actor: str, bundle: PreparedBundle) -> None:
@@ -487,7 +572,8 @@ async def retry_activation(
     publish: Callable[[bytes], Awaitable[None]],
     opa_url: str,
     timeout_seconds: float,
-    restore: Callable[[], Awaitable[bool]] | None = None,
+    keep: Callable[[str, str], Awaitable[None]] | None = None,
+    restore: Callable[[str, str], Awaitable[bool]] | None = None,
 ) -> None:
     """게시 후 DB 전환이 실패한 validated 판본을 다시 게시하고 활성화한다."""
     await activate_bundle(
@@ -498,5 +584,6 @@ async def retry_activation(
         publish=publish,
         opa_url=opa_url,
         timeout_seconds=timeout_seconds,
+        keep=keep,
         restore=restore,
     )
