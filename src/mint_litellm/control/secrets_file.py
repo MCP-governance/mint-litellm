@@ -13,9 +13,26 @@ VERSION_NAME = "MINT_FINGERPRINT_KEY_VERSION"
 DEFAULT_PATH = "~/.config/mint/secrets.env"
 
 
-def _values(path: Path) -> dict[str, str]:
+def _read_private(path: Path) -> str:
+    """비밀 파일을 읽는다. 링크는 따르지 않고, 열린 기술자의 권한이 0600이 아니면 거부한다."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise ControlError(
+            f"비밀 파일 {path}을(를) 열 수 없습니다(심볼릭 링크는 허용하지 않습니다): {error}"
+        ) from None
+    with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        if os.name != "nt" and stat.S_IMODE(os.fstat(handle.fileno()).st_mode) != 0o600:
+            raise ControlError(
+                f"비밀 파일 {path}의 권한이 0600이 아닙니다. 키가 노출되었을 수 있으니 권한을 "
+                "0600으로 고치고 키 노출 여부를 확인하십시오(자동으로 고치지 않습니다)."
+            )
+        return handle.read()
+
+
+def _parse(text: str) -> dict[str, str]:
     found: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         name, sep, value = line.partition("=")
         if sep and not line.lstrip().startswith("#"):
             found[name.strip()] = value.strip()
@@ -24,17 +41,24 @@ def _values(path: Path) -> dict[str, str]:
 
 def _check_existing(path: Path) -> bool:
     """이미 있는 파일을 검사한다. 키가 있으면 True, 권한이 0600이 아니거나 키가 없으면 실패한다."""
-    if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != 0o600:
-        raise ControlError(
-            f"비밀 파일 {path}의 권한이 0600이 아닙니다. 키가 노출되었을 수 있으니 권한을 "
-            "0600으로 고치고 키 노출 여부를 확인하십시오(자동으로 고치지 않습니다)."
-        )
-    if not _values(path).get(KEY_NAME):
+    if not _parse(_read_private(path)).get(KEY_NAME):
         raise ControlError(
             f"비밀 파일 {path}에 {KEY_NAME}가 없습니다. 파일을 덮어쓰지 않으므로 키를 직접 "
             "추가하거나 파일을 지운 뒤 다시 실행하십시오."
         )
     return True
+
+
+def _prepare_directory(directory: Path) -> None:
+    """디렉터리가 없으면 0700으로 만들고, 있으면(동시에 만들어진 경우 포함) 쓰기 권한만 확인한다."""
+    if directory.is_symlink():
+        raise ControlError(f"비밀 파일의 디렉터리 {directory}가 심볼릭 링크입니다.")
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if os.name != "nt" and directory.stat().st_mode & 0o022:
+        raise ControlError(
+            f"비밀 파일의 디렉터리 {directory}를 다른 사용자가 쓸 수 있습니다. "
+            "권한을 0700으로 고치십시오(자동으로 고치지 않습니다)."
+        )
 
 
 def ensure_fingerprint_key(path: Path) -> bool:
@@ -45,10 +69,10 @@ def ensure_fingerprint_key(path: Path) -> bool:
     디렉터리의 소유자에게 소유권을 넘겨 컨테이너 밖의 사용자가 읽을 수 있게 한다.
     """
     path = path.expanduser()
-    if path.exists():
+    if os.path.lexists(path):
         _check_existing(path)
         return False
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_directory(path.parent)
     temp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -79,8 +103,8 @@ def load_fingerprint_key(environ: Mapping[str, str], path: Path | None = None) -
     version = environ.get(VERSION_NAME)
     if not key:
         source = (path or Path(environ.get("MINT_SECRETS_FILE") or DEFAULT_PATH)).expanduser()
-        if source.exists():
-            values = _values(source)
+        if os.path.lexists(source):
+            values = _parse(_read_private(source))
             key, version = values.get(KEY_NAME), version or values.get(VERSION_NAME)
     if not key:
         raise ControlError(

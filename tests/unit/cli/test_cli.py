@@ -532,3 +532,82 @@ def test_call_approval_request_needs_a_key_or_a_ready_fingerprint(mint):
     assert code == 1 and "인자 지문을 계산할 수 없습니다" in err
     code, _, err = mint.run(*base, "--arguments", "[1]", token=boss)
     assert code == 1
+
+
+def activate_policy(mint, digest):
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        conn.execute(
+            "INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256, bundle_sha256)"
+            " VALUES ('clitest', 'v1', %s, %s)", ("a" * 64, digest))
+        for status in ("staged", "active"):
+            conn.execute("UPDATE mint.policy_versions SET status = %s, activated_at = now(),"
+                         " activated_by = 'x' WHERE id = 'v1'", (status,))
+        conn.commit()
+
+
+def test_status_and_check_exit_codes_follow_the_policy_bundle_comparison(mint):
+    from fake_opa import FakeOpa, expected_hash
+
+    boss = bootstrap(mint)
+    config = mint.tmp / "config.yaml"
+    mint.run("init", "--out", str(config))
+    activate_policy(mint, expected_hash())
+    opa = FakeOpa()
+    try:
+        mint.env["MINT_OPA_URL"] = opa.url
+        code, out, _ = mint.run("--json", "status", token=boss)
+        assert code == 0 and json.loads(out)["ok"] is True
+        assert json.loads(out)["policy_bundle"]["state"] == "match"
+        code, out, _ = mint.run("--json", "check", "--config", str(config), token=boss)
+        policy = [f for f in json.loads(out)["findings"] if f["item"] == "정책 번들 내용"]
+        assert [f["level"] for f in policy] == ["OK"]
+
+        opa.rules += "# 적재 뒤에 바뀐 규칙\n"  # 등록된 해시와 달라진다
+        code, out, err = mint.run("--json", "status", token=boss)
+        result = json.loads(out)
+        assert code == 1 and result["ok"] is False and "다릅니다" in err
+        assert result["policy_bundle"]["state"] == "mismatch"
+        code, out, _ = mint.run("--json", "check", "--config", str(config), token=boss)
+        policy = [f for f in json.loads(out)["findings"] if f["item"] == "정책 번들 내용"]
+        assert code == 1 and [f["level"] for f in policy] == ["FAIL"]
+    finally:
+        opa.close()
+    # 정책 엔진을 읽지 못하면 확인하지 못한 것이다
+    mint.env["MINT_OPA_URL"] = "http://localhost:9"
+    code, out, err = mint.run("--json", "status", token=boss)
+    result = json.loads(out)
+    assert code == 3 and result["ok"] is False and result["policy_bundle"]["state"] == "unverified"
+    assert "확인하지 못했습니다" in err
+    mint.env.pop("MINT_OPA_URL")
+    code, out, _ = mint.run("--json", "status", token=boss)
+    assert code == 3 and json.loads(out)["ok"] is False
+    code, out, _ = mint.run("--json", "check", "--config", str(config), token=boss)
+    result = json.loads(out)
+    assert "정책 번들 내용" in result["incomplete"]
+
+
+def test_status_without_an_active_policy_still_succeeds(mint):
+    boss = bootstrap(mint)
+    code, out, _ = mint.run("--json", "status", token=boss)
+    assert code == 0 and json.loads(out)["ok"] is True
+
+
+def test_the_fingerprint_key_file_must_be_private_and_the_arguments_file_readable(mint):
+    import os
+
+    from mint_litellm.control import secrets_file
+
+    boss = bootstrap(mint)
+    path = mint.tmp / "loose.env"
+    secrets_file.ensure_fingerprint_key(path)
+    mint.env["MINT_SECRETS_FILE"] = str(path)
+    base = ["call-approval", "request", "--org", "acme", "--principal-type", "user",
+            "--principal-id", "alice", "--server", "ctl-everything", "--tool", "echo"]
+    code, _, err = mint.run(*base, "--arguments", "{}", token=boss)
+    assert "0600" not in err  # 권한이 맞으면 키 때문에 거부하지 않는다(다른 이유로 실패할 수 있다)
+    if os.name != "nt":
+        path.chmod(0o644)
+        code, _, err = mint.run(*base, "--arguments", "{}", token=boss)
+        assert code == 1 and "0600" in err
+    code, _, err = mint.run(*base, "--args-file", str(mint.tmp / "missing.json"), token=boss)
+    assert code == 1 and "인자 지문을 계산할 수 없습니다" in err and "Traceback" not in err

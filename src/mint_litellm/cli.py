@@ -253,6 +253,12 @@ def _status(run: Run) -> None:
     )
     run.data.update(info)
     run.say(status.render(info))
+    state = info["policy_bundle"]["state"] if info.get("policy_bundle") else "none"
+    if state == "mismatch":
+        run.failure = "활성 정책 판본의 번들 내용이 정책 엔진에 적재된 내용과 다릅니다."
+    elif state == "unverified":
+        run.failure = "활성 정책 판본의 번들 내용을 확인하지 못했습니다."
+        run.failure_code = 3
 
 
 def _issued(run: Run, token: str) -> None:
@@ -420,8 +426,8 @@ def _fingerprint(run: Run) -> tuple[str, int]:
     a = run.args
     if a.args_fp:
         return a.args_fp, a.fp_key_version or 1
-    text = a.arguments if a.arguments is not None else Path(a.args_file).read_text("utf-8")
     try:
+        text = a.arguments if a.arguments is not None else Path(a.args_file).read_text("utf-8")
         arguments = json.loads(text)
         key_text, version = secrets_file.load_fingerprint_key(run.environ)
         key = fingerprint.decode_fingerprint_key(key_text)

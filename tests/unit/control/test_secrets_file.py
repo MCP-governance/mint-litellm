@@ -66,25 +66,34 @@ def test_an_existing_file_without_a_key_fails_instead_of_being_overwritten(tmp_p
     assert path.read_text(encoding="utf-8") == "OTHER=1\n"
 
 
-def test_concurrent_initializations_leave_exactly_one_key(tmp_path):
+def test_concurrent_initializations_leave_exactly_one_key(tmp_path, monkeypatch):
+    """모든 실행이 ``파일 없음``을 본 상태에서 게시 직전에 함께 멈췄다가 동시에 게시한다."""
     path = tmp_path / "mint" / "secrets.env"
+    count = 8
+    gate = threading.Barrier(count, timeout=10)
+    real_link = os.link
+
+    def link_after_everyone_is_ready(source, target):
+        gate.wait()
+        return real_link(source, target)
+
+    monkeypatch.setattr(secrets_file.os, "link", link_after_everyone_is_ready)
     results: list[object] = []
-    start = threading.Barrier(8)
 
     def run():
-        start.wait()
         try:
             created = secrets_file.ensure_fingerprint_key(path)
             results.append((created, read(path)["MINT_FINGERPRINT_KEY"]))
-        except ControlError as error:
+        except Exception as error:  # noqa: BLE001
             results.append(error)
 
-    threads = [threading.Thread(target=run) for _ in range(8)]
+    threads = [threading.Thread(target=run) for _ in range(count)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(20)
-    assert all(isinstance(r, tuple) for r in results), results
+    assert not any(t.is_alive() for t in threads)
+    assert len(results) == count and all(isinstance(r, tuple) for r in results), results
     assert sum(1 for created, _ in results if created) == 1
     assert len({key for _, key in results}) == 1  # 모두 같은 키를 읽었다
     assert [p.name for p in path.parent.iterdir()] == ["secrets.env"]
@@ -95,3 +104,45 @@ def test_two_deployments_get_different_keys(tmp_path):
     secrets_file.ensure_fingerprint_key(first)
     secrets_file.ensure_fingerprint_key(second)
     assert read(first)["MINT_FINGERPRINT_KEY"] != read(second)["MINT_FINGERPRINT_KEY"]
+
+
+@POSIX
+def test_loading_a_key_from_a_file_applies_the_same_permission_check(tmp_path):
+    path = tmp_path / "secrets.env"
+    secrets_file.ensure_fingerprint_key(path)
+    key, version = secrets_file.load_fingerprint_key({}, path)
+    assert key and version == 1
+    path.chmod(0o644)
+    with pytest.raises(ControlError, match="0600"):
+        secrets_file.load_fingerprint_key({}, path)
+    assert secrets_file.load_fingerprint_key({"MINT_FINGERPRINT_KEY": "from-env"}, path)[0] == (
+        "from-env")  # 환경 변수로 받은 키는 파일을 읽지 않는다
+
+
+@POSIX
+def test_symbolic_links_are_refused_for_the_file_and_its_directory(tmp_path):
+    real = tmp_path / "real.env"
+    secrets_file.ensure_fingerprint_key(real)
+    link = tmp_path / "link.env"
+    link.symlink_to(real)
+    with pytest.raises(ControlError, match="심볼릭 링크"):
+        secrets_file.load_fingerprint_key({}, link)
+    with pytest.raises(ControlError, match="심볼릭 링크"):
+        secrets_file.ensure_fingerprint_key(link)
+    directory_link = tmp_path / "dir-link"
+    directory_link.symlink_to(tmp_path)
+    with pytest.raises(ControlError, match="심볼릭 링크"):
+        secrets_file.ensure_fingerprint_key(directory_link / "new.env")
+
+
+@POSIX
+def test_the_directory_is_created_private_and_shared_directories_are_refused(tmp_path):
+    created = tmp_path / "a" / "b"
+    secrets_file.ensure_fingerprint_key(created / "secrets.env")
+    assert stat.S_IMODE(created.stat().st_mode) == 0o700
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    with pytest.raises(ControlError, match="다른 사용자가 쓸 수"):
+        secrets_file.ensure_fingerprint_key(shared / "secrets.env")
+    assert not (shared / "secrets.env").exists()

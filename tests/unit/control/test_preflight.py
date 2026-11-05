@@ -140,3 +140,46 @@ def test_the_entrypoint_refuses_when_the_check_module_is_absent(tmp_path):
     path = write(tmp_path, good_text())
     result, started = start(tmp_path, ["--config", str(path)], python_ok=False)
     assert result.returncode != 0 and not started
+
+
+def bad_config(tmp_path) -> Path:
+    config = yaml.safe_load(good_text())
+    config.pop("guardrails")
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    return path
+
+
+@bash
+@pytest.mark.parametrize("order", ["good-first", "bad-first"])
+@pytest.mark.parametrize(
+    "flags", [("--config", "-c"), ("-c", "--config"), ("--config", "--config")]
+)
+def test_two_configuration_arguments_are_refused_whatever_their_form(tmp_path, order, flags):
+    good, bad = write(tmp_path, good_text()), bad_config(tmp_path)
+    first, second = (good, bad) if order == "good-first" else (bad, good)
+    result, started = start(tmp_path, [flags[0], str(first), flags[1], str(second)])
+    assert result.returncode != 0 and not started
+    assert "둘 이상" in result.stderr
+
+
+@bash
+def test_every_single_configuration_form_checks_the_file_it_starts_with(tmp_path):
+    good, bad = write(tmp_path, good_text()), bad_config(tmp_path)
+    for index, form in enumerate((["-c", "{}"], ["--config", "{}"], ["--config={}"], ["-c{}"])):
+        for path, should_start in ((good, True), (bad, False)):
+            args = [part.format(path) for part in form] + ["--port", "4000", "-v"]
+            sub = tmp_path / f"run{index}-{should_start}"
+            sub.mkdir()
+            result, started = start(sub, args)
+            assert started is should_start, (form, result.stderr)
+            assert (result.returncode == 0) is should_start
+
+
+@bash
+def test_unparseable_or_incomplete_configuration_arguments_are_refused(tmp_path):
+    good = write(tmp_path, good_text())
+    for args in (["--port", "4000", "-c"], ["-vc", str(good)], [f"--config={good}", "-ec"]):
+        result, started = start(tmp_path, args)
+        assert result.returncode != 0 and not started, args
+        (tmp_path / "start.log").unlink(missing_ok=True)

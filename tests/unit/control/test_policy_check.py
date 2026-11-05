@@ -1,54 +1,15 @@
 """활성 정책 판본의 내용 대조(check·status). 정책 엔진 응답은 OPA 1.21 형식의 고정 응답이다."""
 
-import json
-import socket
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from ctl_fixtures import INSTANCE
 
 pytest.importorskip("psycopg")
 
+from fake_opa import DATA, RULES, FakeOpa, expected_hash  # noqa: E402
+
 from mint_litellm.control import checks, policy_check  # noqa: E402
 from mint_litellm.control.checks import Level  # noqa: E402
-from mint_litellm.plugin.policy.bundle import DATA_FILE, bundle_content_sha256  # noqa: E402
-
-RULES = "package mint\n\ndefault allow := false\n"
-DATA = {"business_hours": {"tz": "UTC", "days": [1], "start": "09:00", "end": "18:00"}}
-
-
-class FakeOpa:
-    """정책 엔진이 번들 하나를 적재한 상태의 응답 세 가지를 돌려준다."""
-
-    def __init__(self, rules=RULES, data=None, bundles=None):
-        self.rules, self.data = rules, DATA if data is None else data
-        self.bundles = {"mint": {}} if bundles is None else bundles
-        outer = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
-                body = {
-                    "/v1/data/system/bundles": {"result": outer.bundles},
-                    "/v1/policies": {"result": [{"id": "mint/policy.rego", "raw": outer.rules}]},
-                    "/v1/data/mint/data": {"result": outer.data},
-                }.get(self.path)
-                payload = json.dumps(body if body is not None else {}).encode()
-                self.send_response(200 if body is not None else 404)
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-
-            def log_message(self, *args):
-                pass
-
-        self.server = ThreadingHTTPServer(("localhost", 0), Handler)
-        self.url = f"http://{socket.gethostbyname('localhost')}:{self.server.server_port}"
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
 
 
 @pytest.fixture
@@ -56,11 +17,6 @@ def opa():
     server = FakeOpa()
     yield server
     server.close()
-
-
-def expected_hash(rules=RULES, data=None):
-    document = DATA if data is None else data
-    return bundle_content_sha256({"policy.rego": rules}, {DATA_FILE: document})
 
 
 def activate(conn, digest):
