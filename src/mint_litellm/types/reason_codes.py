@@ -44,6 +44,8 @@ class Reason(StrEnum):
     ORG_BOUNDARY = "ORG_BOUNDARY"
     ANONYMOUS = "ANONYMOUS"
     ENFORCEMENT_UNVERIFIED = "ENFORCEMENT_UNVERIFIED"
+    # 판정한 인자와 전송 직전 인자가 다르다. 호출별 승인이 이미 소비됐을 수 있어 재시도하지 않는다.
+    ARGUMENTS_CHANGED = "ARGUMENTS_CHANGED"
 
 
 PARAMETERIZED_REASONS: frozenset[Reason] = frozenset(
