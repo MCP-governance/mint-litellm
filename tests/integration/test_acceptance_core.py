@@ -7,6 +7,7 @@
 import concurrent.futures
 import json
 import os
+import statistics
 import time
 from datetime import timedelta
 
@@ -365,10 +366,10 @@ def percentiles(samples: list[float]) -> tuple[float, float, float]:
     return tuple(samples[max(0, int(len(samples) * q) - 1)] for q in (0.5, 0.95, 0.99))
 
 
-def timed_calls(key: str, port: int, count: int, workers: int) -> list[float]:
-    def one(_):
+def timed_calls(key: str, ports: tuple[int, ...], count: int, workers: int) -> list[float]:
+    def one(index: int):
         started = time.perf_counter()
-        reply = support.rest_call(key, "a", "echo", {"text": "x"}, port=port)
+        reply = support.rest_call(key, "a", "echo", {"text": "x"}, port=ports[index % len(ports)])
         assert reply.status_code == 200, reply.text
         return (time.perf_counter() - started) * 1000
 
@@ -377,21 +378,25 @@ def timed_calls(key: str, port: int, count: int, workers: int) -> list[float]:
 
 
 def test_mint_overhead_percentiles(world, evidence, plain, approved):
-    """같은 스택에서 플러그인 적재(복제본 1)와 순정 이미지의 종단 지연 차이를 잰다."""
+    """같은 스택에서 플러그인 적재(복제본 2, 동시 8)와 순정 이미지(복제본당 같은 부하)의 지연 차이.
+
+    세 번 측정한 백분위의 중앙값으로 판정하고 원 측정값을 모두 출력한다.
+    """
     subject, _, _ = approved
     key = subject.key
-    timed_calls(key, plain, 20, 4)
-    timed_calls(key, support.LITELLM_PORTS[0], 20, 4)
-    rows = {}
-    for label, port in (("plain", plain), ("mint", support.LITELLM_PORTS[0])):
-        rows[label] = percentiles(timed_calls(key, port, 200, 8))
-    overhead = [m - p for m, p in zip(rows["mint"], rows["plain"], strict=True)]
-    print(
-        "latency_ms (p50, p95, p99) "
-        f"plain={tuple(round(v, 1) for v in rows['plain'])} "
-        f"mint={tuple(round(v, 1) for v in rows['mint'])} "
-        f"overhead={tuple(round(v, 1) for v in overhead)}"
-    )
+    timed_calls(key, (plain,), 20, 4)
+    timed_calls(key, support.LITELLM_PORTS, 20, 8)
+    rounds = []
+    for _ in range(3):
+        base = percentiles(timed_calls(key, (plain,), 100, 4))
+        mint = percentiles(timed_calls(key, support.LITELLM_PORTS, 200, 8))
+        rounds.append((base, mint))
+        print(
+            "latency_ms (p50, p95, p99) "
+            f"plain={tuple(round(v, 1) for v in base)} mint={tuple(round(v, 1) for v in mint)}"
+        )
+    overhead = [statistics.median(m[i] - b[i] for b, m in rounds) for i in range(3)]
+    print("overhead_ms (p50, p95, p99, median of rounds)", tuple(round(v, 1) for v in overhead))
     limits = [
         float(os.environ.get(n, d))
         for n, d in (("MINT_E_P50_MS", "30"), ("MINT_E_P95_MS", "100"), ("MINT_E_P99_MS", "300"))

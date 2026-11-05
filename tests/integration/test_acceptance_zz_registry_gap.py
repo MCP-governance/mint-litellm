@@ -33,6 +33,7 @@ def test_registered_server_missing_from_registry_stops_start_and_unverified_bloc
             "2",
         )
         output = done.stdout + done.stderr
+        assert done.returncode != 0, output[-600:]
         assert output.count("MINT 자가 점검 실패") == 2, output[-600:]
         assert "Stopping parent process" in output, output[-600:]
         print(
