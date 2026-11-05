@@ -8,7 +8,10 @@ LiteLLM의 표는 읽지 않는다.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+import contextlib
+import math
+import socket
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -388,9 +391,34 @@ class RegisteredServer:
     auth_type: str
 
 
+def _retrieve(task: asyncio.Future[Any]) -> None:
+    """버려진 작업의 결과를 읽어 「처리되지 않은 예외」 경고를 막는다."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _sever(conn: Any) -> None:
+    """연결의 소켓을 양방향으로 닫아 기다리던 읽기가 곧바로 실패하게 한다.
+
+    소켓 번호는 닫지 않는다. 이벤트 루프가 그 번호를 감시하는 중에 닫으면 일부 플랫폼의 선택기가
+    오류를 낸다. 서버가 응답하지 않아도 이쪽 상태만으로 읽기가 끝난다.
+    """
+    sock = socket.socket(fileno=conn.pgconn.socket)
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    finally:
+        sock.detach()
+
+
 @dataclass
 class PluginDatabase:
-    """판정 프로세스 전용 연결. 상태 표 조회와 사건 추가, 호출별 승인 소비만 한다."""
+    """판정 프로세스 전용 연결. 상태 표 조회와 사건 추가, 호출별 승인 소비만 한다.
+
+    DB가 응답하지 않아도 호출한 쪽의 시간 제한(판정 예산)에서 끝나도록 세 겹으로 건다.
+    서버 쪽 문장·잠금 제한(``statement_timeout``, ``lock_timeout``)은 ``acquire_timeout``과
+    같고, 연결 시도에는 ``connect_timeout``을 건다. 응답이 아예 없는 연결에는 두 제한이 소용없으므로
+    호출한 쪽이 기다리기를 그만두면 연결을 닫아 버린다(``_run``).
+    """
 
     dsn: str
     max_size: int = 8
@@ -404,11 +432,20 @@ class PluginDatabase:
                 if self._pool is None:
                     from psycopg_pool import AsyncConnectionPool
 
+                    milliseconds = max(10, int(self.acquire_timeout * 1000))
                     pool = AsyncConnectionPool(
                         self.dsn,
                         min_size=1,
                         max_size=self.max_size,
-                        kwargs={"autocommit": True},
+                        kwargs={
+                            "autocommit": True,
+                            # libpq는 2초보다 짧은 값을 2초로 본다.
+                            "connect_timeout": max(2, math.ceil(self.acquire_timeout)),
+                            "options": (
+                                f"-c statement_timeout={milliseconds}"
+                                f" -c lock_timeout={milliseconds}"
+                            ),
+                        },
                         open=False,
                         timeout=self.acquire_timeout,
                     )
@@ -420,6 +457,33 @@ class PluginDatabase:
         pool, self._pool = self._pool, None
         if pool is not None:
             await pool.close()
+
+    async def _run(self, work: Callable[[Any], Awaitable[Any]]) -> Any:
+        """연결을 빌려 ``work(conn)``을 돌린다.
+
+        호출한 쪽이 시간 초과나 취소로 기다리기를 그만두면 작업은 따로 정리한다. psycopg는 취소된
+        작업이 응답 없는 연결에서 질의 취소를 5초씩 두 번 기다리므로, 작업을 취소하지 않고 연결을
+        끊어 그 기다림 없이 실패하게 한다. 끊어진 연결은 풀이 버리고 새로 만든다. 연결을 아직 빌리지
+        못했다면 빌리는 일을 취소한다.
+        """
+        held: list[Any] = []
+
+        async def job() -> Any:
+            async with await self._connection() as conn:
+                held.append(conn)
+                return await work(conn)
+
+        task = asyncio.ensure_future(job())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if held:
+                with contextlib.suppress(Exception):
+                    _sever(held[0])
+            else:
+                task.cancel()
+            task.add_done_callback(_retrieve)
+            raise
 
     async def read_snapshot(self, query: SnapshotQuery) -> Snapshot:
         from psycopg import IsolationLevel
@@ -433,12 +497,15 @@ class PluginDatabase:
             "user_id": query.user_id,
             "team_id": query.team_id,
         }
-        async with await self._connection() as conn:
+
+        async def read(conn: Any) -> Any:
             await conn.set_isolation_level(IsolationLevel.REPEATABLE_READ)
             await conn.set_read_only(True)
             async with conn.transaction():
                 cursor = await conn.execute(SNAPSHOT_SQL, params)
-                row = await cursor.fetchone()
+                return await cursor.fetchone()
+
+        row = await self._run(read)
         if row is None:
             raise RuntimeError("snapshot query returned no row")
         return parse_snapshot(row[0])
@@ -446,7 +513,7 @@ class PluginDatabase:
     async def insert_event(self, event: Event, consume: ConsumeRequest | None = None) -> bool:
         from psycopg.types.json import Jsonb
 
-        async with await self._connection() as conn:
+        async def write(conn: Any) -> bool:
             await conn.set_isolation_level(None)
             await conn.set_read_only(False)
             async with conn.transaction():
@@ -484,14 +551,18 @@ class PluginDatabase:
                     )
                     if cursor.rowcount != 1:
                         raise ConsumptionLost
-        return inserted
+            return inserted
+
+        return await self._run(write)
 
     async def read_epoch(self, instance_id: str) -> int | None:
-        async with await self._connection() as conn:
+        async def read(conn: Any) -> Any:
             cursor = await conn.execute(
                 "SELECT epoch FROM mint.state_epoch WHERE instance_id = %s", (instance_id,)
             )
-            row = await cursor.fetchone()
+            return await cursor.fetchone()
+
+        row = await self._run(read)
         return None if row is None else row[0]
 
     async def has_negative_state(self, query: NegativeStateQuery) -> bool:
@@ -506,17 +577,22 @@ class PluginDatabase:
             "approval_id": query.approval_id,
             "relation_id": query.relation_id,
         }
-        async with await self._connection() as conn:
+
+        async def read(conn: Any) -> Any:
             cursor = await conn.execute(NEGATIVE_STATE_SQL, params)
-            row = await cursor.fetchone()
+            return await cursor.fetchone()
+
+        row = await self._run(read)
         return bool(row and row[0])
 
     async def registered_servers(self, instance_id: str) -> Sequence[RegisteredServer]:
-        async with await self._connection() as conn:
+        async def read(conn: Any) -> Any:
             cursor = await conn.execute(
                 "SELECT server_id, status, url_sha256, transport, auth_type"
                 " FROM mint.servers WHERE instance_id = %s ORDER BY server_id",
                 (instance_id,),
             )
-            rows = await cursor.fetchall()
+            return await cursor.fetchall()
+
+        rows = await self._run(read)
         return [RegisteredServer(*row) for row in rows]

@@ -3,6 +3,8 @@
 import asyncio
 import io
 import os
+import socket
+import time
 import uuid
 from pathlib import Path
 
@@ -723,3 +725,140 @@ def test_a_revoked_approval_blocks_a_call_through_the_real_snapshot(scenario, pl
     outcome = run(judge())
     assert not outcome.allowed and outcome.error.code == "MINT-APPROVAL-REVOKED"
     assert outcome.evidence is Evidence.DB
+
+
+LOOPBACK = socket.gethostbyname("localhost")
+
+
+class SilentProxy:
+    """데이터베이스 앞의 TCP 중계. ``silent``이면 연결은 열어 둔 채 양방향 전달을 멈춘다."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.target = (host, port)
+        self.silent = False
+        self.port = 0
+        self._server = None
+        self._writers: list = []
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._handle, LOOPBACK, 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+
+    async def _handle(self, reader, writer) -> None:
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_connection(*self.target)
+        except OSError:
+            writer.close()
+            return
+        self._writers += [writer, upstream_writer]
+
+        async def pump(source, sink) -> None:
+            try:
+                while data := await source.read(65536):
+                    while self.silent:
+                        await asyncio.sleep(0.02)
+                    sink.write(data)
+                    await sink.drain()
+            except (OSError, asyncio.CancelledError):
+                pass
+            finally:
+                sink.close()
+
+        await asyncio.gather(pump(reader, upstream_writer), pump(upstream_reader, writer))
+
+    async def close(self) -> None:
+        self._server.close()
+        for writer in self._writers:
+            writer.close()
+
+
+def through(proxy: SilentProxy, url: str) -> str:
+    params = conninfo_to_dict(url)
+    params["host"], params["port"] = LOOPBACK, str(proxy.port)
+    return make_conninfo(**params)
+
+
+def test_a_silent_database_ends_every_access_at_the_budget_and_recovers(scenario, plugin_database):
+    target = conninfo_to_dict(plugin_database)
+    proxy = SilentProxy(target.get("host", "localhost"), int(target.get("port", 5432)))
+
+    async def go():
+        await proxy.start()
+        db = database(through(proxy, plugin_database), max_size=2, acquire_timeout=1.0)
+        event = scenario.event()
+        try:
+            await db.read_snapshot(scenario.query())
+            proxy.silent = True
+            elapsed = {}
+            for name, call in (
+                ("snapshot", lambda: db.read_snapshot(scenario.query())),
+                ("insert", lambda: db.insert_event(event)),
+                ("epoch", lambda: db.read_epoch(scenario.iid)),
+                ("snapshot again", lambda: db.read_snapshot(scenario.query())),
+            ):
+                started = time.monotonic()
+                with pytest.raises((TimeoutError, Exception)) as raised:
+                    async with asyncio.timeout(0.4):
+                        await call()
+                elapsed[name] = time.monotonic() - started
+                assert not isinstance(raised.value, asyncio.CancelledError), name
+            proxy.silent = False
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    async with asyncio.timeout(1.0):
+                        return elapsed, await db.read_snapshot(scenario.query())
+                except Exception:
+                    assert time.monotonic() < deadline, "the pool did not recover"
+                    await asyncio.sleep(0.2)
+        finally:
+            await db.close()
+            await proxy.close()
+
+    elapsed, snap = run(go())
+    assert all(seconds < 1.5 for seconds in elapsed.values()), elapsed
+    assert snap.server.status == "approved"
+    assert scenario.conn.execute(
+        "SELECT count(*) FROM mint.events WHERE instance_id = %s", (scenario.iid,)
+    ).fetchone() in {(0,), (1,)}
+
+
+def test_a_call_to_a_silent_database_is_blocked_as_a_dependency_failure_at_the_budget(
+    scenario, plugin_database, tmp_path
+):
+    target = conninfo_to_dict(plugin_database)
+    proxy = SilentProxy(target.get("host", "localhost"), int(target.get("port", 5432)))
+
+    async def go():
+        await proxy.start()
+        live = database(through(proxy, plugin_database), max_size=2, acquire_timeout=0.4)
+        recorder = EvidenceRecorder(
+            live,
+            LocalBuffer(tmp_path / "buffer", 1024 * 1024),
+            budget_seconds=0.4,
+            instance_id=scenario.iid,
+            stderr=io.StringIO(),
+        )
+        deps = PipelineDeps(
+            config=config(tmp_path, instance_id=scenario.iid, decision_budget_seconds=0.4),
+            snapshots=live,
+            recorder=recorder,
+            evaluate=evaluator(version="pv1", bundle="2" * 64),
+            verified=lambda: True,
+        )
+        principal = user_principal(instance_id=scenario.iid)
+        try:
+            warm = await evaluate_request(request(principal), deps)
+            proxy.silent = True
+            started = time.monotonic()
+            outcome = await evaluate_request(request(principal), deps)
+            return warm, outcome, time.monotonic() - started
+        finally:
+            proxy.silent = False
+            await live.close()
+            await proxy.close()
+
+    warm, outcome, seconds = run(go())
+    assert warm.allowed
+    assert not outcome.allowed and outcome.error.code == "MINT-DEPENDENCY-DB"
+    assert outcome.error.retry_safe and seconds < 1.5, seconds

@@ -716,7 +716,10 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
     try:
         async with asyncio.timeout(run.deadline.remaining()):
             snapshot = await deps.snapshots.read_snapshot(query)
-    except Exception:
+    except Exception as exc:
+        log.debug(
+            "스냅숏 조회 실패: %s sqlstate=%s", type(exc).__name__, getattr(exc, "sqlstate", None)
+        )
         stages.dependency = Dependency.DB
         stages.add(Stage.SNAPSHOT, StageResult.stop(Reason.DEPENDENCY_FAILURE))
         return
