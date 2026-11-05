@@ -40,8 +40,10 @@ def test_every_setting_can_be_given():
         "MINT_FINGERPRINT_KEY_VERSION": "3",
         "MINT_READINESS_URL": "http://localhost:4000/health/readiness",
         "MINT_SELFCHECK_GRACE_SECONDS": "30",
+        "MINT_LOG_LEVEL": " debug ",
     }
     config = PluginConfig.from_env(env)
+    assert config.log_level == "DEBUG"
     assert config.mode_ceiling is Mode.OBSERVE and config.required is False
     assert config.high_risk_tools == {"delete_repo", "drop_table"}
     assert config.buffer_dir == Path("/data/buf") and config.buffer_max_bytes == 2048
@@ -68,6 +70,7 @@ def test_every_setting_can_be_given():
         {"MINT_FINGERPRINT_KEY": "not base64url!" + "a" * 40},
         {"MINT_FINGERPRINT_KEY": ""},
         {"MINT_FINGERPRINT_KEY_VERSION": "0"},
+        {"MINT_LOG_LEVEL": "verbose"},
         {"MINT_SELFCHECK_GRACE_SECONDS": "9"},
         {"MINT_SELFCHECK_GRACE_SECONDS": "601"},
         {"MINT_SELFCHECK_GRACE_SECONDS": "two minutes"},
@@ -96,3 +99,33 @@ def test_truthy_required_values(text):
 def test_the_startup_grace_accepts_its_whole_range(seconds):
     config = PluginConfig.from_env({**BASE, "MINT_SELFCHECK_GRACE_SECONDS": seconds})
     assert config.selfcheck_grace_seconds == float(seconds)
+
+
+def test_the_log_level_is_unset_by_default_and_blank_means_unset():
+    assert PluginConfig.from_env(BASE).log_level is None
+    assert PluginConfig.from_env({**BASE, "MINT_LOG_LEVEL": "  "}).log_level is None
+
+
+def test_configuring_the_log_level_sets_one_stderr_handler_once():
+    import logging
+
+    from mint_litellm.plugin.config import configure_logging
+
+    logger = logging.getLogger("mint_litellm")
+    before = (logger.level, list(logger.handlers), logger.propagate)
+    try:
+        configure_logging(None)
+        assert (logger.level, logger.handlers, logger.propagate) == (
+            before[0],
+            before[1],
+            before[2],
+        )
+        configure_logging("DEBUG")
+        configure_logging("DEBUG")
+        assert logger.level == logging.DEBUG and not logger.propagate
+        assert len(logger.handlers) == len(before[1]) + 1
+        assert logging.getLogger("mint_litellm.guardrail").isEnabledFor(logging.DEBUG)
+    finally:
+        logger.setLevel(before[0])
+        logger.handlers[:] = before[1]
+        logger.propagate = before[2]

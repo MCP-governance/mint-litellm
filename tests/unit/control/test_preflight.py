@@ -120,6 +120,97 @@ def test_the_entrypoint_starts_litellm_only_after_a_passing_check(tmp_path):
     assert started and "STARTED --config" in (tmp_path / "start.log").read_text(encoding="utf-8")
 
 
+def litellm_stand_in(tmp_path, body):
+    """진입점이 시작하는 LiteLLM의 대역과, 종료 코드 표식 파일을 정한 환경."""
+    good = write(tmp_path, good_text())
+    work, env = entrypoint_env(tmp_path)
+    script = work / "docker" / "prod_entrypoint.sh"
+    script.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    marker = tmp_path / "exit-code"
+    return work, {**env, "MINT_EXIT_CODE_FILE": str(marker)}, good, marker
+
+
+@bash
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("exit 0\n", 0),
+        ("exit 5\n", 5),
+        ('echo 3 > "$MINT_EXIT_CODE_FILE"\nexit 0\n', 3),
+        ('echo 3 > "$MINT_EXIT_CODE_FILE"\nexit 1\n', 3),
+    ],
+    ids=["clean", "own-code", "worker-failure-supervisor-clean", "worker-failure-supervisor-error"],
+)
+def test_the_entrypoint_exits_3_when_a_worker_left_the_failure_marker(tmp_path, body, expected):
+    work, env, good, _ = litellm_stand_in(tmp_path, body)
+    result = subprocess.run(["sh", str(ENTRYPOINT), "--config", str(good)], cwd=work, env=env,
+                            capture_output=True, text=True, encoding="utf-8")
+    assert result.returncode == expected, result.stderr
+
+
+@bash
+def test_a_marker_from_an_earlier_run_does_not_change_the_exit_code(tmp_path):
+    work, env, good, marker = litellm_stand_in(tmp_path, "exit 0\n")
+    marker.write_text("3", encoding="utf-8")
+    result = subprocess.run(["sh", str(ENTRYPOINT), "--config", str(good)], cwd=work, env=env,
+                            capture_output=True, text=True, encoding="utf-8")
+    assert result.returncode == 0 and not marker.exists()
+
+
+@bash
+@pytest.mark.parametrize("sent", ["SIGTERM", "SIGINT"])
+def test_stop_signals_reach_litellm_as_term_and_its_own_exit_code_is_kept(tmp_path, sent):
+    import signal
+    import time
+
+    body = (
+        """trap 'echo GOT-TERM >> "$START_LOG"; exit 0' TERM\n"""
+        'echo READY >> "$START_LOG"\nwhile :; do sleep 0.1; done\n'
+    )
+    work, env, good, _ = litellm_stand_in(tmp_path, body)
+    log = tmp_path / "start.log"
+    proc = subprocess.Popen(["sh", str(ENTRYPOINT), "--config", str(good)], cwd=work, env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (log.exists() and "READY" in log.read_text()):
+            time.sleep(0.05)
+        assert "READY" in log.read_text(encoding="utf-8")
+        proc.send_signal(getattr(signal, sent))
+        assert proc.wait(timeout=15) == 0
+    finally:
+        proc.kill()
+    assert "GOT-TERM" in log.read_text(encoding="utf-8")
+
+
+@bash
+def test_a_litellm_that_dies_of_the_term_we_forwarded_is_a_clean_stop(tmp_path):
+    import signal
+    import time
+
+    body = 'echo READY >> "$START_LOG"\ntrap - TERM\nwhile :; do sleep 0.1; done\n'
+    work, env, good, _ = litellm_stand_in(tmp_path, body)
+    log = tmp_path / "start.log"
+    proc = subprocess.Popen(["sh", str(ENTRYPOINT), "--config", str(good)], cwd=work, env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (log.exists() and "READY" in log.read_text()):
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=15) == 0
+    finally:
+        proc.kill()
+
+
+@bash
+def test_a_litellm_that_dies_of_term_on_its_own_keeps_its_status(tmp_path):
+    work, env, good, _ = litellm_stand_in(tmp_path, "kill -TERM $$\n")
+    result = subprocess.run(["sh", str(ENTRYPOINT), "--config", str(good)], cwd=work, env=env,
+                            capture_output=True, text=True, encoding="utf-8")
+    assert result.returncode == 143
+
+
 @bash
 def test_the_entrypoint_refuses_a_config_without_the_mint_entries(tmp_path):
     config = yaml.safe_load(good_text())

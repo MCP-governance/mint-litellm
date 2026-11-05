@@ -98,6 +98,17 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         ),
     ),
     MintSettingRow(
+        key="MINT_LOG_LEVEL",
+        source=SettingSource.ENV,
+        rule=(
+            "플러그인 로그 수준(DEBUG, INFO, WARNING, ERROR). 정하지 않으면 로그 설정을 "
+            "바꾸지 않는다. DEBUG이면 도구 호출 판정마다 "
+            "`decision_ms=<밀리초> ref=<판정 참조> allowed=<true|false>` 한 줄을 표준 오류에 "
+            "남긴다. 시간은 판정 진입부터 반환까지이고 선기록을 포함한다. "
+            "DEBUG가 아니면 시간을 재지 않는다."
+        ),
+    ),
+    MintSettingRow(
         key="MINT_SELFCHECK_GRACE_SECONDS",
         source=SettingSource.ENV,
         rule=(
