@@ -147,3 +147,7 @@
 ## 원장 조회
 
 `ledger list`는 `--kind`, `--since`, `--until`, `--invocation-id`로 사건을 거른다. 호출이 차단되었을 때 오류 본문의 `reference`(`<호출 식별자>:<시도 번호>`)는 `--decision-ref`에 그대로 넣으면 그 판정 사건 하나를 찾는다. `--decision-ref`와 `--invocation-id`는 함께 쓸 수 없다.
+
+## 지문 키 점검
+
+`check`는 LiteLLM 서비스에 전달되는 `MINT_FINGERPRINT_KEY`(base64url, 32바이트 이상)와 `MINT_FINGERPRINT_KEY_VERSION`(1 이상의 정수)을 필수 행으로 확인한다. 환경 변수에 없으면 서비스에 같은 값을 주는 비밀 파일(`MINT_SECRETS_FILE`)을 읽는다. 키가 없거나 형식이 틀리면 종료 코드 1, 파일의 권한이 0600이 아니거나 심볼릭 링크라서 읽을 수 없으면 확인하지 못한 것으로 종료 코드 3이다.

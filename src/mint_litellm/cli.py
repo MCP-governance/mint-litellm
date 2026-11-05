@@ -221,6 +221,7 @@ def _check(run: Run) -> None:
         _optional_litellm(run),
         replicas=run.cfg.replicas,
         registered_servers=registered,
+        check_fingerprint=True,
         policy_state=policy_check.verify_active_policy(
             run.conn, ctx.instance_id, run.environ.get("MINT_OPA_URL")
         ),

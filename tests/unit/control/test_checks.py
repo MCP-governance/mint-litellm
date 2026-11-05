@@ -306,3 +306,58 @@ def test_missing_management_api_leaves_required_rows_unverified(healthy):
     report = checks.run_checks(good_config(), ENV, None, compat_probe=lambda: [])
     assert not report.failed
     assert set(report.incomplete) == {"서버 이름·별칭 유일성", "guardrails[MINT]"}
+
+
+def test_the_fingerprint_key_passed_to_the_service_is_a_required_row(healthy, tmp_path):
+    import base64
+
+    good = base64.urlsafe_b64encode(b"k" * 32).decode()
+    missing_file = {"MINT_SECRETS_FILE": str(tmp_path / "none.env")}
+
+    def fingerprint(**extra):
+        report = checks.run_checks(
+            good_config(), {**ENV, **missing_file, **extra}, healthy,
+            compat_probe=lambda: [], check_fingerprint=True,
+        )
+        return report, [f for f in report.findings if f.item == "MINT_FINGERPRINT_KEY"]
+
+    report, found = fingerprint(MINT_FINGERPRINT_KEY=good, MINT_FINGERPRINT_KEY_VERSION="2")
+    assert [f.level for f in found] == [Level.OK] and not report.failed
+    report, found = fingerprint()
+    assert [f.level for f in found] == [Level.FAIL] and report.failed
+    report, found = fingerprint(MINT_FINGERPRINT_KEY="short")
+    assert [f.level for f in found] == [Level.FAIL] and "형식" in found[0].message
+    for version in ("x", "0"):
+        report, found = fingerprint(MINT_FINGERPRINT_KEY=good, MINT_FINGERPRINT_KEY_VERSION=version)
+        assert [f.level for f in found] == [Level.FAIL], version
+
+
+def test_an_unreadable_fingerprint_file_is_unverified_and_incomplete(healthy, tmp_path):
+    import os
+
+    if os.name == "nt":
+        pytest.skip("POSIX 파일 권한 시험")
+    path = tmp_path / "secrets.env"
+    path.write_text("MINT_FINGERPRINT_KEY=" + "A" * 43 + "\n", encoding="utf-8")
+    path.chmod(0o644)
+    report = checks.run_checks(good_config(), {**ENV, "MINT_SECRETS_FILE": str(path)}, healthy,
+                               compat_probe=lambda: [], check_fingerprint=True)
+    found = [f for f in report.findings if f.item == "MINT_FINGERPRINT_KEY"]
+    assert [f.level for f in found] == [Level.SKIP]
+    assert "MINT_FINGERPRINT_KEY" in report.incomplete and not report.failed
+
+
+def test_a_readable_fingerprint_file_satisfies_the_row(healthy, tmp_path):
+    from mint_litellm.control import secrets_file
+
+    path = tmp_path / "secrets.env"
+    secrets_file.ensure_fingerprint_key(path)
+    report = checks.run_checks(good_config(), {**ENV, "MINT_SECRETS_FILE": str(path)}, healthy,
+                               compat_probe=lambda: [], check_fingerprint=True)
+    found = [f for f in report.findings if f.item == "MINT_FINGERPRINT_KEY"]
+    assert [f.level for f in found] == [Level.OK]
+
+
+def test_without_the_option_the_fingerprint_row_is_not_evaluated(healthy):
+    report = run(good_config(), healthy)
+    assert not [f for f in report.findings if f.item == "MINT_FINGERPRINT_KEY"]

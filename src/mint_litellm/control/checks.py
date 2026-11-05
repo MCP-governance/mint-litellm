@@ -10,9 +10,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from mint_litellm.control import secrets_file
+from mint_litellm.control.errors import ControlError
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
 from mint_litellm.control.litellm_config import GUARDRAIL_MODES
 from mint_litellm.control.policy_check import PolicyState
+from mint_litellm.types import fingerprint
 from mint_litellm.types.decision import normalize_auth_type, url_sha256
 from mint_litellm.types.settings import OBSERVATION_ITEMS, SETTINGS_TABLE, SettingGrade
 
@@ -22,7 +25,8 @@ _OPTOUT_KEYS = ("opted_out_global_guardrails", "disable_global_guardrails")
 
 # 설정 표에는 없지만 필수로 취급하는 점검 항목
 POLICY_ITEM = "정책 번들 내용"
-EXTRA_REQUIRED = frozenset({POLICY_ITEM})
+FINGERPRINT_ITEM = "MINT_FINGERPRINT_KEY"
+EXTRA_REQUIRED = frozenset({POLICY_ITEM, FINGERPRINT_ITEM})
 
 # 호환 계층이 쓰는 LiteLLM 비공개 심볼: (모듈, 객체, 속성)
 COMPAT_SYMBOLS: tuple[tuple[str, str | None, str | None], ...] = (
@@ -116,6 +120,7 @@ def run_checks(
     replicas: int = 1,
     registered_servers: list[dict] | None = None,
     policy_state: PolicyState | None = None,
+    check_fingerprint: bool = False,
     compat_probe: Callable[[], list[str] | None] = probe_compat_symbols,
 ) -> Report:
     report = Report()
@@ -155,6 +160,8 @@ def run_checks(
 
     if policy_state is not None:
         _policy_finding(report, policy_state)
+    if check_fingerprint:
+        _fingerprint_finding(report, env)
     missing = compat_probe()
     if missing is None:
         report.add("호환 계층 비공개 심볼", Level.SKIP,
@@ -392,3 +399,27 @@ def _policy_finding(report: Report, state: PolicyState) -> None:
         report.add(POLICY_ITEM, Level.FAIL, state.detail)
     else:
         report.add(POLICY_ITEM, Level.SKIP, state.detail)
+
+
+def _fingerprint_finding(report: Report, env: Mapping[str, str]) -> None:
+    """LiteLLM 서비스에 넘기는 인자 지문 키와 키 판본이 있고 형식이 맞는지 본다.
+
+    환경 변수에 없으면 서비스에 같은 값을 주는 비밀 파일을 본다. 읽을 수 없으면 확인 못한 것이다.
+    """
+    try:
+        key, version = secrets_file.load_fingerprint_key(env)
+    except ControlError as error:
+        # 키가 없다는 것과 파일을 읽을 수 없다는 것을 구분한다.
+        wrong = "찾을 수 없습니다" in str(error) or "정수가 아닙니다" in str(error)
+        level = Level.FAIL if wrong else Level.SKIP
+        report.add(FINGERPRINT_ITEM, level, str(error))
+        return
+    try:
+        fingerprint.decode_fingerprint_key(key)
+    except ValueError as error:
+        report.add(FINGERPRINT_ITEM, Level.FAIL, f"키 형식이 올바르지 않습니다: {error}")
+        return
+    if version < 1:
+        report.add(FINGERPRINT_ITEM, Level.FAIL, "키 판본은 1 이상이어야 합니다.")
+        return
+    report.add(FINGERPRINT_ITEM, Level.OK, f"키 판본 {version}")
