@@ -168,7 +168,7 @@ def test_every_single_configuration_form_checks_the_file_it_starts_with(tmp_path
     good, bad = write(tmp_path, good_text()), bad_config(tmp_path)
     for index, form in enumerate((["-c", "{}"], ["--config", "{}"], ["--config={}"], ["-c{}"])):
         for path, should_start in ((good, True), (bad, False)):
-            args = [part.format(path) for part in form] + ["--port", "4000", "-v"]
+            args = [part.format(path) for part in form] + ["--port", "4000", "--detailed_debug"]
             sub = tmp_path / f"run{index}-{should_start}"
             sub.mkdir()
             result, started = start(sub, args)
@@ -183,3 +183,45 @@ def test_unparseable_or_incomplete_configuration_arguments_are_refused(tmp_path)
         result, started = start(tmp_path, args)
         assert result.returncode != 0 and not started, args
         (tmp_path / "start.log").unlink(missing_ok=True)
+
+
+@bash
+@pytest.mark.parametrize(
+    "variable",
+    ["CONFIG_FILE_PATH", "LITELLM_CONFIG_BUCKET_NAME", "LITELLM_CONFIG_BUCKET_OBJECT_KEY",
+     "LITELLM_CONFIG_BUCKET_TYPE"],
+)
+@pytest.mark.parametrize("value", ["", "/app/other.yaml", "x"])
+def test_another_configuration_source_is_refused_even_when_empty(tmp_path, variable, value):
+    """LiteLLM은 환경 변수의 설정을 인자보다 먼저 쓴다. 정의만 되어 있어도 시작하지 않는다."""
+    good = write(tmp_path, good_text())
+    work, env = entrypoint_env(tmp_path)
+    result = subprocess.run(
+        ["sh", str(ENTRYPOINT), "--config", str(good)], cwd=work, env={**env, variable: value},
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert result.returncode != 0 and not (tmp_path / "start.log").exists()
+    assert variable in result.stderr
+
+
+@bash
+def test_a_path_with_spaces_is_checked_and_started_as_one_argument(tmp_path):
+    folder = tmp_path / "with space"
+    folder.mkdir()
+    good = folder / "config file.yaml"
+    good.write_text(good_text(), encoding="utf-8")
+    result, started = start(tmp_path, ["--config", str(good), "--port", "4000"])
+    assert result.returncode == 0 and started, result.stderr
+    assert f"STARTED --config {good}" in (tmp_path / "start.log").read_text(encoding="utf-8")
+
+
+@bash
+def test_unrelated_environment_variables_do_not_block_startup(tmp_path):
+    good = write(tmp_path, good_text())
+    work, env = entrypoint_env(tmp_path)
+    result = subprocess.run(
+        ["sh", str(ENTRYPOINT), "--config", str(good)], cwd=work,
+        env={**env, "CONFIG_FILE_PATHS": "x", "MY_CONFIG_FILE_PATH": "x"},
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
