@@ -241,7 +241,8 @@ def leave_exit_marker() -> None:
     """
     path = os.environ.get(EXIT_CODE_FILE_ENV)
     if path:
-        with contextlib.suppress(OSError), open(path, "w", encoding="utf-8") as marker:
+        # 표식은 보조 수단이다. 어떤 이유로 쓰지 못해도 원래의 종료·예외 경로를 가리면 안 된다.
+        with contextlib.suppress(Exception), open(path, "w", encoding="utf-8") as marker:
             marker.write(str(EXIT_CODE))
 
 
