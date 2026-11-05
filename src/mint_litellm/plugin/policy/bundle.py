@@ -123,21 +123,45 @@ async def loaded_bundle_sha256(opa_url: str, client: httpx.AsyncClient | None = 
     return bundle_content_sha256(modules, data)
 
 
+def _text(value: object) -> bool:
+    return type(value) is str
+
+
+def _manifest_is_managed(manifest: object) -> bool:
+    if not isinstance(manifest, dict):
+        return False
+    shapes = {
+        "revision": _text,
+        "roots": lambda v: isinstance(v, list) and all(_text(item) for item in v),
+        "metadata": lambda v: isinstance(v, dict),
+        "rego_version": lambda v: isinstance(v, _Number),
+        "file_rego_versions": lambda v: isinstance(v, dict)
+        and all(isinstance(item, _Number) for item in v.values()),
+        "wasm": lambda v: isinstance(v, list),
+    }
+    return all(key in shapes and shapes[key](value) for key, value in manifest.items())
+
+
 def _system_is_managed(bundles: dict, system: object) -> bool:
-    """``data.system``이 OPA가 만든 항목뿐인지 본다(전체 조회는 이 경로를 빼고 돌려준다)."""
+    """``data.system``에 OPA가 쓰는 항목만, 정해진 키와 형식으로 있는지 본다.
+
+    지원하는 적재 경로는 파일 번들과 ``--watch``(OPA가 판본 정보를 다시 쓴다)이다.
+    전체 조회는 이 경로를 빼고 돌려주므로 따로 조회한다.
+    """
     if not isinstance(system, dict) or set(system) != {"bundles", "version"}:
         return False
     version = system["version"]
     if system["bundles"] != bundles or not (
         isinstance(version, dict)
-        and set(version) <= {"build_commit", "build_hostname", "build_timestamp", "version"}
+        and set(version) == {"build_commit", "build_hostname", "build_timestamp", "version"}
+        and all(_text(value) for value in version.values())
     ):
         return False
     return all(
         isinstance(entry, dict)
         and set(entry) == {"etag", "manifest"}
-        and isinstance(entry["manifest"], dict)
-        and set(entry["manifest"]) <= {"revision", "roots", "metadata"}
+        and _text(entry["etag"])
+        and _manifest_is_managed(entry["manifest"])
         for entry in bundles.values()
     )
 

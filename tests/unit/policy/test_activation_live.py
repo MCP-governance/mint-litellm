@@ -220,11 +220,12 @@ def _tampered(archive: bytes, name: str, change) -> bytes:
         ("system/data.json", lambda _: b'{"injected": {"k": 1}}'),
         ("system/sub/data.json", lambda _: b'{"k": 1}'),
         ("system/bundles/data.json", lambda _: b'{"x": 1}'),
+        ("system/version/data.json", lambda _: b'{"version": {"injected": 1}}'),
     ],
     ids=[
         "rule-line", "data-value", "data-subtree", "root-data", "other-data-path",
         "mint-data", "rule-package-data", "decision-package-data", "system-data",
-        "system-subtree", "system-bundles",
+        "system-subtree", "system-bundles", "system-version",
     ],
 )
 def test_activation_rejects_content_changed_with_unchanged_metadata(live_database, name, change):
