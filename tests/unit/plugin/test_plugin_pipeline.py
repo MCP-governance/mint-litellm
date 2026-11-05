@@ -860,6 +860,75 @@ class TestObligations:
         assert len(events) == 1 and events[0].payload["enforced_action"] == "block"
         assert outcome.snapshot.consumed_call_approval_id is None
 
+    def converted_block(self, tmp_path, policy_id, *, snap=None, mode=Mode.OBSERVE):
+        """Block이 관측 모드에서 허용으로 전환될 수 있고 호출별 승인·동의 의무가 함께 붙은 결과."""
+        settings = SettingsRow(
+            mode=mode,
+            observable_reasons=OBSERVATION_CANDIDATES,
+            observable_policy_ids=frozenset({policy_id}),
+        )
+        evaluate = evaluator(
+            "Block",
+            policy_ids=(policy_id,),
+            observable=True,
+            obligations=(
+                {"type": "require_call_approval"},
+                {"type": "require_consent", "purpose": "support"},
+            ),
+        )
+        if snap is None:
+            snap = snapshot(
+                call_approvals=(call_approval(),), consents=(consent(),), settings=settings
+            )
+        else:
+            snap = replace(snap, settings=settings)
+        return harness(tmp_path, snap, evaluate=evaluate, cfg=config(tmp_path, mode_ceiling=mode))
+
+    @pytest.mark.parametrize("policy_id", ["R3", "R1"])
+    def test_a_converted_block_is_allowed_only_with_the_obligations_met(self, tmp_path, policy_id):
+        h = self.converted_block(tmp_path, policy_id)
+        outcome = decide(h)
+        assert outcome.allowed and len(h.store.consumed) == 1
+        assert [f.reason_code for f in outcome.snapshot.findings] == [f"POLICY_DETECT_{policy_id}"]
+        assert outcome.snapshot.evaluated_decision is Action.BLOCK
+        assert outcome.snapshot.enforced_action is Action.ALLOW
+        assert [o.value for o in outcome.snapshot.obligation_types] == [
+            "require_call_approval",
+            "require_consent",
+        ]
+
+    @pytest.mark.parametrize("policy_id", ["R3", "R1"])
+    def test_a_converted_block_without_a_call_approval_still_requires_one(
+        self, tmp_path, policy_id
+    ):
+        snap = snapshot(consents=(consent(),))
+        h = self.converted_block(tmp_path, policy_id, snap=snap)
+        outcome = decide(h)
+        assert code(outcome) == "MINT-CALL-APPROVAL-REQUIRED" and not outcome.allowed
+        assert outcome.snapshot.stop.reason_code == "CALL_APPROVAL_REQUIRED"
+        assert [f.reason_code for f in outcome.snapshot.findings] == [f"POLICY_DETECT_{policy_id}"]
+        assert h.store.consumed == []
+
+    def test_a_converted_block_with_a_stale_call_approval_is_blocked(self, tmp_path):
+        snap = snapshot(
+            call_approvals=(call_approval(policy_version_id="pv0"),), consents=(consent(),)
+        )
+        outcome = decide(self.converted_block(tmp_path, "R3", snap=snap))
+        assert code(outcome) == "MINT-CALL-APPROVAL-STALE" and not outcome.allowed
+
+    def test_a_converted_block_without_consent_is_blocked_and_consumes_nothing(self, tmp_path):
+        snap = snapshot(call_approvals=(call_approval(),))
+        h = self.converted_block(tmp_path, "R3", snap=snap)
+        assert code(decide(h)) == "MINT-CONSENT-REQUIRED"
+        assert h.store.consumed == []
+
+    def test_an_unconverted_block_reports_the_obligation_stop_first(self, tmp_path):
+        snap = snapshot(consents=(consent(),))
+        h = self.converted_block(tmp_path, "R3", snap=snap, mode=Mode.ENFORCE)
+        outcome = decide(h)
+        assert code(outcome) == "MINT-CALL-APPROVAL-REQUIRED"
+        assert [f.reason_code for f in outcome.snapshot.findings] == ["POLICY_DETECT_R3"]
+
     def test_consent_obligation_states(self, tmp_path):
         evaluate = evaluator(
             "Allow", obligations=({"type": "require_consent", "purpose": "support"},)
