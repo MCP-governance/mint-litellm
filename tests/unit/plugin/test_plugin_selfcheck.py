@@ -1,5 +1,6 @@
 import asyncio
 import io
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -262,6 +263,9 @@ def make_runtime(
     ready=True,
     store=None,
     stopped=None,
+    grace=0.05,
+    ready_delay=0.0,
+    database_delay=0.0,
 ):
     store = store if store is not None else FakeStore()
     recorder = EvidenceRecorder(
@@ -274,6 +278,7 @@ def make_runtime(
 
     class Database:
         async def registered_servers(self, instance_id):
+            await asyncio.sleep(database_delay)
             if controlled is Exception:
                 raise ConnectionError("down")
             return [registered()] if controlled is None else controlled
@@ -285,10 +290,11 @@ def make_runtime(
 
     async def readiness(url, timeout):
         waited.append(timeout)
+        await asyncio.sleep(ready_delay)
         return ready
 
     runtime = PluginRuntime(
-        config=config(tmp_path, required=required, selfcheck_grace_seconds=0.05),
+        config=config(tmp_path, required=required, selfcheck_grace_seconds=grace),
         database=Database(),
         recorder=recorder,
         evaluate=None,
@@ -522,6 +528,37 @@ def test_without_readiness_in_time_the_startup_is_recorded_and_stopped(tmp_path)
     assert stopped == [1] and not runtime.verified
     (event,) = store.of_kind("enforcement_unverified")
     assert event.payload == {"failed": [], "error": "readiness_timeout"}
+
+
+def test_readiness_and_checks_share_one_time_limit(tmp_path):
+    runtime, store, stopped, _ = make_runtime(
+        tmp_path, grace=0.3, ready_delay=0.15, database_delay=0.4
+    )
+    asyncio.run(runtime._startup())
+    assert stopped == [1] and not runtime.verified
+    (event,) = store.of_kind("enforcement_unverified")
+    assert event.payload == {"failed": [], "error": "startup_timeout"}
+
+
+def test_a_check_that_finishes_after_the_limit_is_not_a_pass(tmp_path):
+    runtime, store, stopped, _ = make_runtime(tmp_path, grace=0.2)
+    collect = runtime.view_collector
+
+    def slow_collect():
+        time.sleep(0.3)
+        return collect()
+
+    runtime.view_collector = slow_collect
+    asyncio.run(runtime._startup())
+    assert stopped == [1] and not runtime.verified
+    (event,) = store.of_kind("enforcement_unverified")
+    assert event.payload["error"] == "startup_timeout"
+
+
+def test_readiness_that_uses_most_of_the_limit_still_leaves_time_for_the_checks(tmp_path):
+    runtime, store, stopped, _ = make_runtime(tmp_path, grace=0.5, ready_delay=0.2)
+    asyncio.run(runtime._startup())
+    assert runtime.verified and stopped == [] and store.events == {}
 
 
 def test_without_readiness_a_non_required_runtime_stays_blocked_and_recovers(tmp_path):

@@ -349,21 +349,31 @@ class PluginRuntime:
         url = self.config.readiness_url or (
             f"http://localhost:{os.environ.get('PORT', '4000')}/health/readiness"
         )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace
         try:
-            deadline = time.monotonic() + grace
             error: str | None = "readiness_timeout"
-            # 준비 신호와 8항목은 같은 유예 시간 안에 모두 통과해야 한다. 다른 워커가 낸 준비
-            # 신호로 시작했다면 이 워커의 레지스트리가 아직 비어 있을 수 있어 다시 확인한다.
-            if await self.readiness(url, grace):
-                error = None
-                while True:
-                    if await self.verify():
-                        log.info("MINT 자가 점검 통과")
-                        await self._report_mismatches()
-                        return
-                    if time.monotonic() >= deadline:
-                        break
-                    await asyncio.sleep(self.retry_seconds)
+            ready = False
+            # 준비 신호와 8항목은 하나의 외부 시간 제한 안에서 모두 통과해야 한다. 다른 워커가 낸
+            # 준비 신호로 시작했다면 이 워커의 레지스트리가 아직 비어 있을 수 있어 다시 확인한다.
+            try:
+                async with asyncio.timeout_at(deadline):
+                    ready = await self.readiness(url, grace)
+                    if ready:
+                        error = None
+                        while not await self.verify():
+                            await asyncio.sleep(self.retry_seconds)
+            except TimeoutError:
+                pass
+            if ready:
+                if self.verified and loop.time() < deadline:
+                    log.info("MINT 자가 점검 통과")
+                    await self._report_mismatches()
+                    return
+                # 시간 제한이 지난 뒤에 끝난 점검은 통과로 치지 않는다.
+                self.verified = False
+                if not any(not r.ok for r in self.last_results):
+                    error = "startup_timeout"
                 await self._report_mismatches()
             await self._fail(error=error)
             if self.config.required:
