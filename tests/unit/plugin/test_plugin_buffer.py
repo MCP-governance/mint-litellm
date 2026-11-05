@@ -96,7 +96,8 @@ class TestLocalBuffer:
         assert not buffer.has_pending()
         buffer.append(make_event(1))
         assert buffer.has_pending()
-        (claimed,) = buffer.claim()
+        (candidate,) = buffer.pending()
+        claimed = buffer.take(candidate)
         assert [e.source_key for e in LocalBuffer.read(claimed)[0]] == [make_event(1).source_key]
         assert not buffer.has_pending()
         buffer.append(make_event(2))
@@ -106,12 +107,13 @@ class TestLocalBuffer:
         buffer = LocalBuffer(tmp_path, 1024 * 1024)
         buffer.append(make_event(1))
         buffer.close()
-        (claimed,) = buffer.claim()
+        (candidate,) = buffer.pending()
+        claimed = buffer.take(candidate)
         assert ".replaying." in claimed.name and not buffer.has_pending()
         buffer.release(claimed)
         assert buffer.has_pending()
-        (claimed,) = buffer.claim()
-        buffer.discard(claimed)
+        claimed = buffer.take(buffer.pending()[0])
+        buffer.finish(claimed)
         assert files(tmp_path) == []
 
     def test_the_size_cap_deletes_the_oldest_closed_files_and_counts_what_was_lost(self, tmp_path):
@@ -233,9 +235,41 @@ class TestLocalBuffer:
         assert live.has_pending()
         other = LocalBuffer(tmp_path, 1024 * 1024)
         other.append(make_event(6))
-        assert [p.name for p in live.claim()] and not any(
-            p.name.startswith(other._owner) for p in live.claim()
+        names = [p.name for p in live.pending()]
+        assert dead.name in names and not any(n.startswith(other._owner) for n in names)
+
+    def test_files_are_taken_one_at_a_time(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        buffer._segment_bytes = 1024
+        for i in range(3):
+            buffer.append(make_event(i, payload={"pad": "x" * 700}))
+        candidates = buffer.pending()
+        assert len(candidates) == 3
+        taken = buffer.take(candidates[0])
+        names = files(tmp_path)
+        assert (
+            sum(".replaying." in n for n in names) == 1
+            and sum(n.endswith(".jsonl") for n in names) == 2
         )
+        assert buffer.take(candidates[0]) is None
+        buffer.release(taken)
+        assert not any(".replaying." in n for n in files(tmp_path))
+
+    @pytest.mark.skipif(fcntl is None, reason="needs flock")
+    def test_a_replay_left_behind_by_a_dead_process_is_recovered(self, tmp_path):
+        dead = LocalBuffer(tmp_path, 1024 * 1024)
+        dead.append(make_event(7))
+        (taken,) = [dead.take(p) for p in dead.pending()]
+        other = LocalBuffer(tmp_path, 1024 * 1024)
+        assert other.pending() == []
+        dead._held.pop(taken).close()
+        (recovered,) = other.pending()
+        assert recovered.name == taken.name
+        mine = other.take(recovered)
+        assert mine is not None and other._owner in mine.name
+        assert [e.source_key for e in LocalBuffer.read(mine)[0]] == [make_event(7).source_key]
+        other.release(mine)
+        assert [p.name.endswith(".jsonl") for p in other.pending()] == [True]
 
     @pytest.mark.skipif(fcntl is None, reason="needs flock")
     def test_a_file_held_by_a_live_writer_is_not_adopted(self, tmp_path):
@@ -367,6 +401,85 @@ class TestEvidenceRecorder:
         (report,) = store.of_kind("buffer_replayed")
         assert report.payload == {"replayed": 3, "duplicates": 0, "unreadable": 0}
         assert not buffer.has_pending()
+
+    @staticmethod
+    def three_segments(tmp_path, store):
+        """사건 하나씩 담은 닫힌 세그먼트 3개가 있는 기록기."""
+        rec, buffer = recorder(tmp_path, store)
+        buffer._segment_bytes = 1024
+        store.fail = ConnectionError("down")
+
+        async def fill():
+            for i in range(3):
+                await rec.record(make_event(i, payload={"n": i, "pad": "x" * 700}))
+
+        asyncio.run(fill())
+        buffer.close()
+        store.fail = None
+        return rec, buffer
+
+    def test_a_failure_on_the_first_file_leaves_every_file_for_the_next_pass(self, tmp_path):
+        store = FakeStore()
+        rec, buffer = self.three_segments(tmp_path, store)
+        store.fail = ConnectionError("down")
+        asyncio.run(rec.replay())
+        names = files(buffer._dir)
+        assert len(names) == 3 and all(n.endswith(".jsonl") for n in names)
+        store.fail = None
+        asyncio.run(rec.replay())
+        assert len(store.of_kind("decision_evaluated")) == 3 and files(buffer._dir) == []
+
+    def test_a_failure_on_a_later_file_keeps_the_loaded_ones_and_the_rest_waiting(self, tmp_path):
+        class DiesOnThird(FakeStore):
+            async def insert_event(self, event, consume=None):
+                if event.payload.get("n") == 2:
+                    raise ConnectionError("down")
+                return await super().insert_event(event, consume)
+
+        store = DiesOnThird()
+        rec, buffer = self.three_segments(tmp_path, store)
+        asyncio.run(rec.replay())
+        assert len(store.of_kind("decision_evaluated")) == 2
+        names = files(buffer._dir)
+        assert len(names) == 1 and names[0].endswith(".jsonl")
+
+    def test_cancelling_a_replay_gives_the_current_file_back(self, tmp_path):
+        class Stuck(FakeStore):
+            def __init__(self):
+                super().__init__()
+                self.entered = asyncio.Event()
+
+            async def insert_event(self, event, consume=None):
+                self.entered.set()
+                await asyncio.sleep(60)
+
+        store = FakeStore()
+        rec, buffer = self.three_segments(tmp_path, store)
+        rec._store = Stuck()
+
+        async def scenario():
+            task = asyncio.create_task(rec.replay())
+            await rec._store.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        names = files(buffer._dir)
+        assert len(names) == 3 and all(n.endswith(".jsonl") for n in names)
+
+    @pytest.mark.skipif(fcntl is None, reason="needs flock")
+    def test_a_restarted_process_replays_what_a_dead_one_had_taken(self, tmp_path):
+        store = FakeStore()
+        _, dead = self.three_segments(tmp_path, store)
+        for path in dead.pending():
+            dead.take(path)
+        for handle in list(dead._held.values()):
+            handle.close()
+        rec, restarted = recorder(tmp_path, store)
+        asyncio.run(rec.replay())
+        assert len(store.of_kind("decision_evaluated")) == 3
+        assert files(restarted._dir) == []
 
     def test_commit_then_lost_response_converges_to_one_row_and_counts_the_duplicate(
         self, tmp_path

@@ -104,6 +104,7 @@ class LocalBuffer:
         self._dropped_files = 0
         self._lock = threading.RLock()
         self._directory_lock_handle: TextIO | None = None
+        self._held: dict[Path, TextIO] = {}
 
     def append(self, event: Event) -> None:
         line = event.to_json_line()
@@ -150,30 +151,60 @@ class LocalBuffer:
             except OSError:
                 return False
 
-    def claim(self) -> list[Path]:
-        """다시 적재할 파일을 가져온다(이름을 바꿔 소유한다).
+    def pending(self) -> list[Path]:
+        """다시 적재할 파일의 목록. 지금 쓰고 있는 파일도 닫아서 포함한다.
 
-        지금 쓰고 있는 파일도 닫아서 포함한다. 닫지 않으면 쓰는 프로세스가 살아 있는 동안 그
-        파일의 사건은 다시 적재되지 않는다. 주인이 없어진 열린 파일도 가져온다.
+        닫지 않으면 쓰는 프로세스가 살아 있는 동안 그 파일의 사건은 다시 적재되지 않는다. 주인이
+        없어진 열린 파일과, 재적재 중 프로세스가 죽어 남은 파일도 포함한다.
         """
         with self._lock:
             self._close_current()
-            claimed: list[Path] = []
-            for path in self._claimable():
-                target = path.with_name(f"{path.name}{_REPLAYING}.{self._owner}")
+            try:
+                return list(self._claimable())
+            except OSError:
+                return []
+
+    def take(self, path: Path) -> Path | None:
+        """파일 하나를 재적재용으로 인수한다(이름을 바꾸고 잠근다). 이미 다른 쪽이 가져갔으면 None.
+
+        한 번에 한 파일만 인수해야 재적재가 중간에 끝나도 남는 파일이 하나뿐이다.
+        """
+        with self._lock, self._directory_lock():
+            base = path.name.split(_REPLAYING)[0]
+            target = path.with_name(f"{base}{_REPLAYING}.{self._owner}")
+            try:
+                os.rename(path, target)
+            except OSError:
+                return None
+            if fcntl is not None:
                 try:
-                    os.rename(path, target)
+                    handle = target.open("r")
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:
-                    continue
-                claimed.append(target)
-            return claimed
+                    return None
+                self._held[target] = handle
+            return target
 
     def release(self, path: Path) -> None:
         """재적재를 마치지 못한 파일을 다시 닫힌 파일로 돌려놓는다."""
+        self._drop_hold(path)
         original = path.name.split(_REPLAYING)[0]
         name = original if original.endswith(_CLOSED) else original.removesuffix(_OPEN) + _CLOSED
         with contextlib.suppress(OSError):
             os.rename(path, path.with_name(name))
+
+    def finish(self, path: Path) -> None:
+        """재적재를 마친 파일을 지운다."""
+        self._drop_hold(path)
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+    def _drop_hold(self, path: Path) -> None:
+        with self._lock:
+            handle = self._held.pop(path, None)
+        if handle is not None:
+            with contextlib.suppress(OSError):
+                handle.close()
 
     @staticmethod
     def read(path: Path) -> tuple[list[Event], int]:
@@ -189,11 +220,6 @@ class LocalBuffer:
                     unreadable += 1
         return events, unreadable
 
-    @staticmethod
-    def discard(path: Path) -> None:
-        with contextlib.suppress(OSError):
-            path.unlink()
-
     def _claimable(self):
         if not self._dir.is_dir():
             return
@@ -205,10 +231,16 @@ class LocalBuffer:
                 name.endswith(_OPEN) and not name.startswith(self._owner) and self._orphaned(entry)
             ):
                 yield entry
+            elif (
+                _REPLAYING in name
+                and not name.endswith(f"{_REPLAYING}.{self._owner}")
+                and self._orphaned(entry)
+            ):
+                yield entry
 
     @staticmethod
     def _orphaned(path: Path) -> bool:
-        """쓰는 프로세스가 없는 열린 파일. 쓰는 쪽이 건 배타 잠금을 얻을 수 있으면 주인이 없다."""
+        """쓰거나 재적재하는 프로세스가 없는 파일. 배타 잠금을 얻을 수 있으면 주인이 없다."""
         if fcntl is None:
             return False
         try:
@@ -392,14 +424,22 @@ class EvidenceRecorder:
         return await self.fallback(event)
 
     async def replay(self) -> None:
-        """버퍼에 쌓인 사건을 DB에 적재한다. 중복은 세어 ``buffer_replayed``에 남긴다."""
+        """버퍼에 쌓인 사건을 DB에 적재한다. 중복은 세어 ``buffer_replayed``에 남긴다.
+
+        파일은 하나씩 인수한다. 적재가 실패하거나 취소되면 그 파일을 돌려놓고, 나머지는 건드리지
+        않으므로 다음 재적재가 이어받는다.
+        """
         store = self._store
         if store is None:
             return
         replayed = duplicates = unreadable = 0
-        for path in await asyncio.to_thread(self._buffer.claim):
-            events, bad = await asyncio.to_thread(self._buffer.read, path)
-            try:
+        held: Path | None = None
+        try:
+            for candidate in await asyncio.to_thread(self._buffer.pending):
+                held = await asyncio.to_thread(self._buffer.take, candidate)
+                if held is None:
+                    continue
+                events, bad = await asyncio.to_thread(self._buffer.read, held)
                 for event in events:
                     async with asyncio.timeout(self._budget):
                         inserted = await store.insert_event(event.with_evidence(Evidence.DB))
@@ -409,11 +449,14 @@ class EvidenceRecorder:
                         replayed += 1
                     else:
                         duplicates += 1
-            except Exception:
-                self._buffer.release(path)
-                break
-            unreadable += bad
-            self._buffer.discard(path)
+                unreadable += bad
+                self._buffer.finish(held)
+                held = None
+        except Exception:
+            pass
+        finally:
+            if held is not None:
+                self._buffer.release(held)
         if replayed or duplicates or unreadable:
             await self._append_system(
                 EventKind.BUFFER_REPLAYED,
