@@ -35,7 +35,7 @@ concurrency:
 jobs:
   integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -46,10 +46,10 @@ jobs:
       - run: uv sync --locked --extra dev --extra litellm
       - name: 스택 기동
         run: docker compose -p mint-e -f tests/integration/compose.yaml --profile plain up -d --build --wait
-        timeout-minutes: 20
+        timeout-minutes: 15
       - name: 인수시험
         run: uv run --no-sync pytest tests/integration -ra --durations=15
-        timeout-minutes: 80
+        timeout-minutes: 40
       - name: 실패 시 컨테이너 로그 수집
         if: failure()
         run: |
