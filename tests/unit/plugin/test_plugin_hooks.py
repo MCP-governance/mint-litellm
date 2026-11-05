@@ -124,6 +124,11 @@ def synthesized(obj, **override):
         "user_api_key_user_id": "u1",
     }
     data.update(override)
+    if "messages" not in override:
+        # LiteLLM의 변환기는 원래 인자를 첫 메시지 끝에 남긴다.
+        tool, arguments = data["mcp_tool_name"], data["mcp_arguments"]
+        content = f"Tool: {tool}\nArguments: {arguments}"
+        data["messages"] = [{"role": "user", "content": content}]
     return data
 
 
@@ -287,10 +292,41 @@ class TestGuardrailJudgment:
     def test_a_missing_arguments_key_is_judged_as_no_arguments(self, tmp_path, contract_snapshot):
         calls: list = []
         runtime, _, _ = build_runtime(tmp_path, contract_snapshot, evaluate=evaluator(calls=calls))
-        data = synthesized(logging_obj())
+        data = synthesized(logging_obj(), mcp_arguments={})
         del data["mcp_arguments"]
         assert pre(runtime.guardrail, data) is None
         assert calls[0]["arguments"]["keys"] == []
+
+    def test_a_reference_replaced_without_a_replacement_object_cannot_be_matched(
+        self, tmp_path, contract_snapshot
+    ):
+        # 전송부는 이 경우 원래 인자를 보내므로, 바뀐 참조를 판정하면 승인 대상이 갈린다.
+        runtime, store, snapshots = build_runtime(tmp_path, contract_snapshot)
+        data = synthesized(logging_obj())
+        data["mcp_arguments"] = {"q": "masked"}
+        assert blocked(lambda: pre(runtime.guardrail, data)).code == "MINT-SCHEMA-ERROR"
+        assert len(store.of_kind("decision_evaluated")) == 1 and snapshots.queries == []
+
+    @pytest.mark.parametrize(
+        "messages",
+        [None, [], [{}], [{"content": ["x"]}], [{"content": "Tool: t"}], "text"],
+        ids=["none", "empty", "no-content", "list-content", "no-arguments", "text"],
+    )
+    def test_without_the_original_arguments_witness_the_call_is_blocked(
+        self, tmp_path, contract_snapshot, messages
+    ):
+        runtime, _, snapshots = build_runtime(tmp_path, contract_snapshot)
+        data = synthesized(logging_obj(), messages=messages)
+        assert blocked(lambda: pre(runtime.guardrail, data)).code == "MINT-SCHEMA-ERROR"
+        assert snapshots.queries == []
+
+    def test_a_truthy_replacement_object_needs_no_witness(self, tmp_path, contract_snapshot):
+        calls: list = []
+        runtime, _, _ = build_runtime(tmp_path, contract_snapshot, evaluate=evaluator(calls=calls))
+        data = synthesized(logging_obj(), modified_arguments={"z": 1}, messages=[])
+        data["mcp_arguments"] = {"q": "masked"}
+        assert pre(runtime.guardrail, data) is None
+        assert calls[0]["arguments"]["keys"] == ["z"]
 
     def test_an_unverified_runtime_blocks_every_call(self, tmp_path, contract_snapshot):
         runtime, store, snapshots = build_runtime(tmp_path, contract_snapshot, verified=False)
@@ -541,6 +577,17 @@ class ArgumentsRewriter(CustomGuardrail):
         return changed
 
 
+class ReferenceReplacer(CustomGuardrail):
+    """순차 가드레일. ``mcp_arguments``만 다른 객체로 바꾸고 수정본은 만들지 않는다."""
+
+    def __init__(self, replacement, **kwargs):
+        super().__init__(**kwargs)
+        self.replacement = replacement
+
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        return {**data, "mcp_arguments": self.replacement}
+
+
 class ParallelBlocker(CustomGuardrail):
     """병렬 단계에서 호출을 막는 다른 가드레일."""
 
@@ -713,6 +760,52 @@ class TestParallelStage(ChainRunner):
         rig = self.build_rig(tmp_path, monkeypatch, contract_snapshot, before=[replacement])
         result = self.call(rig)
         assert result.error.code == "MINT-SCHEMA-ERROR" and result.sent is None
+
+    def test_litellm_sends_the_original_arguments_when_only_the_reference_was_replaced(
+        self, tmp_path, monkeypatch
+    ):
+        import litellm
+        from litellm.caching.caching import DualCache
+        from litellm.proxy.utils import ProxyLogging
+
+        replacer = ReferenceReplacer(
+            self.OTHER, guardrail_name="r", event_hook="pre_mcp_call", default_on=True
+        )
+        monkeypatch.setattr(litellm, "callbacks", [replacer])
+        rig = SimpleNamespace(proxy=ProxyLogging(user_api_key_cache=DualCache()))
+        data, _, start, user = self.data_for(rig)
+        data = run(
+            rig.proxy.pre_call_hook(user_api_key_dict=user, data=data, call_type="call_mcp_tool")
+        )
+        assert data["mcp_arguments"] == self.OTHER
+        converted = rig.proxy.convert_mcp_hook_response_to_kwargs(data, {"arguments": start})
+        assert converted["arguments"] == self.SENT
+
+    @pytest.mark.parametrize("approved", [{"q": "x"}, {"q": "y"}], ids=["original", "replaced"])
+    def test_a_sequential_guardrail_that_replaces_only_the_reference_is_blocked_whoever_is_approved(
+        self, tmp_path, monkeypatch, contract_snapshot, approved
+    ):
+        snap, _ = call_approval_snapshot(contract_snapshot, approved)
+        evaluate = evaluator("RequireApproval", policy_ids=("R2",))
+        replacer = ReferenceReplacer(
+            self.OTHER, guardrail_name="r", event_hook="pre_mcp_call", default_on=True
+        )
+        rig = self.build_rig(tmp_path, monkeypatch, snap, before=[replacer], evaluate=evaluate)
+        result = self.call(rig)
+        assert result.error.code == "MINT-SCHEMA-ERROR" and result.sent is None
+        assert result.store.consumed == []
+
+    def test_a_replacement_object_wins_over_a_replaced_reference(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        replacer = ReferenceReplacer(
+            {"q": "masked"}, guardrail_name="r", event_hook="pre_mcp_call", default_on=True
+        )
+        rig = self.build_rig(
+            tmp_path, monkeypatch, contract_snapshot, before=[replacer, self.OTHER]
+        )
+        result = self.call(rig)
+        assert result.error is None and result.sent == self.OTHER
 
     def test_the_rest_request_body_stage_is_skipped_by_litellm_not_by_mint(
         self, tmp_path, monkeypatch, contract_snapshot

@@ -905,6 +905,10 @@ def build_request(
         failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="hook data has no server or tool")
     elif not hook.arguments_ok:
         failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="arguments are not an object")
+    elif not hook.arguments_confirmed:
+        failure = StageResult.stop(
+            Reason.SCHEMA_ERROR, detail="arguments cannot be matched with the original"
+        )
     else:
         try:
             resolved = resolver(hook)

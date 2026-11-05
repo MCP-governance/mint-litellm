@@ -71,6 +71,9 @@ class LiteLLMView:
 
 def collect_view(env: Mapping[str, str] | None = None) -> LiteLLMView:
     missing = compat.missing_symbols()
+    if not missing:
+        witness = compat.arguments_witness_problem()
+        missing = [witness] if witness else []
     if missing:
         return LiteLLMView((), {}, True, False, True, (), missing)
     return LiteLLMView(
