@@ -1,7 +1,10 @@
 import asyncio
+import dataclasses
+import io
 import os
 import shlex
 import sys
+import tarfile
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -10,7 +13,9 @@ import httpx
 import pytest
 
 from mint_litellm.plugin.policy.bundle import (
+    BundleContentMismatch,
     activate_bundle,
+    loaded_bundle_sha256,
     prepare_bundle,
     publish_bundle,
     register_bundle,
@@ -171,3 +176,134 @@ def test_real_activation_and_recovery(live_database):
             asyncio.set_event_loop_policy(policy)
     else:
         asyncio.run(run())
+
+
+def _run(coroutine_function):
+    if sys.platform == "win32":
+        policy = asyncio.get_event_loop_policy()
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        try:
+            asyncio.run(coroutine_function())
+        finally:
+            asyncio.set_event_loop_policy(policy)
+    else:
+        asyncio.run(coroutine_function())
+
+
+def _tampered(archive: bytes, name: str, change) -> bytes:
+    """메타는 그대로 두고 번들 안 한 파일을 바꾸거나(없으면 ``change(b"")``로 추가한) 아카이브."""
+    source = io.BytesIO(archive)
+    output = io.BytesIO()
+    with tarfile.open(fileobj=source, mode="r:gz") as reader, \
+            tarfile.open(fileobj=output, mode="w:gz") as writer:
+        members = {m.name: reader.extractfile(m).read() for m in reader.getmembers()}
+        members[name] = change(members.get(name, b""))
+        for member_name, content in members.items():
+            info = tarfile.TarInfo(member_name)
+            info.size = len(content)
+            info.mtime = 0
+            writer.addfile(info, io.BytesIO(content))
+    return output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("name", "change"),
+    [
+        ("mint/policy.rego", lambda text: text + b"# edited" + bytes([10])),
+        ("mint/data/data.json", lambda text: text.replace(b"09:00", b"00:00")),
+        ("mint/data/inner/data.json", lambda _: b'{"d": 1}'),
+        ("data.json", lambda _: b'{"root_extra": 1}'),
+        ("mint/extra/data.json", lambda _: b'{"k": 1}'),
+        ("mint/data.json", lambda _: b'{"extra": 2}'),
+        ("mint/policy/data.json", lambda _: b'{"extra": 3}'),
+        ("mint/decision/data.json", lambda _: b'{"extra": 4}'),
+        ("system/data.json", lambda _: b'{"injected": {"k": 1}}'),
+        ("system/sub/data.json", lambda _: b'{"k": 1}'),
+        ("system/bundles/data.json", lambda _: b'{"x": 1}'),
+    ],
+    ids=[
+        "rule-line", "data-value", "data-subtree", "root-data", "other-data-path",
+        "mint-data", "rule-package-data", "decision-package-data", "system-data",
+        "system-subtree", "system-bundles",
+    ],
+)
+def test_activation_rejects_content_changed_with_unchanged_metadata(live_database, name, change):
+    import psycopg
+
+    bundle_dir = Path(os.environ["MINT_TEST_OPA_BUNDLE_DIR"])
+    opa_url = os.environ["MINT_TEST_OPA_URL"].rstrip("/")
+    good, tampered = (
+        prepare_bundle(ROOT, version, opa=opa_command(), opa_policy_path="/work/policy")
+        for version in ("good", "tampered")
+    )
+    forged = dataclasses.replace(tampered, archive=_tampered(tampered.archive, name, change))
+
+    async def run():
+        async with await psycopg.AsyncConnection.connect(live_database) as conn:
+            async def publish(data):
+                publish_bundle(bundle_dir / "mint.tar.gz", data)
+
+            await register_bundle(conn, instance_id="test", bundle=good)
+            await activate_bundle(
+                conn, instance_id="test", actor="operator", bundle=good,
+                publish=publish, opa_url=opa_url, timeout_seconds=30,
+            )
+            assert await loaded_bundle_sha256(opa_url) == good.bundle_sha256
+
+            await register_bundle(conn, instance_id="test", bundle=forged)
+            await conn.commit()
+            with pytest.raises(BundleContentMismatch):
+                await activate_bundle(
+                    conn, instance_id="test", actor="operator", bundle=forged,
+                    publish=publish, opa_url=opa_url, timeout_seconds=8,
+                )
+            await conn.rollback()
+            rows = await (await conn.execute(
+                "SELECT id, status FROM mint.policy_versions ORDER BY id"
+            )).fetchall()
+            assert rows == [("good", "active"), ("tampered", "validated")]
+            events = await (await conn.execute(
+                "SELECT count(*) FROM mint.events WHERE kind = %s", ("policy_activated",)
+            )).fetchone()
+            assert events[0] == 1
+            await publish(good.archive)
+            for _ in range(100):
+                try:
+                    if await loaded_bundle_sha256(opa_url) == good.bundle_sha256:
+                        break
+                except BundleContentMismatch:
+                    pass
+                await asyncio.sleep(0.1)
+            assert await loaded_bundle_sha256(opa_url) == good.bundle_sha256
+
+    _run(run)
+
+
+def test_watch_path_overwrites_injected_version_information(live_database):
+    import psycopg
+
+    bundle_dir = Path(os.environ["MINT_TEST_OPA_BUNDLE_DIR"])
+    opa_url = os.environ["MINT_TEST_OPA_URL"].rstrip("/")
+    prepared = prepare_bundle(ROOT, "version", opa=opa_command(), opa_policy_path="/work/policy")
+    forged = dataclasses.replace(prepared, archive=_tampered(
+        prepared.archive, "system/version/data.json", lambda _: b'{"version": {"injected": 1}}'
+    ))
+
+    async def run():
+        async with await psycopg.AsyncConnection.connect(live_database) as conn:
+            async def publish(data):
+                publish_bundle(bundle_dir / "mint.tar.gz", data)
+
+            await register_bundle(conn, instance_id="test", bundle=forged)
+            await activate_bundle(
+                conn, instance_id="test", actor="operator", bundle=forged,
+                publish=publish, opa_url=opa_url, timeout_seconds=30,
+            )
+            async with httpx.AsyncClient(trust_env=False) as client:
+                reply = await client.get(f"{opa_url}/v1/data/system/version")
+            assert set(reply.json()["result"]) == {
+                "build_commit", "build_hostname", "build_timestamp", "version"
+            }
+            assert all(type(v) is str for v in reply.json()["result"].values())
+
+    _run(run)

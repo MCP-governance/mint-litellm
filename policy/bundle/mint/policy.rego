@@ -227,6 +227,12 @@ observable if {
 
 default observable := false
 
-obligations := [{"type": "require_consent", "purpose": conditions.require_consent}] if {
+call_approval_obligations := [{"type": "require_call_approval"}] if {
+	"R2" in applied
+} else := []
+
+consent_obligations := [{"type": "require_consent", "purpose": conditions.require_consent}] if {
 	"R4" in applied
 } else := []
+
+obligations := array.concat(call_approval_obligations, consent_obligations)
