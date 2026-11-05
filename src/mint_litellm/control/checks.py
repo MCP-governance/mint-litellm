@@ -201,8 +201,6 @@ def _check_file_rows(judge, config, general, lsettings, servers_cfg, env, replic
             problems.append("mode에 pre_mcp_call과 post_mcp_call이 모두 필요합니다")
         if params.get("default_on") is not True:
             problems.append("default_on이 true가 아닙니다")
-        if mint_index != len(guardrails) - 1:
-            problems.append("사전 훅 순서에서 마지막이어야 합니다(가드레일 목록의 마지막 항목)")
         judge("guardrails[MINT]", not problems, "; ".join(problems))
 
     callbacks = lsettings.get("callbacks") or []
@@ -372,8 +370,9 @@ def _check_keys_and_teams(
     report.observations["guardrail_optout_subjects"] = subjects
     if subjects:
         report.add("가드레일 제외 대상", Level.WARN,
-                   f"MINT 가드레일을 제외했거나 전역 가드레일을 끈 키·팀이 {subjects}개 있습니다. "
-                   "이 키·팀도 MINT 로거가 판정하며 가드레일 전용 기능만 적용되지 않습니다.")
+                   f"키·팀 metadata로 가드레일을 끈 키·팀이 {subjects}개 있습니다. "
+                   "MINT 판정과 도구 목록 숨김은 그대로 적용되고, "
+                   "꺼지는 것은 다른 가드레일뿐입니다.")
     bad: list[str] = []
     for owner, kind, objects in (("키", "key", keys), ("팀", "team", teams)):
         for obj in objects:

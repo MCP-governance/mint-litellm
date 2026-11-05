@@ -162,4 +162,4 @@
 
 ## 설정 조각과 기동 전 검사
 
-`init`이 만드는 설정 조각에는 `litellm_settings.callbacks`가 없다. MINT 로거는 MINT 가드레일이 등록하므로 `callbacks`에 로거가 적혀 있으면 기동 전 검사와 `check`가 거부하고, MINT 가드레일은 가드레일 목록의 마지막이어야 한다. 기동 전 검사와 `check`는 주 설정 파일이 아니라 LiteLLM의 설정 로더가 `include`까지 병합한 설정을 검사한다. 이 로더를 쓸 수 없으면 `include`가 있는 설정을 거부하고, 파생 이미지의 기동 전 검사는 로더가 없으면 통과시키지 않는다.
+`init`이 만드는 설정 조각에는 `litellm_settings.callbacks`가 없다. MINT 로거는 MINT 가드레일이 등록하므로 `callbacks`에 로거가 적혀 있으면 기동 전 검사와 `check`가 거부한다. 기동 전 검사와 `check`는 주 설정 파일이 아니라 LiteLLM의 설정 로더가 `include`까지 병합한 설정을 검사한다. 이 로더를 쓸 수 없으면 `include`가 있는 설정을 거부하고, 파생 이미지의 기동 전 검사는 로더가 없으면 통과시키지 않는다.

@@ -72,8 +72,6 @@ def test_every_settings_row_is_reported(healthy):
          "guardrails[MINT]"),
         (lambda c: c["guardrails"][0]["litellm_params"].update(default_on=False),
          "guardrails[MINT]"),
-        (lambda c: c["guardrails"].append({"guardrail_name": "z", "litellm_params": {
-            "guardrail": "other"}}), "guardrails[MINT]"),
         (lambda c: c["litellm_settings"].update(callbacks=["x.plugin.MintLogger"]), "callbacks"),
         (lambda c: c["litellm_settings"].update(callbacks=["x.mint_logger"]), "callbacks"),
         (lambda c: c["mcp_servers"]["everything"].update(allow_all_keys=True),
@@ -390,7 +388,7 @@ def test_the_mint_guardrail_name_comes_from_the_config(healthy, stub):
     report = run(config, healthy)
     assert report.observations["guardrail_optout_subjects"] == 3  # 이름이 다른 'mint'는 해당 없음
     message = next(f.message for f in report.findings if f.item == "가드레일 제외 대상")
-    assert "호출할 수 없게" not in message and "판정하며" in message
+    assert "다른 가드레일뿐입니다" in message and "호출할 수 없게" not in message
 
 
 @pytest.mark.parametrize(

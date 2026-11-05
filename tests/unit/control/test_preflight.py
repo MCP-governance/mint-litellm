@@ -41,8 +41,6 @@ def test_a_complete_snippet_passes(tmp_path):
         (lambda c: c["guardrails"][0]["litellm_params"].update(mode=["pre_mcp_call"]),
          "guardrails[MINT]"),
         (lambda c: c["litellm_settings"].update(callbacks=["x.plugin.MintLogger"]), "callbacks"),
-        (lambda c: c["guardrails"].append({"guardrail_name": "z", "litellm_params": {
-            "guardrail": "other"}}), "guardrails[MINT]"),
         (lambda c: c["general_settings"].pop("require_key_mcp_access_defined"),
          "require_key_mcp_access_defined"),
         (lambda c: c["general_settings"].update(store_prompts_in_spend_logs=True),
