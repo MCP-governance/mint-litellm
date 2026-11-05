@@ -867,7 +867,7 @@ def test_a_call_to_a_silent_database_is_blocked_as_a_dependency_failure_at_the_b
 def test_the_loser_of_a_concurrent_consumption_is_always_blocked_as_already_consumed(
     scenario, plugin_dsn, tmp_path
 ):
-    """복제본 둘이 같은 호출별 승인을 동시에 소비하면 진 쪽은 승인 요구로 막힌다(의존 장애가 아니다)."""
+    """복제본 둘이 같은 호출별 승인을 동시에 소비하면 진 쪽은 승인 요구로 막힌다."""
     rounds = 20
     approvals = [uuid.uuid4() for _ in range(rounds)]
     for call_id in approvals:
