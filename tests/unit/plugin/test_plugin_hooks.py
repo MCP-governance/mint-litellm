@@ -84,6 +84,13 @@ def build_runtime(tmp_path, snap=None, *, evaluate="allow", verified=True):
         evaluate=evaluator() if evaluate == "allow" else evaluate,
     )
     runtime.verified = verified
+    # 로거는 등록된 MINT 가드레일 인스턴스가 이 호출에서 실행되는지 묻는다.
+    MintGuardrail(
+        runtime=runtime,
+        guardrail_name="mint",
+        event_hook=["pre_mcp_call", "post_mcp_call"],
+        default_on=True,
+    )
     return runtime, store, snapshots
 
 
@@ -486,16 +493,25 @@ class ArgumentsRewriter(CustomGuardrail):
         return {**data, "modified_arguments": self.replacement}
 
 
-class TestCallbackChain:
-    """LiteLLM의 사전 훅 순회를 그대로 거쳐, 판정한 인자와 전송될 인자를 대조한다."""
-
+class ChainRunner:
     SENT = {"q": "x"}
     OTHER = {"q": "y"}
 
     def run_chain(
-        self, tmp_path, monkeypatch, order, snap, evaluate="allow", empty_arguments=False
+        self,
+        tmp_path,
+        monkeypatch,
+        order,
+        snap,
+        evaluate="allow",
+        empty_arguments=False,
+        user=None,
+        guardrail_instance="registered",
     ):
-        """``order``의 문자열은 MINT 로거·가드레일, 딕셔너리는 인자를 그 값으로 바꾸는 가드레일."""
+        """``order``의 문자열은 MINT 로거·가드레일, 그 밖의 값은 인자를 그 값으로 바꾸는 가드레일.
+
+        도구 호출 데이터는 LiteLLM이 키 객체에서 직접 만든다.
+        """
         import litellm
         from litellm.caching.caching import DualCache
         from litellm.proxy.utils import ProxyLogging
@@ -508,6 +524,14 @@ class TestCallbackChain:
             event_hook=["pre_mcp_call", "post_mcp_call"],
             default_on=True,
         )
+        if guardrail_instance == "missing":
+            runtime.guardrail = None
+        elif guardrail_instance == "failing":
+
+            def explode(**kwargs):
+                raise RuntimeError("boom")
+
+            guardrail.should_run_guardrail = explode
         chain = []
         for index, item in enumerate(order):
             if item == "logger":
@@ -527,18 +551,35 @@ class TestCallbackChain:
         proxy = ProxyLogging(user_api_key_cache=DualCache())
         obj = logging_obj()
         start = {} if empty_arguments else dict(self.SENT)
-        data = synthesized(obj, mcp_arguments=start)
+        user = user if user is not None else auth()
+        kwargs = {
+            "name": "search",
+            "arguments": start,
+            "server_name": "mslearn",
+            "mcp_rate_limit_server_name": "mslearn",
+            "user_api_key_auth": user,
+            "user_api_key_user_id": user.user_id,
+            "user_api_key_team_id": user.team_id,
+        }
+        data = proxy.convert_mcp_to_llm_format(
+            proxy.create_mcp_request_object_from_kwargs(kwargs), kwargs
+        )
+        data["litellm_logging_obj"] = obj
         result = SimpleNamespace(error=None, sent=None, obj=obj, store=store, logger=logger)
         try:
             data = run(
-                proxy.pre_call_hook(user_api_key_dict=auth(), data=data, call_type="call_mcp_tool")
+                proxy.pre_call_hook(user_api_key_dict=user, data=data, call_type="call_mcp_tool")
             )
         except HTTPException as exc:
             result.error = MintError.from_detail(exc.detail)
             return result
-        kwargs = proxy.convert_mcp_hook_response_to_kwargs(data, {"arguments": start})
-        result.sent = kwargs["arguments"]
+        converted = proxy.convert_mcp_hook_response_to_kwargs(data, {"arguments": start})
+        result.sent = converted["arguments"]
         return result
+
+
+class TestCallbackChain(ChainRunner):
+    """LiteLLM의 사전 훅 순회를 그대로 거쳐, 판정한 인자와 전송될 인자를 대조한다."""
 
     def test_the_unchanged_arguments_pass_the_whole_chain(
         self, tmp_path, monkeypatch, contract_snapshot
@@ -685,6 +726,89 @@ class TestCallbackChain:
         order = ["logger", self.OTHER, "guardrail"]
         result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
         assert result.store.of_kind("call_approval_consumed_without_dispatch") == []
+
+
+class TestGuardrailOptOut(ChainRunner):
+    """키·팀 설정으로 MINT 가드레일이 꺼진 호출은 로거가 판정 단계에서 막는다."""
+
+    def test_the_data_the_logger_receives_carries_the_key_and_team_metadata(self):
+        from litellm.caching.caching import DualCache
+        from litellm.proxy.utils import ProxyLogging
+
+        proxy = ProxyLogging(user_api_key_cache=DualCache())
+        user = auth(
+            metadata={"opted_out_global_guardrails": ["mint"]},
+            team_metadata={"disable_global_guardrails": True},
+        )
+        kwargs = {"name": "search", "arguments": {}, "server_name": "mslearn"}
+        kwargs["user_api_key_auth"] = user
+        data = proxy.convert_mcp_to_llm_format(
+            proxy.create_mcp_request_object_from_kwargs(kwargs), kwargs
+        )
+        assert data["metadata"]["user_api_key_metadata"] == {
+            "opted_out_global_guardrails": ["mint"]
+        }
+        assert data["metadata"]["user_api_key_team_metadata"] == {"disable_global_guardrails": True}
+
+    def test_a_key_that_opts_out_of_the_mint_guardrail_cannot_send_changed_arguments(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        user = auth(metadata={"opted_out_global_guardrails": ["mint"]})
+        order = ["logger", self.OTHER, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot, user=user)
+        assert result.sent is None
+        assert result.error.code == "MINT-GUARDRAIL-OPTED-OUT"
+        assert result.error.dispatch_state.value == "not_dispatched"
+        assert result.error.retry_safe is False
+        (event,) = result.store.events.values()
+        assert event.kind.value == "decision_evaluated"
+        assert event.payload["stop"]["reason_code"] == "GUARDRAIL_OPTED_OUT"
+        assert result.store.consumed == []
+
+    def test_opting_out_blocks_every_call_of_the_key(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        user = auth(metadata={"opted_out_global_guardrails": ["mint"]})
+        result = self.run_chain(
+            tmp_path, monkeypatch, ["logger", "guardrail"], contract_snapshot, user=user
+        )
+        assert result.error.code == "MINT-GUARDRAIL-OPTED-OUT" and result.sent is None
+
+    def test_opting_out_of_another_guardrail_leaves_the_call_judged_normally(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        user = auth(metadata={"opted_out_global_guardrails": ["pii"]})
+        order = ["logger", "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot, user=user)
+        assert result.error is None and result.sent == self.SENT
+        order = ["logger", self.OTHER, "guardrail"]
+        result = self.run_chain(
+            tmp_path / "again", monkeypatch, order, contract_snapshot, user=user
+        )
+        assert result.error.code == "MINT-ARGUMENTS-CHANGED"
+
+    def test_a_team_that_disables_global_guardrails_is_blocked(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        user = auth(team_metadata={"disable_global_guardrails": True})
+        order = ["logger", "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot, user=user)
+        assert result.error.code == "MINT-GUARDRAIL-OPTED-OUT"
+
+    @pytest.mark.parametrize("instance", ["missing", "failing"])
+    def test_a_guardrail_that_cannot_be_asked_blocks_the_call(
+        self, tmp_path, monkeypatch, contract_snapshot, instance
+    ):
+        order = ["logger", "guardrail"]
+        result = self.run_chain(
+            tmp_path, monkeypatch, order, contract_snapshot, guardrail_instance=instance
+        )
+        assert result.error.code == "MINT-GUARDRAIL-OPTED-OUT" and result.sent is None
+        (event,) = result.store.events.values()
+        assert event.payload["stop"]["detail"] in {
+            "guardrail not registered",
+            "guardrail check failed",
+        }
 
 
 class TestConstructors:

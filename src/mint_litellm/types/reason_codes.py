@@ -46,6 +46,8 @@ class Reason(StrEnum):
     ENFORCEMENT_UNVERIFIED = "ENFORCEMENT_UNVERIFIED"
     # 판정한 인자와 전송 직전 인자가 다르다. 호출별 승인이 이미 소비됐을 수 있어 재시도하지 않는다.
     ARGUMENTS_CHANGED = "ARGUMENTS_CHANGED"
+    # 키·팀 설정으로 MINT 가드레일이 이 호출에서 실행되지 않는다. 관리자가 설정을 고쳐야 한다.
+    GUARDRAIL_OPTED_OUT = "GUARDRAIL_OPTED_OUT"
 
 
 PARAMETERIZED_REASONS: frozenset[Reason] = frozenset(

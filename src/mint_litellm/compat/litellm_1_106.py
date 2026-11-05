@@ -64,6 +64,19 @@ def effective_arguments(data: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return arguments if isinstance(arguments, Mapping) else None
 
 
+def guardrail_runs(guardrail: Any, data: Mapping[str, Any]) -> bool:
+    """이 호출의 사전 훅 단계에서 ``guardrail``이 실행되는지.
+
+    LiteLLM이 가드레일을 건너뛸지 정할 때 쓰는 함수를 같은 이벤트와 같은 ``data``로 직접 부른다.
+    """
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    return (
+        guardrail.should_run_guardrail(data=data, event_type=GuardrailEventHooks.pre_mcp_call)
+        is True
+    )
+
+
 def parse_hook_data(data: Mapping[str, Any]) -> HookData:
     arguments = effective_arguments(data)
     logging_obj = data.get("litellm_logging_obj")

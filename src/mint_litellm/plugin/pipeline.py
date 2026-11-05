@@ -167,12 +167,12 @@ class _Stages:
 
 
 def context_result(req: CallRequest, verified: bool) -> StageResult | None:
-    if req.forced_stop is not None:
-        return req.forced_stop
     if not verified:
         return StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED)
     if req.principal.principal_type is PrincipalType.MASTER_KEY:
         return StageResult.stop(Reason.MASTER_KEY_FORBIDDEN)
+    if req.forced_stop is not None:
+        return req.forced_stop
     if req.resolution_failure is not None:
         return req.resolution_failure
     resolved = req.resolved

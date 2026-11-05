@@ -4,7 +4,8 @@
 ``mint_litellm.plugin.logger.mint_logger``는 처음 읽을 때 만들어진다.
 
 로거의 사전 훅은 키·팀 메타데이터의 가드레일 제외 설정에 영향받지 않으므로 호출 판정은 여기서
-한다. 가드레일은 같은 호출에 이 훅의 판정 표식이 있는지만 확인한다.
+한다. 가드레일은 같은 호출에 이 훅의 판정 표식이 있고 인자가 바뀌지 않았는지 확인하므로, MINT
+가드레일이 이 호출에서 실행되지 않으면 판정 단계에서 호출을 막는다.
 """
 
 from __future__ import annotations
@@ -18,7 +19,12 @@ from litellm.integrations.custom_logger import CustomLogger
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.plugin.result import observe_response, observe_unknown_outcome
 from mint_litellm.plugin.selfcheck import PluginRuntime, get_runtime
-from mint_litellm.types.decision import MINT_CTX_KEY, MINT_DECISION_REF_KEY, MintContext
+from mint_litellm.types.decision import (
+    MINT_CTX_KEY,
+    MINT_DECISION_REF_KEY,
+    MintContext,
+    StageResult,
+)
 from mint_litellm.types.errors import error_for_reason
 from mint_litellm.types.ids import new_uuid7
 from mint_litellm.types.reason_codes import Reason
@@ -53,7 +59,9 @@ class MintLogger(CustomLogger):
         if not hook.is_synthesized:
             return None
         try:
-            outcome = await self._runtime.judge_call(data, user_api_key_dict)
+            outcome = await self._runtime.judge_call(
+                data, user_api_key_dict, stop=self._opted_out_stop(data)
+            )
         except Exception as exc:
             log.error("도구 호출 판정 오류: %s", type(exc).__name__)
             raise internal_block() from exc
@@ -65,6 +73,22 @@ class MintLogger(CustomLogger):
             raise HTTPException(status_code=403, detail=outcome.error.detail())
         data[MINT_DECISION_REF_KEY] = outcome.snapshot.decision_ref
         return data
+
+    def _opted_out_stop(self, data: dict) -> StageResult | None:
+        """MINT 가드레일이 이 호출에서 실행되지 않으면 호출을 막는 정지. 확인하지 못해도 막는다.
+
+        가드레일이 건너뛰어지면 판정 뒤에 바뀐 인자를 대조할 곳이 없다.
+        """
+        guardrail = self._runtime.guardrail
+        if guardrail is None:
+            return StageResult.stop(Reason.GUARDRAIL_OPTED_OUT, detail="guardrail not registered")
+        try:
+            if compat.guardrail_runs(guardrail, data):
+                return None
+        except Exception as exc:
+            log.error("가드레일 실행 여부 확인 오류: %s", type(exc).__name__)
+            return StageResult.stop(Reason.GUARDRAIL_OPTED_OUT, detail="guardrail check failed")
+        return StageResult.stop(Reason.GUARDRAIL_OPTED_OUT)
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         ctx = kwargs.get(MINT_CTX_KEY)

@@ -361,7 +361,7 @@ SETTINGS_TABLE: tuple[SettingRow, ...] = (
 )
 
 # check·status가 출력하는 관측 항목. 실패 조건이 아니다.
-# guardrail_optout_subjects는 가드레일 제외 메타데이터를 가진 키·팀의 수이고,
+# guardrail_optout_subjects는 MINT 가드레일을 제외해 MCP를 호출할 수 없게 되는 키·팀의 수이고,
 # unbound_keys는 사용자와 팀 어디에도 결속되지 않은 키의 수이다(0이 아니면 경고).
 OBSERVATION_ITEMS: tuple[str, ...] = (
     "spend_log_arguments_stored",
