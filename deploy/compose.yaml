@@ -34,7 +34,9 @@ services:
     image: mint-litellm:local
     command: ["--config", "/app/config/litellm.config.yaml", "--port", "4000"]
     # 인자 지문 키(MINT_FINGERPRINT_KEY, MINT_FINGERPRINT_KEY_VERSION)는 저장소 밖 비밀 파일에서 읽는다.
-    env_file: ${MINT_SECRETS_DIR:?MINT_SECRETS_DIR를 .env에 설정하십시오}/secrets.env
+    env_file:
+      - path: ${MINT_SECRETS_DIR:?MINT_SECRETS_DIR를 .env에 설정하십시오}/secrets.env
+        required: false
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/litellm
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY를 .env에 설정하십시오}
@@ -76,7 +78,8 @@ services:
     entrypoint: ["mint-litellm"]
     env_file:
       - .env
-      - ${MINT_SECRETS_DIR:?MINT_SECRETS_DIR를 .env에 설정하십시오}/secrets.env
+      - path: ${MINT_SECRETS_DIR:?MINT_SECRETS_DIR를 .env에 설정하십시오}/secrets.env
+        required: false
     environment:
       MINT_SECRETS_FILE: /run/mint-secrets/secrets.env
       MINT_DATABASE_URL: postgresql://mint_control_app:${MINT_CONTROL_DB_PASSWORD}@postgres:5432/mint

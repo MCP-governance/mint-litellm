@@ -267,7 +267,19 @@ def test_concurrent_settings_changes_do_not_overwrite_each_other(fresh_db):
 
     thread = threading.Thread(target=other)
     thread.start()
-    time.sleep(0.5)  # 상대가 읽기를 시도하는 동안 먼저 변경을 커밋하지 않는다
+    # 상대가 첫 연결의 행 잠금을 기다리는 것을 확인한 뒤에 커밋한다. 잠금이 없으면 상대는
+    # 기다리지 않고 지나가 이 확인이 시간 초과로 실패한다.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        waiting = fetchone(
+            a, "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+            (b.info.backend_pid,),
+        )
+        if waiting and waiting["wait_event_type"] == "Lock":
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("두 번째 변경이 첫 변경의 잠금을 기다리지 않았다")
     a.commit()
     thread.join(10)
     assert result == {"done": True}

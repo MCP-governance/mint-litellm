@@ -8,11 +8,12 @@ BUNDLE_FILE=/bundles/mint.tar.gz
 
 fail() { echo "$*" >&2; exit 1; }
 
+# 설정되지 않은 키는 빈 값이다(이전 .env에는 없는 키가 있다).
 env_value() {
-    grep -E "^$1=" .env | head -n1 | cut -d= -f2-
+    grep -E "^$1=" .env | head -n1 | cut -d= -f2- || true
 }
 
-# 인자 지문 키는 저장소 밖 비밀 파일에 둔다. 디렉터리와 빈 파일(0600)만 준비하고, 키는 init이 만든다.
+# 인자 지문 키는 저장소 밖 비밀 파일에 둔다. 디렉터리(0700)만 준비하고, 파일과 키는 init이 만든다.
 ensure_secrets() {
     local dir
     dir="$(env_value MINT_SECRETS_DIR)"
@@ -23,7 +24,6 @@ ensure_secrets() {
     fi
     mkdir -p "$dir"
     chmod 700 "$dir"
-    [ -f "$dir/secrets.env" ] || (umask 077 && : > "$dir/secrets.env")
 }
 
 require_env() {

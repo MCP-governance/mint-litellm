@@ -40,6 +40,8 @@ class Cli:
             "MINT_INSTANCE_ID": "clitest",
             "MINT_LITELLM_URL": litellm_url,
             "MINT_LITELLM_KEY": CONTROL_KEY,
+            # 시험이 사용자의 실제 비밀 파일을 만들지 않도록 시험별 경로로 격리한다.
+            "MINT_SECRETS_FILE": str(tmp_path / "isolated-secrets.env"),
         }
         self.capsys = capsys
         self.tmp = tmp_path
