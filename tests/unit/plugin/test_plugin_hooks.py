@@ -569,6 +569,9 @@ class TestCallbackChain:
         assert blocked_event.payload["stop"]["reason_code"] == "ARGUMENTS_CHANGED"
         assert blocked_event.payload["stop"]["detail"] == f"decision_ref={original}"
         assert len(result.store.events) == 2
+        ctx = result.obj.model_call_details[MINT_CTX_KEY]
+        assert str(blocked_event.invocation_id) == ctx["invocation_id"]
+        assert blocked_event.attempt_id == ctx["attempt_id"] + 1
         assert result.error.reference == f"{blocked_event.invocation_id}:{blocked_event.attempt_id}"
 
     def test_a_change_that_was_blocked_leaves_no_unknown_outcome_event(
@@ -668,6 +671,10 @@ class TestCallbackChain:
             ":call_approval_consumed_without_dispatch"
         )
         assert event.actor == "mint-plugin"
+        ctx = result.obj.model_call_details[MINT_CTX_KEY]
+        assert str(event.invocation_id) == ctx["invocation_id"]
+        decisions = result.store.of_kind("decision_evaluated")
+        assert {str(e.invocation_id) for e in decisions} == {ctx["invocation_id"]}
         text = event.to_json_line()
         assert approval.args_fp not in text and "arguments_digest" not in text
         assert len(result.store.events) == 3

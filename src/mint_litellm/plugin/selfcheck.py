@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.compat.litellm_1_106 import RegistryEntry
@@ -298,6 +299,7 @@ class PluginRuntime:
         *,
         unverified: bool = False,
         stop: StageResult | None = None,
+        attempt: tuple[UUID, int] | None = None,
     ):
         deps = self.deps if not unverified else _unverified(self.deps)
         request = build_request(
@@ -311,6 +313,8 @@ class PluginRuntime:
         )
         if stop is not None:
             request = replace(request, forced_stop=stop)
+        if attempt is not None:
+            request = replace(request, invocation_id=attempt[0], attempt_id=attempt[1])
         outcome: Outcome = await evaluate_request(request, deps)
         return outcome
 

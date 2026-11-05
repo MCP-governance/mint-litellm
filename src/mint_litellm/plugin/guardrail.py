@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from uuid import UUID
 
 from fastapi import HTTPException
 from litellm.integrations.custom_guardrail import CustomGuardrail
@@ -64,12 +65,14 @@ class MintGuardrail(CustomGuardrail):
         state, ctx = self._judged_state(data, ref)
         if state == "current":
             return None
-        stop = None
+        stop = attempt = None
         if state == "changed":
             stop = self._changed_stop(ctx)
+            # 같은 호출의 다음 시도로 기록해 원래 판정·승인 소비와 호출 식별자로 이어지게 한다.
+            attempt = (UUID(ctx["invocation_id"]), int(ctx["attempt_id"]) + 1)
         try:
             outcome = await self._runtime.judge_call(
-                data, user_api_key_dict, unverified=stop is None, stop=stop
+                data, user_api_key_dict, unverified=stop is None, stop=stop, attempt=attempt
             )
         except Exception as exc:
             log.error("안전망 판정 오류: %s", type(exc).__name__)
