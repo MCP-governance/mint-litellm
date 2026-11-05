@@ -178,6 +178,18 @@ def test_restore_rejects_stale_or_altered_copies(tmp_path):
     assert restore_bundle(path, "a", sha_a)
 
 
+def test_truncated_archives_are_treated_as_missing(tmp_path):
+    path = tmp_path / "bundle.tar.gz"
+    previous = tmp_path / "bundle.tar.gz.previous"
+    (a, sha_a), (b, _) = _archive("a"), _archive("b")
+    previous.write_bytes(a[: len(a) // 2])
+    publish_bundle(path, b)
+    assert not restore_bundle(path, "a", sha_a)
+    publish_bundle(path, a[: len(a) // 2])
+    keep_active_bundle(path, "a", sha_a)
+    assert previous.read_bytes() == a[: len(a) // 2]
+
+
 def _with_meta(archive: bytes, name: str, sha: str) -> bytes:
     stream = io.BytesIO()
     meta = json.dumps({"policy_version_id": name, "bundle_sha256": sha}).encode()

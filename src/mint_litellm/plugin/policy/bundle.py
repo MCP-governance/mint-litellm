@@ -9,6 +9,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import zlib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -319,7 +320,10 @@ def _archive_identity(data: bytes) -> tuple[str, str] | None:
         identity = (meta["policy_version_id"], meta["bundle_sha256"])
         if bundle_content_sha256(modules, documents) != identity[1]:
             return None
-    except (tarfile.TarError, OSError, KeyError, ValueError, TypeError, AttributeError):
+    except (
+        tarfile.TarError, OSError, EOFError, zlib.error, KeyError, ValueError, TypeError,
+        AttributeError,
+    ):
         return None
     return identity if all(isinstance(part, str) for part in identity) else None
 
@@ -475,7 +479,8 @@ async def activate_bundle(
     잠금 안에서 DB의 활성 판본을 다시 읽어 그 번들로 되돌리고 OPA가 다시 서빙하는지 확인한다.
     결과는 던져지는 예외(취소 포함)의 ``restore_outcome``과 노트에 담긴다. 활성 판본과 내용이
     같은 보관본이 없거나, 연결이 끊겨 커밋 결과를 알 수 없거나, DB가 이미 새 판본을 활성으로
-    보이면 되돌리지 않는다. 복원 시간은 전체 제한(``timeout_seconds``) 안에서 먼저 떼어 둔다.
+    보이면 되돌리지 않는다. 복원 시간은 전체 제한(``timeout_seconds``)에서 먼저 떼어 두며,
+    남은 몫이 1초보다 작으면 복원에 최대 1초를 더 쓴다.
     """
     if timeout_seconds <= 0 or not actor:
         raise ValueError("invalid activation parameters")
