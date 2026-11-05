@@ -122,6 +122,17 @@ def test_require_approval_merges_with_an_explicit_one():
     assert out.obligation_types == (ObligationType.ALERT, ObligationType.REQUIRE_CALL_APPROVAL)
 
 
+def test_block_keeps_obligations_collected_from_other_rules():
+    out = normalize_policy_output(
+        "Block",
+        ["R3"],
+        [{"type": "require_call_approval"}, {"type": "require_consent", "purpose": "use"}],
+    )
+    assert out.failure is None
+    assert [f.reason_code for f in out.findings] == ["POLICY_DETECT_R3"]
+    assert out.obligations == (RequireCallApproval(), RequireConsent(purpose="use"))
+
+
 def test_block_becomes_one_finding_per_policy():
     out = normalize_policy_output("Block", ["POL-E-07", "POL-E-08"], [])
     assert [f.reason_code for f in out.findings] == [
