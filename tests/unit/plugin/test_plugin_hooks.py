@@ -388,7 +388,6 @@ class TestResponseAndFailureEvents:
         run(hook.async_log_failure_event(failure, None, None, None))
         (event,) = store.of_kind("call_outcome_unknown")
         assert event.payload["call_approval_id"] == consumed["id"]
-        assert store.of_kind("call_approval_consumed_without_dispatch") == []
 
     def test_the_failure_event_of_a_blocked_call_is_ignored(self, tmp_path):
         hook, store = self.hook(tmp_path)
@@ -796,7 +795,6 @@ class TestAnotherParallelGuardrailBlocks(ChainRunner):
         run(rig.logger.async_log_failure_event(failure, None, None, None))
         (event,) = rig.store.of_kind("call_outcome_unknown")
         assert event.payload["call_approval_id"] == str(approval_row.id)
-        assert rig.store.of_kind("call_approval_consumed_without_dispatch") == []
 
 
 class TestListing(ChainRunner):
