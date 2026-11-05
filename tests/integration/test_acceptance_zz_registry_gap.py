@@ -75,3 +75,42 @@ def test_registered_server_missing_from_registry_stops_start_and_unverified_bloc
     )
     assert verified[0]["n"] >= 1
     assert json.loads(world.mint.run("status", check=False).stdout)["enforcement"]
+
+
+def test_suspended_server_missing_from_registry_does_not_stop_start_and_is_reported(
+    world, evidence
+):
+    """중지한 서버는 LiteLLM에서 지워도 기동을 막지 않고, 플러그인이 사건 하나로 알린다."""
+    server_id = db_server("mcp_gap_suspended", DB_SERVER_URL)
+    subject = world.subject((server_id,))
+    world.approve(subject, world.prepare(subject, server_id, url=DB_SERVER_URL), tools="echo")
+    world.mint.run("server", "suspend", server_id)
+    delete_db_server(server_id)
+    since = world.now()
+    try:
+        support.compose("up", "-d", "--wait", "--force-recreate", "litellm2")
+        support.wait_until(
+            lambda: world.query(
+                "select 1 from mint.events where kind = 'enforcement_verified' "
+                "and inserted_at >= %s",
+                (since,),
+            ),
+            120,
+            3,
+            what="the restarted replica passes its checks",
+        )
+        mismatches = world.query(
+            "select payload from mint.events where kind = 'server_identity_mismatch_observed' "
+            "and inserted_at >= %s and payload->>'server_id' = %s",
+            (since, server_id),
+        )
+        assert len(mismatches) >= 1
+        assert all(m["payload"]["fields"] == ["registry_missing"] for m in mismatches)
+        failed = world.query(
+            "select 1 from mint.events where kind = 'enforcement_unverified' and inserted_at >= %s",
+            (since,),
+        )
+        assert failed == []
+    finally:
+        db_server("mcp_gap_suspended", DB_SERVER_URL, server_id)
+        support.compose("up", "-d", "--wait", "--force-recreate", "litellm2")

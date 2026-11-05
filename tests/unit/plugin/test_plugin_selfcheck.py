@@ -250,16 +250,20 @@ def test_contract_mismatches_cover_only_controlled_servers_present_in_the_regist
         ("srv-1", "auth_type"),
     ]
     assert contract_mismatches(changed, [registered(status="pending")]) == []
+    # 승인된 서버가 레지스트리에서 지워진 경우는 자가 점검 5번이 막으므로 세지 않는다.
     assert contract_mismatches(view(registry=[]), [registered()]) == []
     assert contract_mismatches(view(), [registered()]) == []
+    assert contract_mismatches(view(registry=[]), [registered(status="suspended")]) == [
+        ("srv-1", "registry_missing")
+    ]
 
 
 def test_item_5_registry_must_contain_every_controlled_server():
     assert SelfCheckItem.SERVER_REGISTRY_MATCH in failed(run_checks(view(registry=[])))
-    for status in ("approved", "suspended"):
-        results = run_checks(view(registry=[]), controlled=[registered(status=status)])
-        assert SelfCheckItem.SERVER_REGISTRY_MATCH in failed(results)
+    results = run_checks(view(registry=[]), controlled=[registered(status="approved")])
+    assert SelfCheckItem.SERVER_REGISTRY_MATCH in failed(results)
     other_states = (
+        "suspended",
         "pending",
         "validating",
         "awaiting_approval",
@@ -621,6 +625,27 @@ def test_a_contract_mismatch_does_not_stop_startup_and_is_recorded_once_per_serv
     )
     asyncio.run(runtime._report_mismatches())
     assert len(store.of_kind("server_identity_mismatch_observed")) == 1
+
+
+def test_a_suspended_server_missing_from_the_registry_does_not_stop_startup(tmp_path):
+    runtime, store, stopped, state = make_runtime(
+        tmp_path, v=view(registry=[]), controlled=[registered(status="suspended")]
+    )
+    asyncio.run(runtime._startup())
+    assert runtime.verified and stopped == []
+    (event,) = store.of_kind("server_identity_mismatch_observed")
+    assert event.payload == {"server_id": "srv-1", "fields": ["registry_missing"]}
+    asyncio.run(runtime._report_mismatches())
+    assert len(store.of_kind("server_identity_mismatch_observed")) == 1
+
+
+def test_an_approved_server_missing_from_the_registry_still_stops_startup(tmp_path):
+    runtime, store, stopped, _ = make_runtime(
+        tmp_path, v=view(registry=[]), controlled=[registered(status="approved")]
+    )
+    asyncio.run(runtime._startup())
+    assert not runtime.verified and stopped == [1]
+    assert store.of_kind("server_identity_mismatch_observed") == []
 
 
 def test_two_servers_with_a_mismatch_leave_two_events_with_their_own_keys(tmp_path):

@@ -205,9 +205,8 @@ def test_per_call_approval_single_consumption_under_concurrent_resubmit(world, e
     allowed = [r for r in results if r.allowed]
     blocked = [r for r in results if not r.allowed]
     assert len(allowed) == 1 and len(blocked) == 1
-    # 소비하지 못한 호출은 호출별 승인 요구로 막힌다. 다른 복제본의 소비가 상태 세대를 올리는 순간에
-    # 스냅숏을 읽은 호출은 일관된 상태를 읽지 못해 의존성 차단(재시도 가능)으로 끝날 수 있다.
-    assert blocked[0].code in (code_of("CALL_APPROVAL_REQUIRED"), "MINT-DEPENDENCY-DB")
+    # 소비 경쟁에서 진 호출은 의존 장애가 아니라 호출별 승인 요구로 막힌다.
+    assert blocked[0].code == code_of("CALL_APPROVAL_REQUIRED")
     evidence.assert_calls(mark, 1)
     support.wait_until(
         lambda: len(world.events(mark, wait=0)) == 2, 30, what="both decision events"

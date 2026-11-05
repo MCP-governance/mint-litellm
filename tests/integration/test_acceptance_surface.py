@@ -515,10 +515,6 @@ def test_evidence_commit_result_unknown_keeps_first_attempt_and_records_block_as
     assert len({e["payload"]["invocation_id"] for e in events}) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="DB 응답이 오지 않으면(응답 폐기) 판정 예산이 지나도 호출이 반환되지 않는다",
-)
 def test_silent_database_does_not_hold_the_call_beyond_the_budget(
     world, evidence, approved, toxics
 ):
@@ -533,12 +529,13 @@ def test_silent_database_does_not_hold_the_call_beyond_the_budget(
     toxics["postgres"].add("timeout", stream="downstream", timeout=0)
     worker = threading.Thread(target=go)
     worker.start()
-    worker.join(20)
+    worker.join(10)
     held = worker.is_alive()
     toxics["postgres"].clear()
     worker.join(60)
-    assert not held, "호출이 20초가 지나도 반환되지 않았다"
+    assert not held, "호출이 판정 예산(2초)을 크게 넘겨 10초가 지나도 반환되지 않았다"
     assert result["outcome"].status == 403
+    assert result["outcome"].code == "MINT-DEPENDENCY-DB", result["outcome"].body
 
 
 def test_evidence_database_down_and_buffer_read_only_goes_to_stderr(

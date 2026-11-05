@@ -216,7 +216,7 @@ def _check(run: Run) -> None:
     ctx = run.context()
     registered = fetchall(
         run.conn,
-        "SELECT server_id, url_sha256, transport, auth_type FROM mint.servers"
+        "SELECT server_id, status, url_sha256, transport, auth_type FROM mint.servers"
         " WHERE instance_id = %s",
         (ctx.instance_id,),
     )

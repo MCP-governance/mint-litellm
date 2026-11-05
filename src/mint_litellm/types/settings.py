@@ -94,7 +94,11 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         source=SettingSource.ENV,
         rule=(
             "판정 하나의 시간 예산(밀리초, 기본 300). 상태 조회·정책 평가·선기록은 남은 시간만큼만 "
-            "기다리고, 시간 초과는 결과 불명으로 다룬다. 저장된 설정으로 덮지 않는다."
+            "기다리고, 시간 초과는 결과 불명으로 다룬다. 데이터베이스가 응답하지 않아도 이 "
+            "시간에서 끝나며(서버 쪽 잠금 제한 `lock_timeout`은 같은 값, 문장 제한 "
+            "`statement_timeout`은 열 배, 연결 시도 제한도 건다), 상태 조회가 넘으면 "
+            "`MINT-DEPENDENCY-DB`로 차단한다. "
+            "저장된 설정으로 덮지 않는다."
         ),
     ),
     MintSettingRow(
@@ -158,8 +162,9 @@ SELF_CHECK_DESCRIPTIONS: dict[SelfCheckItem, str] = {
         "통제 서버가 `allow_all_keys: false`이고 `require_key_mcp_access_defined`가 true이다."
     ),
     SelfCheckItem.SERVER_REGISTRY_MATCH: (
-        "통제 서버의 `server_id`가 레지스트리에 있다. 계약 값(URL 해시·전송 방식·인증 방식)이 "
-        "다르면 기동은 계속하고 사건으로 남기며, 그 서버의 호출은 차단한다."
+        "승인된 통제 서버의 `server_id`가 레지스트리에 있다. 계약 값(URL 해시·전송 방식·인증 "
+        "방식)이 다르면 기동은 계속하고 사건으로 남기며, 그 서버의 호출은 차단한다. 중지된 서버가 "
+        "레지스트리에 없으면 기동은 계속하고 사건(`registry_missing`)으로 남긴다."
     ),
     SelfCheckItem.NAME_ALIAS_UNIQUE: "설정과 DB를 합친 서버의 이름·별칭이 전역에서 유일하다.",
     SelfCheckItem.COMPAT_SYMBOLS: "호환 계층이 쓰는 LiteLLM 비공개 심볼이 모두 존재한다.",

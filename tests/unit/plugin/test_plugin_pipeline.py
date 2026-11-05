@@ -1316,6 +1316,48 @@ class TestCancellation:
         assert h.store.events == {} and buffered(h) == [] and h.stderr.getvalue() == ""
 
 
+class FlakySnapshots:
+    def __init__(self, snap, failures, error):
+        self.snap, self.failures, self.error, self.calls = snap, failures, error, 0
+
+    async def read_snapshot(self, query):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise self.error
+        return self.snap
+
+
+class TestSnapshotRetry:
+    """조회는 읽기 전용이라 일시 오류를 같은 예산 안에서 한 번 다시 읽는다."""
+
+    def decide_with(self, tmp_path, failures, error):
+        h = harness(tmp_path)
+        h.deps.snapshots = FlakySnapshots(h.snapshots.snap, failures, error)
+        return decide(h), h.deps.snapshots
+
+    def test_one_transient_failure_is_absorbed(self, tmp_path):
+        outcome, source = self.decide_with(tmp_path, 1, ConnectionError("stale connection"))
+        assert outcome.allowed and source.calls == 2
+
+    def test_two_failures_are_a_dependency_failure_after_two_reads(self, tmp_path):
+        outcome, source = self.decide_with(tmp_path, 2, ConnectionError("down"))
+        assert code(outcome) == "MINT-DEPENDENCY-DB" and source.calls == 2
+
+    def test_a_timeout_is_not_read_again(self, tmp_path):
+        outcome, source = self.decide_with(tmp_path, 1, TimeoutError())
+        assert code(outcome) == "MINT-DEPENDENCY-DB" and source.calls == 1
+
+    def test_nothing_is_read_again_once_the_budget_is_gone(self, tmp_path, monkeypatch):
+        h = harness(tmp_path)
+        source = FlakySnapshots(h.snapshots.snap, 5, ConnectionError("down"))
+        h.deps.snapshots = source
+        monkeypatch.setattr(
+            Deadline, "remaining", lambda self: 0.0001 if source.calls == 0 else 0.0
+        )
+        outcome = decide(h)
+        assert code(outcome) == "MINT-DEPENDENCY-DB" and source.calls <= 1
+
+
 class TestRecording:
     def test_a_database_failure_on_the_allow_path_blocks_with_audit_failure(self, tmp_path):
         h = harness(tmp_path)

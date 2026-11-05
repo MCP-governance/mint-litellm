@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import errno
 import itertools
+import logging
 import os
 import sys
 import threading
@@ -30,6 +31,8 @@ except ImportError:  # Windows
     fcntl = None  # type: ignore[assignment]
 
 _OPEN = ".open"
+log = logging.getLogger("mint_litellm.buffer")
+
 _CLOSED = ".jsonl"
 _REPLAYING = ".replaying"
 _LOCKFILE = ".lock"
@@ -447,7 +450,10 @@ class EvidenceRecorder:
                 inserted = await self._store.insert_event(event, consume)
         except ConsumptionLost:
             return DatabaseResult(stored=False, consumption_lost=True)
-        except Exception:
+        except Exception as exc:
+            log.debug(
+                "사건 기록 실패: %s sqlstate=%s", type(exc).__name__, getattr(exc, "sqlstate", None)
+            )
             return DatabaseResult(stored=False)
         if consume is not None and not inserted:
             return DatabaseResult(stored=False)
