@@ -1130,6 +1130,57 @@ class TestConstructors:
         with pytest.raises(RuntimeError):
             MintGuardrail(guardrail_name="mint", event_hook=["pre_mcp_call"], default_on=True)
 
+    @staticmethod
+    def invalid_environment(monkeypatch, tmp_path):
+        marker = tmp_path / "exit-code"
+        monkeypatch.setenv("MINT_EXIT_CODE_FILE", str(marker))
+        monkeypatch.setenv("MINT_INSTANCE_ID", "inst")
+        monkeypatch.setenv("MINT_DATABASE_URL", "postgresql://nobody@db.invalid:1/mint")
+        monkeypatch.setenv("MINT_OPA_URL", "http://opa.invalid:1")
+        monkeypatch.setenv("MINT_FINGERPRINT_KEY", "")
+        monkeypatch.setattr("mint_litellm.plugin.selfcheck._runtime", None)
+        return marker
+
+    @pytest.mark.parametrize("build", ["guardrail", "logger"])
+    def test_a_constructor_failure_before_the_first_startup_leaves_the_exit_marker(
+        self, tmp_path, monkeypatch, build
+    ):
+        marker = self.invalid_environment(monkeypatch, tmp_path)
+        with pytest.raises(RuntimeError, match="MINT_FINGERPRINT_KEY"):
+            if build == "guardrail":
+                MintGuardrail(guardrail_name="mint", event_hook=["pre_mcp_call"], default_on=True)
+            else:
+                MintLogger()
+        assert marker.read_text(encoding="utf-8") == "3"
+
+    def test_a_failure_after_the_process_passed_its_checks_does_not_leave_it(
+        self, tmp_path, monkeypatch
+    ):
+        runtime, _, _ = build_runtime(tmp_path)
+        assert runtime.verified
+        monkeypatch.setattr("mint_litellm.plugin.selfcheck._runtime", runtime)
+        marker = tmp_path / "exit-code"
+        monkeypatch.setenv("MINT_EXIT_CODE_FILE", str(marker))
+        import litellm
+
+        litellm.callbacks.append(MintLogger(runtime=runtime))
+        with pytest.raises(RuntimeError, match="must not be listed"):
+            MintGuardrail(runtime=runtime, guardrail_name="mint", default_on=True)
+        assert not marker.exists()
+        runtime.verified = False
+        with pytest.raises(RuntimeError, match="must not be listed"):
+            MintGuardrail(runtime=runtime, guardrail_name="mint", default_on=True)
+        assert marker.read_text(encoding="utf-8") == "3"
+
+    def test_without_the_marker_setting_a_constructor_failure_writes_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        self.invalid_environment(monkeypatch, tmp_path)
+        monkeypatch.delenv("MINT_EXIT_CODE_FILE")
+        with pytest.raises(RuntimeError):
+            MintLogger()
+        assert list(tmp_path.iterdir()) == []
+
     def test_unexpected_errors_are_converted_to_runtime_error(self):
         class Broken:
             def __setattr__(self, name, value):

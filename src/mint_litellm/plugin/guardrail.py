@@ -26,7 +26,11 @@ from litellm.types.guardrails import GuardrailEventHooks
 
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.plugin.logger import MintLogger, internal_block
-from mint_litellm.plugin.selfcheck import PluginRuntime, get_runtime
+from mint_litellm.plugin.selfcheck import (
+    PluginRuntime,
+    get_runtime,
+    leave_startup_failure_marker,
+)
 from mint_litellm.types.decision import MINT_CTX_KEY
 
 log = logging.getLogger("mint_litellm.guardrail")
@@ -55,8 +59,10 @@ class MintGuardrail(CustomGuardrail):
             self._register_logger()
             self._runtime.ensure_started()
         except RuntimeError:
+            leave_startup_failure_marker()
             raise
         except Exception as exc:
+            leave_startup_failure_marker()
             raise RuntimeError(f"MintGuardrail could not start: {type(exc).__name__}") from exc
 
     def _register_logger(self) -> None:
