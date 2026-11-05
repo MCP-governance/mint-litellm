@@ -9,8 +9,9 @@ import re
 import subprocess
 import tarfile
 import tempfile
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -18,6 +19,99 @@ import httpx
 
 from mint_litellm.types.events import EventKind, control_source_key
 from mint_litellm.types.ids import new_uuid7
+
+DATA_FILE = "mint/data/data.json"
+META_FILE = "mint/meta/data.json"
+
+
+class BundleContentMismatch(ValueError):
+    """OPA가 적재한 번들 내용이 등록된 해시와 다르다."""
+
+
+def _reject_constant(name: str) -> None:
+    raise ValueError(f"invalid JSON constant {name}")
+
+
+def parse_data_json(raw: str | bytes) -> object:
+    return json.loads(raw, parse_float=Decimal, parse_constant=_reject_constant)
+
+
+def _canonical(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, Decimal):
+        return str(value.normalize())
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(_canonical(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            json.dumps(key, ensure_ascii=False) + ":" + _canonical(value[key])
+            for key in sorted(value)
+        ) + "}"
+    raise ValueError("unsupported JSON value")
+
+
+def canonical_json(value: object) -> bytes:
+    """키 정렬, 구분자 ``,``·``:``, UTF-8 정규 JSON."""
+    return _canonical(value).encode("utf-8")
+
+
+def bundle_content_sha256(
+    modules: Mapping[str, str | bytes], data: Mapping[str, object]
+) -> str:
+    """번들 내용 해시. 경로는 번들 안 상대 경로, 규칙은 원문, 데이터는 정규 JSON이다.
+
+    번들 준비와 OPA 적재 내용의 재계산이 같은 함수를 쓴다.
+    """
+    entries = {
+        **{path: raw.encode("utf-8") if isinstance(raw, str) else raw
+           for path, raw in modules.items()},
+        **{path: canonical_json(value) for path, value in data.items()},
+    }
+    if len(entries) != len(modules) + len(data):
+        raise ValueError("duplicate bundle path")
+    digest = hashlib.sha256()
+    for path in sorted(entries):
+        digest.update(path.encode("utf-8") + b"\0" + entries[path] + b"\0")
+    return digest.hexdigest()
+
+
+async def loaded_bundle_sha256(opa_url: str, client: httpx.AsyncClient | None = None) -> str:
+    """OPA가 실제로 적재한 모듈 원문과 정책 데이터에서 번들 내용 해시를 다시 계산한다."""
+    base = opa_url.rstrip("/")
+    if client is None:
+        async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as own:
+            return await loaded_bundle_sha256(opa_url, own)
+
+    async def get(path: str) -> dict:
+        response = await client.get(base + path)
+        response.raise_for_status()
+        body = json.loads(response.text, parse_float=Decimal, parse_constant=_reject_constant)
+        return body if isinstance(body, dict) else {}
+
+    bundles = (await get("/v1/data/system/bundles")).get("result")
+    if not isinstance(bundles, dict) or len(bundles) != 1:
+        raise BundleContentMismatch("exactly one loaded bundle is required")
+    prefix = next(iter(bundles)).rstrip("/") + "/"
+    modules: dict[str, str] = {}
+    policies = (await get("/v1/policies")).get("result")
+    for policy in policies if isinstance(policies, list) else []:
+        identifier, raw = policy.get("id"), policy.get("raw")
+        if not (isinstance(identifier, str) and isinstance(raw, str)
+                and identifier.startswith(prefix)):
+            raise BundleContentMismatch("module outside the loaded bundle")
+        modules[identifier.removeprefix(prefix)] = raw
+    data = {}
+    document = (await get("/v1/data/mint/data")).get("result")
+    if document is not None:
+        data[DATA_FILE] = document
+    return bundle_content_sha256(modules, data)
 
 
 @dataclass(frozen=True)
@@ -62,16 +156,18 @@ def prepare_bundle(
     bundle_dir = root / "policy" / "bundle"
     files = sorted(
         (p for p in bundle_dir.rglob("*") if p.is_file() and p.suffix in {".rego", ".json"}
-         and p.relative_to(bundle_dir).as_posix() != "mint/meta/data.json"),
-        key=lambda p: p.relative_to(root).as_posix(),
+         and p.relative_to(bundle_dir).as_posix() != META_FILE),
+        key=lambda p: p.relative_to(bundle_dir).as_posix(),
     )
     if not files or any(
         p.is_symlink() or not p.resolve().is_relative_to(bundle_dir) for p in files
     ):
         raise ValueError("invalid bundle files")
-    contents = [(p.relative_to(root).as_posix(), p.read_bytes()) for p in files]
+    contents = [(p.relative_to(bundle_dir).as_posix(), p.read_bytes()) for p in files]
     source = dict(contents)
-    data = json.loads(source["policy/bundle/mint/data/data.json"])
+    if {name for name in source if name.endswith(".json")} != {DATA_FILE}:
+        raise ValueError("invalid bundle data files")
+    data = parse_data_json(source[DATA_FILE])
     _validate_hours(data["business_hours"])
     catalog = (root / "policy" / "catalog.json").read_bytes()
     catalog_data = json.loads(catalog)
@@ -83,19 +179,18 @@ def prepare_bundle(
         check=True,
         capture_output=True,
     )
-    if any((root / name).read_bytes() != content for name, content in contents):
+    if any((bundle_dir / name).read_bytes() != content for name, content in contents):
         raise ValueError("bundle changed during validation")
     if (root / "policy" / "catalog.json").read_bytes() != catalog:
         raise ValueError("catalog changed during validation")
-    digest = hashlib.sha256()
-    for name, content in contents:
-        digest.update(name.encode("utf-8") + b"\0" + content + b"\0")
-    sha = digest.hexdigest()
+    sha = bundle_content_sha256(
+        {name: content for name, content in contents if name != DATA_FILE}, {DATA_FILE: data}
+    )
     meta = json.dumps({"policy_version_id": policy_version_id, "bundle_sha256": sha}).encode()
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w:gz") as archive:
-        for name, content in contents + [("policy/bundle/mint/meta/data.json", meta)]:
-            info = tarfile.TarInfo(name.removeprefix("policy/bundle/"))
+        for name, content in [*contents, (META_FILE, meta)]:
+            info = tarfile.TarInfo(name)
             info.size = len(content)
             info.mtime = 0
             archive.addfile(info, io.BytesIO(content))
@@ -168,6 +263,8 @@ async def activate_bundle(
                 if response.json().get("result") == expected:
                     break
                 await asyncio.sleep(0.1)
+            if await loaded_bundle_sha256(opa_url, client) != bundle.bundle_sha256:
+                raise BundleContentMismatch("loaded bundle content differs from registered hash")
         await conn.execute(
             "UPDATE mint.policy_versions SET status = 'superseded' "
             "WHERE instance_id = %s AND status = 'active'", (instance_id,)

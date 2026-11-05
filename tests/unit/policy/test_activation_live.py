@@ -1,7 +1,10 @@
 import asyncio
+import dataclasses
+import io
 import os
 import shlex
 import sys
+import tarfile
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -10,7 +13,9 @@ import httpx
 import pytest
 
 from mint_litellm.plugin.policy.bundle import (
+    BundleContentMismatch,
     activate_bundle,
+    loaded_bundle_sha256,
     prepare_bundle,
     publish_bundle,
     register_bundle,
@@ -171,3 +176,89 @@ def test_real_activation_and_recovery(live_database):
             asyncio.set_event_loop_policy(policy)
     else:
         asyncio.run(run())
+
+
+def _run(coroutine_function):
+    if sys.platform == "win32":
+        policy = asyncio.get_event_loop_policy()
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        try:
+            asyncio.run(coroutine_function())
+        finally:
+            asyncio.set_event_loop_policy(policy)
+    else:
+        asyncio.run(coroutine_function())
+
+
+def _tampered(archive: bytes, name: str, change) -> bytes:
+    """메타는 그대로 두고 번들 안 한 파일의 내용만 바꾼 아카이브."""
+    source = io.BytesIO(archive)
+    output = io.BytesIO()
+    with tarfile.open(fileobj=source, mode="r:gz") as reader, \
+            tarfile.open(fileobj=output, mode="w:gz") as writer:
+        for member in reader.getmembers():
+            content = reader.extractfile(member).read()
+            if member.name == name:
+                content = change(content)
+            info = tarfile.TarInfo(member.name)
+            info.size = len(content)
+            info.mtime = 0
+            writer.addfile(info, io.BytesIO(content))
+    return output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("name", "change"),
+    [
+        ("mint/policy.rego", lambda text: text + b"# edited" + bytes([10])),
+        ("mint/data/data.json", lambda text: text.replace(b"09:00", b"00:00")),
+    ],
+    ids=["rule-line", "data-value"],
+)
+def test_activation_rejects_content_changed_with_unchanged_metadata(live_database, name, change):
+    import psycopg
+
+    bundle_dir = Path(os.environ["MINT_TEST_OPA_BUNDLE_DIR"])
+    opa_url = os.environ["MINT_TEST_OPA_URL"].rstrip("/")
+    good, tampered = (
+        prepare_bundle(ROOT, version, opa=opa_command(), opa_policy_path="/work/policy")
+        for version in ("good", "tampered")
+    )
+    forged = dataclasses.replace(tampered, archive=_tampered(tampered.archive, name, change))
+
+    async def run():
+        async with await psycopg.AsyncConnection.connect(live_database) as conn:
+            async def publish(data):
+                publish_bundle(bundle_dir / "mint.tar.gz", data)
+
+            await register_bundle(conn, instance_id="test", bundle=good)
+            await activate_bundle(
+                conn, instance_id="test", actor="operator", bundle=good,
+                publish=publish, opa_url=opa_url, timeout_seconds=30,
+            )
+            assert await loaded_bundle_sha256(opa_url) == good.bundle_sha256
+
+            await register_bundle(conn, instance_id="test", bundle=forged)
+            await conn.commit()
+            with pytest.raises(BundleContentMismatch):
+                await activate_bundle(
+                    conn, instance_id="test", actor="operator", bundle=forged,
+                    publish=publish, opa_url=opa_url, timeout_seconds=30,
+                )
+            await conn.rollback()
+            rows = await (await conn.execute(
+                "SELECT id, status FROM mint.policy_versions ORDER BY id"
+            )).fetchall()
+            assert rows == [("good", "active"), ("tampered", "validated")]
+            events = await (await conn.execute(
+                "SELECT count(*) FROM mint.events WHERE kind = %s", ("policy_activated",)
+            )).fetchone()
+            assert events[0] == 1
+            await publish(good.archive)
+            for _ in range(100):
+                if await loaded_bundle_sha256(opa_url) == good.bundle_sha256:
+                    break
+                await asyncio.sleep(0.1)
+            assert await loaded_bundle_sha256(opa_url) == good.bundle_sha256
+
+    _run(run)
