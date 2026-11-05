@@ -53,7 +53,7 @@ def _readiness() -> dict[str, bool]:
 
 
 def _unready(message: str) -> None:
-    """CI(MINT_INTEGRATION_REQUIRED 설정)에서는 준비 실패를 실패로, 로컬에서는 건너뛰기로 처리한다."""
+    """준비 실패: CI(MINT_INTEGRATION_REQUIRED)에서는 실패, 로컬에서는 건너뛰기."""
     if os.environ.get("MINT_INTEGRATION_REQUIRED"):
         pytest.fail(message, pytrace=False)
     pytest.skip(message)
