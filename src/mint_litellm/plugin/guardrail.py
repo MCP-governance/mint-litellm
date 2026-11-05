@@ -103,7 +103,7 @@ class MintGuardrail(CustomGuardrail):
             return "unjudged", {}
         details = compat.logging_details(data.get("litellm_logging_obj"))
         if details is None:
-            return "current", {}
+            return "unjudged", {}
         ctx = details.get(MINT_CTX_KEY)
         if not (
             isinstance(ctx, dict) and ctx.get("decision_ref") == ref and ctx.get("allowed") is True
@@ -111,8 +111,10 @@ class MintGuardrail(CustomGuardrail):
             return "unjudged", {}
         # 로거가 판정한 뒤 앞선 훅이 인자를 바꿨으면 그 판정과 승인은 전송될 인자의 것이 아니다.
         digest = ctx.get("arguments_digest")
+        # 인자를 객체로 읽지 못하면 판정한 인자와 같다고 할 수 없다.
+        arguments = compat.effective_arguments(data)
         key = self._runtime.config.fingerprint_key
-        current = arguments_digest(compat.parse_hook_data(data).arguments, key)
+        current = arguments_digest(arguments, key) if arguments is not None else None
         if isinstance(digest, str) and digest == current:
             return "current", ctx
         details[MINT_CTX_KEY] = {**ctx, "allowed": False}

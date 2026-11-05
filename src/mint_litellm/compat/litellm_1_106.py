@@ -55,15 +55,23 @@ class HookData:
         return self.server_name is not None and self.tool_name is not None
 
 
-def parse_hook_data(data: Mapping[str, Any]) -> HookData:
-    # 앞선 훅이 돌려준 수정본이 있으면 그것이 업스트림에 전달되는 인자이다.
+def effective_arguments(data: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """업스트림에 전달될 인자. 객체가 아니면 None이다.
+
+    앞선 훅이 돌려준 수정본이 있으면 그것이다. LiteLLM은 비어 있는 값을 수정본으로 치지 않는다.
+    """
     arguments = data.get("modified_arguments") or data.get("mcp_arguments") or {}
+    return arguments if isinstance(arguments, Mapping) else None
+
+
+def parse_hook_data(data: Mapping[str, Any]) -> HookData:
+    arguments = effective_arguments(data)
     logging_obj = data.get("litellm_logging_obj")
     call_id = getattr(logging_obj, "litellm_call_id", None) or data.get("litellm_call_id")
     return HookData(
         server_name=data.get("mcp_server_name"),
         tool_name=data.get("mcp_tool_name"),
-        arguments=arguments if isinstance(arguments, Mapping) else {},
+        arguments=arguments if arguments is not None else {},
         litellm_call_id=str(call_id) if call_id else None,
         logging_obj=logging_obj,
     )

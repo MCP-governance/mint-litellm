@@ -407,9 +407,15 @@ class TestGuardrail:
         obj.model_call_details[MINT_CTX_KEY] = {"decision_ref": "forged", "allowed": False}
         assert blocked(lambda: pre(guardrail, data)).code == "MINT-ENFORCEMENT-UNVERIFIED"
 
-    def test_a_marker_without_a_logging_object_is_accepted(self, tmp_path):
+    @pytest.mark.parametrize(
+        "logging",
+        [None, SimpleNamespace(litellm_call_id="c", model_call_details=None)],
+        ids=["no-logging-object", "unreadable-details"],
+    )
+    def test_a_marker_without_a_readable_context_is_blocked(self, tmp_path, logging):
         runtime, _, _ = build_runtime(tmp_path)
-        assert pre(self.make(runtime), synthesized(None, mint_decision_ref="x")) is None
+        data = synthesized(logging, mint_decision_ref="x")
+        assert blocked(lambda: pre(self.make(runtime), data)).code == "MINT-ENFORCEMENT-UNVERIFIED"
 
     def test_a_listed_tool_with_a_grant_stays_visible(self, tmp_path, contract_snapshot):
         runtime, store, _ = build_runtime(tmp_path, contract_snapshot)
@@ -486,7 +492,9 @@ class TestCallbackChain:
     SENT = {"q": "x"}
     OTHER = {"q": "y"}
 
-    def run_chain(self, tmp_path, monkeypatch, order, snap, evaluate="allow"):
+    def run_chain(
+        self, tmp_path, monkeypatch, order, snap, evaluate="allow", empty_arguments=False
+    ):
         """``order``의 문자열은 MINT 로거·가드레일, 딕셔너리는 인자를 그 값으로 바꾸는 가드레일."""
         import litellm
         from litellm.caching.caching import DualCache
@@ -518,7 +526,8 @@ class TestCallbackChain:
         monkeypatch.setattr(litellm, "callbacks", chain)
         proxy = ProxyLogging(user_api_key_cache=DualCache())
         obj = logging_obj()
-        data = synthesized(obj, mcp_arguments=dict(self.SENT))
+        start = {} if empty_arguments else dict(self.SENT)
+        data = synthesized(obj, mcp_arguments=start)
         result = SimpleNamespace(error=None, sent=None, obj=obj, store=store, logger=logger)
         try:
             data = run(
@@ -527,7 +536,7 @@ class TestCallbackChain:
         except HTTPException as exc:
             result.error = MintError.from_detail(exc.detail)
             return result
-        kwargs = proxy.convert_mcp_hook_response_to_kwargs(data, {"arguments": dict(self.SENT)})
+        kwargs = proxy.convert_mcp_hook_response_to_kwargs(data, {"arguments": start})
         result.sent = kwargs["arguments"]
         return result
 
@@ -579,6 +588,15 @@ class TestCallbackChain:
         order = ["logger", replacement, "guardrail"]
         result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
         assert result.error is None and result.sent == self.SENT
+
+    @pytest.mark.parametrize("replacement", [["x"], "text", 7], ids=["list", "text", "number"])
+    def test_arguments_replaced_by_something_that_is_not_an_object_are_not_sent(
+        self, tmp_path, monkeypatch, contract_snapshot, replacement
+    ):
+        snap = contract_snapshot
+        order = ["logger", replacement, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, snap, empty_arguments=True)
+        assert result.sent is None and result.error.code == "MINT-ARGUMENTS-CHANGED"
 
     @pytest.mark.parametrize(
         ("approved", "expected"),

@@ -124,6 +124,16 @@ class TestHookData:
         assert compat.parse_hook_data(synthesized(mcp_arguments=None)).arguments == {}
         assert compat.parse_hook_data(synthesized(mcp_arguments="text")).arguments == {}
 
+    def test_effective_arguments_tell_a_missing_value_from_one_that_is_not_an_object(self):
+        assert compat.effective_arguments(synthesized(mcp_arguments=None)) == {}
+        assert compat.effective_arguments(synthesized(mcp_arguments={})) == {}
+        assert compat.effective_arguments(synthesized(mcp_arguments="text")) is None
+        odd = synthesized(mcp_arguments={}, modified_arguments=["x"])
+        assert compat.effective_arguments(odd) is None
+        assert compat.effective_arguments(synthesized(modified_arguments=0)) == {
+            "query": "azure functions"
+        }
+
     def test_the_call_id_is_read_from_the_logging_object_first(self):
         data = synthesized(litellm_call_id="from-data")
         assert compat.parse_hook_data(data).litellm_call_id == "call-1"
