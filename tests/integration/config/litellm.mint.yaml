@@ -35,3 +35,15 @@ mcp_servers:
     transport: http
     allow_all_keys: false
     description: Integration test upstream B
+  mcp_c:
+    server_id: e1000000000000000000000000000003
+    url: http://counting-proxy:8080/c/mcp
+    transport: http
+    allow_all_keys: false
+    description: Integration test upstream C (same server as B)
+  mcp_d:
+    server_id: e1000000000000000000000000000004
+    url: http://counting-proxy:8080/d/mcp
+    transport: http
+    allow_all_keys: false
+    description: Integration test upstream D (same server as A)

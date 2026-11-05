@@ -7,6 +7,10 @@ name: mint-e
 
 x-mint-env: &mint-env
   MINT_INSTANCE_ID: integration
+  MINT_MODE: observe
+  MINT_REQUIRED: ${MINT_E_REQUIRED:-true}
+  MINT_BUFFER_MAX_BYTES: ${MINT_E_BUFFER_MAX_BYTES:-52428800}
+  MINT_HIGH_RISK_TOOLS: ${MINT_E_HIGH_RISK_TOOLS:-}
   MINT_OPA_URL: http://opa:8181
   MINT_BUFFER_DIR: /var/lib/mint/buffer
   MINT_DB_POOL_SIZE: "4"
@@ -199,7 +203,8 @@ services:
       - "${MINT_E_PORT_PREFIX:-}4101:4000"
     volumes:
       - ${MINT_E_LITELLM_CONFIG:-./config/litellm.mint.yaml}:/app/config/litellm.config.yaml:ro
-      - buffer1:/var/lib/mint/buffer
+      - ./guardrails/it_guardrails.py:/app/config/it_guardrails.py:ro
+      - buffer1:/var/lib/mint/buffer${MINT_E_BUFFER1_MODE:-}
     depends_on:
       mint-init:
         condition: service_completed_successfully
@@ -216,6 +221,7 @@ services:
       - "${MINT_E_PORT_PREFIX:-}4102:4000"
     volumes:
       - ${MINT_E_LITELLM_CONFIG:-./config/litellm.mint.yaml}:/app/config/litellm.config.yaml:ro
+      - ./guardrails/it_guardrails.py:/app/config/it_guardrails.py:ro
       - buffer2:/var/lib/mint/buffer
     depends_on:
       litellm1:

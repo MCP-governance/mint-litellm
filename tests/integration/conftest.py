@@ -5,6 +5,11 @@
 시험은 그 서비스가 떠 있을 때만 실행된다.
 """
 
+import json
+import os
+import uuid
+from pathlib import Path
+
 import httpx
 import pytest
 import support
@@ -104,17 +109,13 @@ def plain(stack):
     return port
 
 
-@pytest.fixture(scope="session")
-def world(stack):
-    """첫 관리자와 제어 평면 키를 만들고 첫 정책 판본을 활성화한다."""
-    import scenario
-
-    mint = scenario.Mint()
-    helper = scenario.World(mint)
+def _bootstrap(mint, helper) -> None:
+    """제어 평면 키, 첫 관리자, 첫 정책 판본, 서버 a·b의 첫 승인을 만든다."""
+    suffix = uuid.uuid4().hex[:8]
     reply = httpx.post(
         support.url(support.LITELLM_PORTS[0], "/user/new"),
         headers=support.master_headers(),
-        json={"user_id": "it-control", "user_role": "proxy_admin"},
+        json={"user_id": f"it-control-{suffix}", "user_role": "proxy_admin"},
         timeout=30,
     )
     reply.raise_for_status()
@@ -122,20 +123,57 @@ def world(stack):
         support.url(support.LITELLM_PORTS[0], "/key/generate"),
         headers=support.master_headers(),
         json={
-            "user_id": "it-control",
-            "key_alias": "it-control-key",
+            "user_id": f"it-control-{suffix}",
+            "key_alias": f"it-control-key-{suffix}",
             "allowed_routes": support.CONTROL_ROUTES,
         },
         timeout=30,
     )
     reply.raise_for_status()
-    mint.env["MINT_LITELLM_KEY"] = reply.json()["key"]
     helper.control_key = reply.json()["key"]
+    mint.env["MINT_LITELLM_KEY"] = helper.control_key
     mint.env["MINT_LITELLM_URL"] = "http://litellm1:4000"
-    admin_user = helper.litellm_user()
-    mint.token = mint.data("operator", "bootstrap", "--name", "it-admin", "--user-id", admin_user)[
-        "token"
-    ]
-    helper.admin_user = admin_user
+    helper.admin_user = helper.litellm_user()
+    mint.token = mint.data(
+        "operator", "bootstrap", "--name", "it-admin", "--user-id", helper.admin_user
+    )["token"]
     mint.run("policy", "activate", "it-v1")
+    # 서버 a·b의 첫 승인을 미리 만들어 서버 상태가 승인됨이 되게 한다(서버 c는 시험이 직접 다룬다).
+    seed = helper.subject(("a", "b"))
+    helper.approve(seed, helper.prepare(seed, "a"))
+    helper.approve(seed, helper.relate(seed, "b"))
+
+
+@pytest.fixture(scope="session")
+def world(stack):
+    """운영자·제어 평면 키·정책이 준비된 시나리오 도구. 같은 스택에서 다시 실행해도 재사용한다.
+
+    ``MINT_E_STATE``가 가리키는 파일에 준비 결과를 남겨 두면(반복 실행용) 다시 만들지 않는다.
+    """
+    import scenario
+
+    mint = scenario.Mint()
+    helper = scenario.World(mint)
+    state = Path(os.environ["MINT_E_STATE"]) if os.environ.get("MINT_E_STATE") else None
+    if state is not None and state.exists():
+        saved = json.loads(state.read_text(encoding="utf-8"))
+        mint.token, helper.admin_user = saved["token"], saved["admin_user"]
+        helper.control_key = saved["control_key"]
+        mint.env.update(saved["env"])
+        helper.registered.update(saved["registered"])
+        return helper
+    _bootstrap(mint, helper)
+    if state is not None:
+        state.write_text(
+            json.dumps(
+                {
+                    "token": mint.token,
+                    "admin_user": helper.admin_user,
+                    "control_key": helper.control_key,
+                    "env": mint.env,
+                    "registered": sorted(helper.registered),
+                }
+            ),
+            encoding="utf-8",
+        )
     return helper

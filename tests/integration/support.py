@@ -18,8 +18,22 @@ from mcp.client.streamable_http import create_mcp_http_client, streamable_http_c
 HERE = Path(__file__).resolve().parent
 HOST = os.environ.get("MINT_E_HOST", "localhost")
 MASTER_KEY = os.environ.get("MINT_E_MASTER_KEY", "sk-integration-master")
-SERVER_ID = {"a": "e1000000000000000000000000000001", "b": "e1000000000000000000000000000002"}
-TOOL_PREFIX = {"a": "mcp_a", "b": "mcp_b"}
+SERVER_ID = {
+    "a": "e1000000000000000000000000000001",
+    "b": "e1000000000000000000000000000002",
+    "c": "e1000000000000000000000000000003",
+    "d": "e1000000000000000000000000000004",
+}
+
+
+def sid(server: str) -> str:
+    """시험 서버 약칭(a·b·c·d) 또는 LiteLLM 서버 식별자를 서버 식별자로 바꾼다."""
+    return SERVER_ID.get(server, server)
+
+
+TOOL_PREFIX = {"a": "mcp_a", "b": "mcp_b", "c": "mcp_c", "d": "mcp_d"}
+# 서버 c·d는 업스트림 b·a를 다른 경로로 가리키는 별도 설정 서버이다.
+UPSTREAM_OF = {"a": "a", "b": "b", "c": "b", "d": "a"}
 
 LITELLM_PORTS = (4101, 4102)
 PLAIN_PORT = 4103
@@ -50,9 +64,14 @@ def url(port: int, path: str = "") -> str:
 
 
 def compose(*args: str, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+    merged = None
+    if env:
+        # WSL 안의 docker로 실행할 때 변수가 넘어가도록 WSLENV에 적는다(리눅스에서는 무해하다).
+        names = ":".join([os.environ.get("WSLENV", ""), *env]).strip(":")
+        merged = {**os.environ, **env, "WSLENV": names}
     return subprocess.run(
         [*shlex.split(COMPOSE), *args],
-        env={**os.environ, **env} if env else None,
+        env=merged,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -173,7 +192,7 @@ def master_headers() -> dict:
 def new_key(servers=("a", "b"), port: int = LITELLM_PORTS[0], **extra) -> str:
     body = {
         "key_alias": "it-" + uuid.uuid4().hex[:10],
-        "object_permission": {"mcp_servers": [SERVER_ID[s] for s in servers]},
+        "object_permission": {"mcp_servers": [sid(s) for s in servers]},
         **extra,
     }
     reply = httpx.post(url(port, "/key/generate"), headers=master_headers(), json=body, timeout=30)
@@ -209,11 +228,11 @@ def rest_call(
     if call_id:
         headers["x-litellm-call-id"] = call_id
     body = {
-        "server_id": SERVER_ID[server],
+        "server_id": sid(server),
         "name": f"{TOOL_PREFIX[server]}-{tool}",
         "arguments": arguments,
     }
-    return httpx.post(url(port, "/mcp-rest/tools/call"), headers=headers, json=body, timeout=60)
+    return httpx.post(url(port, "/mcp-rest/tools/call"), headers=headers, json=body, timeout=180)
 
 
 class Evidence:
@@ -245,7 +264,7 @@ class Evidence:
         """(프록시 tools/call 행 수, 시험 서버 진입 수)."""
         return (
             len(self.log.tools_calls(mark, server)),
-            self.upstreams[server].count(mark)["entered"],
+            self.upstreams[UPSTREAM_OF[server]].count(mark)["entered"],
         )
 
     def assert_calls(
