@@ -51,4 +51,36 @@ if ! python -m mint_litellm.control.preflight "$config"; then
     exit 1
 fi
 
-exec docker/prod_entrypoint.sh "$@"
+# 워커가 여럿이면(uvicorn) 한 워커가 자가 점검에 실패해 감독 프로세스를 멈춰도 감독 프로세스는 0으로
+# 끝난다. 워커는 실패하면 이 파일에 표식을 남기므로, LiteLLM이 끝난 뒤 표식이 있으면 3으로 끝낸다.
+# 종료 신호(TERM, INT)는 LiteLLM에 TERM으로 전달한다. 배경 작업은 INT를 무시한 채 시작하므로 INT로는
+# 전달할 수 없다.
+MINT_EXIT_CODE_FILE="${MINT_EXIT_CODE_FILE:-/tmp/mint-exit-code}"
+export MINT_EXIT_CODE_FILE
+rm -f "$MINT_EXIT_CODE_FILE"
+
+child=
+stopping=0
+# 자식을 띄우기 전에 trap을 건다. 그 사이에 온 신호는 자식을 띄운 직후 전달한다.
+trap 'stopping=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT
+docker/prod_entrypoint.sh "$@" &
+child=$!
+if [ "$stopping" = 1 ]; then
+    kill -TERM "$child" 2>/dev/null
+fi
+wait "$child"
+status=$?
+# 신호를 받으면 wait가 먼저 돌아온다. 자식이 끝날 때까지 기다린다.
+while kill -0 "$child" 2>/dev/null; do
+    wait "$child"
+    status=$?
+done
+
+if [ -e "$MINT_EXIT_CODE_FILE" ]; then
+    exit 3
+fi
+# 우리가 멈추라고 한 LiteLLM이 TERM으로 끝나는 것은 정상 종료이다(PID 1일 때는 0으로 끝났다).
+if [ "$stopping" = 1 ] && [ "$status" -eq 143 ]; then
+    exit 0
+fi
+exit "$status"
