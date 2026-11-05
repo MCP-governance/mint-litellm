@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import os
 import sys
 import threading
@@ -31,6 +32,21 @@ _OPEN = ".open"
 _CLOSED = ".jsonl"
 _REPLAYING = ".replaying"
 _SYSTEM_KINDS = frozenset({EventKind.BUFFER_OVERFLOW, EventKind.BUFFER_REPLAYED})
+
+
+class SystemEventKeys:
+    """한 실행이 시스템 사건 키를 1부터 순서대로 발급한다.
+
+    같은 종류의 사건이 한 실행에서 여러 건이어도 키가 겹쳐 한 건으로 합쳐지지 않으며, 실행이 다르면
+    순번이 같아도 키가 다르다.
+    """
+
+    def __init__(self) -> None:
+        self.run_id = new_uuid7()
+        self._sequence = itertools.count(1)
+
+    def next(self, kind: EventKind) -> str:
+        return control_source_key(kind, str(self.run_id), next(self._sequence))
 
 
 class BufferWriteError(Exception):
@@ -285,6 +301,7 @@ class EvidenceRecorder:
         self._replay_interval = replay_interval_seconds
         self._last_replay = 0.0
         self._replaying: asyncio.Task[None] | None = None
+        self._keys = SystemEventKeys()
 
     async def try_database(
         self,
@@ -375,12 +392,11 @@ class EvidenceRecorder:
             return
 
     async def _append_system(self, kind: EventKind, payload: dict[str, int]) -> None:
-        batch = new_uuid7()
         event = Event(
             instance_id=self._instance_id,
             inserted_at=_utcnow(),
             kind=kind,
-            source_key=control_source_key(kind, str(batch), 1),
+            source_key=self._keys.next(kind),
             payload=payload,
         )
         if self._store is not None:

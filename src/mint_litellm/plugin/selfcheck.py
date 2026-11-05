@@ -23,7 +23,7 @@ from typing import Any
 
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.compat.litellm_1_106 import RegistryEntry
-from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer
+from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer, SystemEventKeys
 from mint_litellm.plugin.config import PluginConfig
 from mint_litellm.plugin.discovery import DiscoveryResult, evaluate_listed_tool
 from mint_litellm.plugin.pipeline import (
@@ -37,8 +37,7 @@ from mint_litellm.plugin.policy.opa_client import OPAClient
 from mint_litellm.plugin.result import ResultDeps
 from mint_litellm.plugin.snapshot import PluginDatabase, RegisteredServer
 from mint_litellm.types.decision import OperationType
-from mint_litellm.types.events import Event, EventKind, control_source_key
-from mint_litellm.types.ids import new_uuid7
+from mint_litellm.types.events import Event, EventKind
 from mint_litellm.types.settings import SELF_CHECK_DESCRIPTIONS, SelfCheckItem
 
 log = logging.getLogger("mint_litellm.selfcheck")
@@ -271,7 +270,8 @@ class PluginRuntime:
     guardrail: Any = None
     last_results: list[CheckResult] = field(default_factory=list)
     last_mismatches: list[tuple[str, str]] = field(default_factory=list)
-    _reported: set[tuple[str, str]] = field(default_factory=set, repr=False)
+    keys: SystemEventKeys = field(default_factory=SystemEventKeys, repr=False)
+    _reported: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @property
@@ -344,6 +344,7 @@ class PluginRuntime:
         self._task = loop.create_task(self._startup())
 
     async def _startup(self) -> None:
+        self.keys = SystemEventKeys()
         grace = self.config.selfcheck_grace_seconds
         url = self.config.readiness_url or (
             f"http://localhost:{os.environ.get('PORT', '4000')}/health/readiness"
@@ -377,19 +378,23 @@ class PluginRuntime:
                 self.terminate()
 
     async def _report_mismatches(self) -> None:
-        """승인된 계약과 다른 서버를 사건으로 남긴다. 그 서버의 호출은 판정에서 차단된다."""
+        """승인된 계약과 다른 서버마다 사건을 한 건 남긴다. 그 서버의 호출은 판정에서 차단된다."""
+        by_server: dict[str, list[str]] = {}
         for server_id, name in self.last_mismatches:
-            if (server_id, name) in self._reported:
+            by_server.setdefault(server_id, []).append(name)
+        for server_id, names in by_server.items():
+            fields = tuple(names)
+            if self._reported.get(server_id) == fields:
                 continue
-            self._reported.add((server_id, name))
+            self._reported[server_id] = fields
             kind = EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED
             await self.recorder.record(
                 Event(
                     instance_id=self.config.instance_id,
                     inserted_at=datetime.now(UTC),
                     kind=kind,
-                    source_key=control_source_key(kind, str(new_uuid7()), 1),
-                    payload={"server_id": server_id, "field": name},
+                    source_key=self.keys.next(kind),
+                    payload={"server_id": server_id, "fields": list(fields)},
                 )
             )
 
@@ -406,7 +411,7 @@ class PluginRuntime:
             instance_id=self.config.instance_id,
             inserted_at=datetime.now(UTC),
             kind=EventKind.ENFORCEMENT_UNVERIFIED,
-            source_key=control_source_key(EventKind.ENFORCEMENT_UNVERIFIED, str(new_uuid7()), 1),
+            source_key=self.keys.next(EventKind.ENFORCEMENT_UNVERIFIED),
             payload=payload,
         )
         await self.recorder.record(event)

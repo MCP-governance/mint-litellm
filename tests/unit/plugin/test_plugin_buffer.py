@@ -215,6 +215,50 @@ class TestEvidenceRecorder:
             kinds += [e.kind for e in LocalBuffer.read(path)[0]]
         assert EventKind.BUFFER_OVERFLOW in kinds
 
+    def test_system_events_of_one_process_take_consecutive_sequence_numbers(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        rec, buffer = recorder(tmp_path, store, max_bytes=8 * 1024)
+
+        async def scenario():
+            for i in range(30):
+                await rec.record(make_event(i, payload={"pad": "x" * 900}))
+            buffer.close()
+            store.fail = None
+            await rec.replay()
+
+        asyncio.run(scenario())
+        system = [
+            e.source_key.split(":")
+            for e in store.events.values()
+            if e.kind in (EventKind.BUFFER_OVERFLOW, EventKind.BUFFER_REPLAYED)
+        ]
+        assert len(system) >= 2
+        assert {parts[0] for parts in system} == {"buffer"}
+        assert len({parts[1] for parts in system}) == 1
+        sequence = sorted(int(parts[2]) for parts in system)
+        assert sequence[0] >= 1 and len(set(sequence)) == len(sequence)
+        (report,) = store.of_kind("buffer_replayed")
+        assert int(report.source_key.split(":")[2]) == sequence[-1]
+
+    def test_system_events_of_two_processes_keep_apart_at_the_same_sequence_number(self, tmp_path):
+        store = FakeStore()
+
+        async def replay_one(directory):
+            rec, buffer = recorder(directory, store)
+            store.fail = ConnectionError("down")
+            await rec.record(make_event(1))
+            buffer.close()
+            store.fail = None
+            await rec.replay()
+
+        asyncio.run(replay_one(tmp_path / "a"))
+        asyncio.run(replay_one(tmp_path / "b"))
+        reports = store.of_kind("buffer_replayed")
+        assert len(reports) == 2
+        assert all(e.source_key.endswith(":1:buffer_replayed") for e in reports)
+        assert len({e.source_key for e in reports}) == 2
+
     def test_replay_loads_the_buffer_and_records_the_count(self, tmp_path):
         store = FakeStore()
         store.fail = ConnectionError("down")

@@ -7,7 +7,7 @@ import pytest
 from plugin_helpers import FakeStore, config
 
 from mint_litellm.compat.litellm_1_106 import RegistryEntry
-from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer
+from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer, SystemEventKeys
 from mint_litellm.plugin.selfcheck import (
     LiteLLMView,
     PluginRuntime,
@@ -17,6 +17,7 @@ from mint_litellm.plugin.selfcheck import (
 )
 from mint_litellm.plugin.snapshot import RegisteredServer
 from mint_litellm.types.decision import url_sha256
+from mint_litellm.types.events import EventKind
 from mint_litellm.types.settings import SELF_CHECK_DESCRIPTIONS, SelfCheckItem
 
 URL = "https://mcp.example/api"
@@ -251,8 +252,18 @@ def test_failure_details_never_contain_credentials_or_urls():
     assert "mcp.example" not in text
 
 
-def make_runtime(tmp_path, *, v=None, controlled=None, required=True, retry=0.01, ready=True):
-    store = FakeStore()
+def make_runtime(
+    tmp_path,
+    *,
+    v=None,
+    controlled=None,
+    required=True,
+    retry=0.01,
+    ready=True,
+    store=None,
+    stopped=None,
+):
+    store = store if store is not None else FakeStore()
     recorder = EvidenceRecorder(
         store,
         LocalBuffer(tmp_path / "buf", 1024 * 1024),
@@ -267,7 +278,7 @@ def make_runtime(tmp_path, *, v=None, controlled=None, required=True, retry=0.01
                 raise ConnectionError("down")
             return [registered()] if controlled is None else controlled
 
-    stopped: list[int] = []
+    stopped = stopped if stopped is not None else []
     state = {"view": v or view()}
 
     waited: list[float] = []
@@ -428,21 +439,65 @@ def test_a_runtime_without_the_required_environment_raises_runtime_error(monkeyp
         selfcheck.get_runtime({})
 
 
-def test_a_contract_mismatch_does_not_stop_startup_and_is_recorded_once_per_field(tmp_path):
+def test_a_contract_mismatch_does_not_stop_startup_and_is_recorded_once_per_server(tmp_path):
     changed = view(registry=[entry(transport="sse", url_sha256=url_sha256("https://moved/"))])
     runtime, store, stopped, _ = make_runtime(tmp_path, v=changed)
     asyncio.run(runtime._startup())
     assert runtime.verified and stopped == []
-    events = store.of_kind("server_identity_mismatch_observed")
-    assert sorted(e.payload["field"] for e in events) == ["transport", "url_sha256"]
-    assert {e.payload["server_id"] for e in events} == {"srv-1"}
-    for event in events:
-        assert event.actor is None and event.invocation_id is None
-        assert event.source_key.startswith("selfcheck:")
-        assert event.source_key.endswith(":1:server_identity_mismatch_observed")
-    assert len({e.source_key for e in events}) == 2
+    (event,) = store.of_kind("server_identity_mismatch_observed")
+    assert event.payload == {"server_id": "srv-1", "fields": ["url_sha256", "transport"]}
+    assert event.actor is None and event.invocation_id is None
+    assert (
+        event.source_key == f"selfcheck:{runtime.keys.run_id}:1:server_identity_mismatch_observed"
+    )
     asyncio.run(runtime._report_mismatches())
-    assert len(store.of_kind("server_identity_mismatch_observed")) == 2
+    assert len(store.of_kind("server_identity_mismatch_observed")) == 1
+
+
+def test_two_servers_with_a_mismatch_leave_two_events_with_their_own_keys(tmp_path):
+    changed = view(
+        registry=[
+            entry("srv-1", names=("one",), transport="sse"),
+            entry("srv-2", names=("two",), auth_type="bearer"),
+        ]
+    )
+    controlled = [registered(server_id="srv-1"), registered(server_id="srv-2")]
+    runtime, store, stopped, _ = make_runtime(tmp_path, v=changed, controlled=controlled)
+    asyncio.run(runtime._startup())
+    assert runtime.verified and stopped == []
+    events = store.of_kind("server_identity_mismatch_observed")
+    assert sorted((e.payload["server_id"], tuple(e.payload["fields"])) for e in events) == [
+        ("srv-1", ("transport",)),
+        ("srv-2", ("auth_type",)),
+    ]
+    run_id = runtime.keys.run_id
+    assert sorted(e.source_key for e in events) == [
+        f"selfcheck:{run_id}:1:server_identity_mismatch_observed",
+        f"selfcheck:{run_id}:2:server_identity_mismatch_observed",
+    ]
+
+
+def test_a_run_issues_keys_from_one_and_another_run_gets_other_keys():
+    first, second = SystemEventKeys(), SystemEventKeys()
+    kind = EventKind.ENFORCEMENT_UNVERIFIED
+    keys = [first.next(kind), first.next(kind), second.next(kind)]
+    assert keys[0].endswith(":1:enforcement_unverified")
+    assert keys[1].endswith(":2:enforcement_unverified")
+    assert keys[2].endswith(":1:enforcement_unverified")
+    assert len(set(keys)) == 3
+
+
+def test_failures_of_two_startups_in_one_database_both_remain(tmp_path):
+    store = FakeStore()
+    stopped: list[int] = []
+    for index in range(2):
+        runtime, _, _, _ = make_runtime(
+            tmp_path / str(index), v=view(callbacks=[GUARDRAIL]), store=store, stopped=stopped
+        )
+        asyncio.run(runtime._startup())
+    keys = [e.source_key for e in store.of_kind("enforcement_unverified")]
+    assert len(keys) == 2 and len(set(keys)) == 2
+    assert all(key.endswith(":1:enforcement_unverified") for key in keys)
 
 
 def test_a_mismatch_is_also_recorded_when_another_item_stops_the_startup(tmp_path):
