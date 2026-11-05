@@ -17,7 +17,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TextIO
+from typing import BinaryIO, Protocol, TextIO
 from uuid import UUID
 
 from mint_litellm.types.events import Event, EventKind, Evidence, control_source_key
@@ -31,6 +31,7 @@ except ImportError:  # Windows
 _OPEN = ".open"
 _CLOSED = ".jsonl"
 _REPLAYING = ".replaying"
+_LOCKFILE = ".lock"
 _SYSTEM_KINDS = frozenset({EventKind.BUFFER_OVERFLOW, EventKind.BUFFER_REPLAYED})
 
 
@@ -93,33 +94,37 @@ class LocalBuffer:
         self._segment_bytes = max(1024, min(4 * 1024 * 1024, max_bytes // 4))
         self._owner = new_uuid7().hex
         self._seq = 0
-        self._handle: TextIO | None = None
+        self._handle: BinaryIO | None = None
         self._path: Path | None = None
         self._size = 0
         self._dropped_events = 0
         self._dropped_files = 0
         self._lock = threading.RLock()
+        self._directory_lock_handle: TextIO | None = None
 
     def append(self, event: Event) -> None:
         line = event.to_json_line()
         if "\n" in line:
             raise BufferWriteError("event line contains a line break")
-        data = line + "\n"
-        try:
-            self._dir.mkdir(parents=True, exist_ok=True)
-            self._make_room(len(data.encode("utf-8")))
-            if self._handle is None or self._size + len(data) > self._segment_bytes:
-                self._rotate()
-            assert self._handle is not None
-            self._handle.write(data)
-            self._handle.flush()
-            os.fsync(self._handle.fileno())
-            self._size += len(data)
-        except BufferWriteError:
-            raise
-        except OSError as exc:
-            self._abandon()
-            raise BufferWriteError(f"{type(exc).__name__}") from exc
+        data = (line + "\n").encode("utf-8")
+        # 용량 확인, 회전, 쓰기, fsync, 크기 갱신을 한 잠금으로 묶는다. 다른 스레드의 회전이 끼면
+        # 쓴 줄이 이미 닫힌 파일이나 다른 파일에 대한 fsync로 성공 처리될 수 있다.
+        with self._lock:
+            try:
+                self._dir.mkdir(parents=True, exist_ok=True)
+                self._make_room(len(data))
+                if self._handle is None or self._size + len(data) > self._segment_bytes:
+                    self._rotate()
+                assert self._handle is not None
+                self._handle.write(data)
+                self._handle.flush()
+                os.fsync(self._handle.fileno())
+                self._size += len(data)
+            except BufferWriteError:
+                raise
+            except (OSError, ValueError) as exc:
+                self._abandon()
+                raise BufferWriteError(f"{type(exc).__name__}") from exc
 
     def take_overflow(self) -> Overflow | None:
         with self._lock:
@@ -215,7 +220,7 @@ class LocalBuffer:
         self._close_current()
         self._seq += 1
         path = self._dir / f"{self._owner}-{self._seq:06d}{_OPEN}"
-        handle = path.open("a", encoding="utf-8", newline="\n")
+        handle = path.open("ab")
         if fcntl is not None:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self._handle, self._path, self._size = handle, path, 0
@@ -252,22 +257,49 @@ class LocalBuffer:
             finally:
                 os.close(fd)
 
+    @contextlib.contextmanager
+    def _directory_lock(self):
+        """같은 디렉터리를 쓰는 프로세스 사이에서 용량 계산·삭제·인수를 직렬화한다.
+
+        호출하는 쪽이 ``self._lock``을 쥐고 있어야 같은 프로세스의 스레드끼리도 배제된다.
+        """
+        if fcntl is None:
+            yield
+            return
+        if self._directory_lock_handle is None:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            self._directory_lock_handle = (self._dir / _LOCKFILE).open("a")
+        fcntl.flock(self._directory_lock_handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(self._directory_lock_handle, fcntl.LOCK_UN)
+
     def _total_bytes(self) -> int:
-        return sum(p.stat().st_size for p in self._dir.iterdir() if p.is_file())
+        total = 0
+        for entry in self._dir.iterdir():
+            with contextlib.suppress(FileNotFoundError):
+                if entry.is_file():
+                    total += entry.stat().st_size
+        return total
 
     def _make_room(self, incoming: int) -> None:
-        while self._total_bytes() + incoming > self._max_bytes:
-            closed = sorted(p for p in self._dir.iterdir() if p.name.endswith(_CLOSED))
-            if not closed:
-                if self._handle is not None and self._size > 0:
-                    self._close_current()
+        with self._directory_lock():
+            while self._total_bytes() + incoming > self._max_bytes:
+                closed = sorted(p for p in self._dir.iterdir() if p.name.endswith(_CLOSED))
+                if not closed:
+                    if self._handle is not None and self._size > 0:
+                        self._close_current()
+                        continue
+                    raise BufferWriteError("buffer is full")
+                victim = closed[0]
+                try:
+                    events, unreadable = self.read(victim)
+                    victim.unlink()
+                except FileNotFoundError:
                     continue
-                raise BufferWriteError("buffer is full")
-            victim = closed[0]
-            events, unreadable = self.read(victim)
-            self._dropped_events += len(events) + unreadable
-            self._dropped_files += 1
-            victim.unlink()
+                self._dropped_events += len(events) + unreadable
+                self._dropped_files += 1
 
 
 class Recorded(Protocol):

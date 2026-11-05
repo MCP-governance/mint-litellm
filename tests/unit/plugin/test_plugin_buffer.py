@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import os
+import threading
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -133,6 +134,64 @@ class TestLocalBuffer:
         buffer = LocalBuffer(blocker / "inner", 1024 * 1024)
         with pytest.raises(BufferWriteError):
             buffer.append(make_event(1))
+
+    def test_concurrent_appends_and_rotations_all_land_in_files(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 8 * 1024 * 1024)
+        buffer._segment_bytes = 1024
+        errors: list[Exception] = []
+
+        def work(worker: int) -> None:
+            for i in range(40):
+                try:
+                    buffer.append(make_event(worker * 1000 + i, payload={"pad": "x" * 150}))
+                except Exception as exc:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=work, args=(w,)) for w in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
+        keys: set[str] = set()
+        for path in closed_files(buffer):
+            events, unreadable = LocalBuffer.read(path)
+            assert unreadable == 0
+            keys |= {e.source_key for e in events}
+        assert len(keys) == 8 * 40
+        assert len(closed_files(buffer)) > 8
+
+    def test_buffers_sharing_a_directory_trim_it_without_failing(self, tmp_path):
+        first, second = LocalBuffer(tmp_path, 16 * 1024), LocalBuffer(tmp_path, 16 * 1024)
+        errors: list[Exception] = []
+
+        def work(buffer: LocalBuffer, worker: int) -> None:
+            for i in range(60):
+                try:
+                    buffer.append(make_event(worker * 1000 + i, payload={"pad": "x" * 400}))
+                except BufferWriteError:
+                    pass
+                except Exception as exc:
+                    errors.append(exc)
+
+        threads = [
+            threading.Thread(target=work, args=(buffer, w))
+            for w, buffer in enumerate((first, second, first, second))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
+        assert sum(p.stat().st_size for p in tmp_path.iterdir()) <= 16 * 1024 + 2048
+
+    def test_the_segment_size_counts_bytes_not_characters(self, tmp_path):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        buffer._segment_bytes = 2048
+        for i in range(12):
+            buffer.append(make_event(i, payload={"pad": "한" * 150}))
+        sizes = [p.stat().st_size for p in closed_files(buffer)]
+        assert len(sizes) > 1 and all(size <= 2048 for size in sizes)
 
     @pytest.mark.skipif(fcntl is None, reason="needs flock")
     def test_an_open_file_without_a_live_writer_is_adopted(self, tmp_path):
