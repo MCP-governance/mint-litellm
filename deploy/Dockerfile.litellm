@@ -15,3 +15,9 @@ RUN python -m ensurepip \
     && python -m pip install "$(ls /tmp/wheels/*.whl)[litellm]" \
     && python -m pip uninstall -y pip \
     && rm -rf /tmp/wheels
+
+# LiteLLM을 시작하기 전에 설정 파일을 검사하는 진입점. 검사에 실패하면 컨테이너가 시작되지 않는다.
+COPY deploy/mint-entrypoint.sh /usr/local/bin/mint-entrypoint
+RUN chmod +x /usr/local/bin/mint-entrypoint
+ENTRYPOINT ["mint-entrypoint"]
+CMD ["--port", "4000"]
