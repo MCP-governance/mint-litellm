@@ -32,8 +32,13 @@ def test_registered_server_missing_from_registry_stops_start_and_unverified_bloc
             "--num_workers",
             "2",
         )
-        assert done.returncode != 0, done.stdout[-600:]
-        print(f"multi-worker start stopped after {time.monotonic() - started:.0f}s")
+        output = done.stdout + done.stderr
+        assert output.count("MINT 자가 점검 실패") == 2, output[-600:]
+        assert "Stopping parent process" in output, output[-600:]
+        print(
+            f"multi-worker start stopped after {time.monotonic() - started:.0f}s "
+            f"exit code {done.returncode}"
+        )
         events = world.query(
             "select payload from mint.events where kind = 'enforcement_unverified' "
             "and inserted_at >= %s",
@@ -41,9 +46,7 @@ def test_registered_server_missing_from_registry_stops_start_and_unverified_bloc
         )
         assert events
         assert all(e["payload"]["failed"][0]["name"] == "SERVER_REGISTRY_MATCH" for e in events)
-        print(
-            "workers that recorded the failure:", len({e["payload"]["worker_id"] for e in events})
-        )
+        assert len({e["payload"]["worker_id"] for e in events}) == 2
 
         # 중단하지 않는 설정(MINT_REQUIRED=false)에서는 점검 실패 상태로 올라와 모든 호출을 막는다.
         support.compose(

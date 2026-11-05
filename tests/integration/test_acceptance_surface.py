@@ -404,15 +404,20 @@ def test_config_server_url_change_after_start_blocks_calls_and_records_mismatch(
 ):
     evidence.positive_control()
     subject = world.subject(("d",))
-    relation = world.prepare(subject, "d")
-    world.approve(subject, relation)
+    world.approve(subject, world.prepare(subject, "d"))
     assert_allowed(world, evidence, world.call(subject, "d"), "d")
-    path = variant(
-        "urlchange",
-        lambda text: text.replace(
-            "http://counting-proxy:8080/d/mcp", "http://counting-proxy:8080/a/mcp"
-        ),
-    )
+    # 서버 c도 승인 상태로 두고 한 번의 기동 점검에서 서버 둘의 URL이 어긋나게 한다.
+    other = world.subject(("c",))
+    world.approve(other, world.prepare(other, "c"))
+
+    def change(text: str) -> str:
+        for name in ("d", "c"):
+            text = text.replace(
+                f"http://counting-proxy:8080/{name}/mcp", "http://counting-proxy:8080/a/mcp"
+            )
+        return text
+
+    path = variant("urlchange", change)
     since = world.now()
     with litellm_config(path) as started:
         assert started.returncode == 0, started.stderr
@@ -421,9 +426,27 @@ def test_config_server_url_change_after_start_blocks_calls_and_records_mismatch(
         assert outcome.code == code_of("SERVER_IDENTITY_MISMATCH"), outcome.body
         evidence.assert_calls(outcome.mark, 0, "a")
         support.wait_until(
-            lambda: world.count_since(since, "server_identity_mismatch_observed") >= 1,
-            what="mismatch event",
+            lambda: len(mismatch_servers(world, since)) >= 2, 30, what="mismatch events"
         )
+        assert mismatch_servers(world, since) == {
+            support.SERVER_ID["c"],
+            support.SERVER_ID["d"],
+        }
+        events = world.query(
+            "select payload from mint.events where kind = 'server_identity_mismatch_observed' "
+            "and inserted_at >= %s",
+            (since,),
+        )
+        assert all("url_sha256" in e["payload"]["fields"] for e in events)
+
+
+def mismatch_servers(world, since) -> set[str]:
+    rows = world.query(
+        "select distinct payload->>'server_id' as server from mint.events "
+        "where kind = 'server_identity_mismatch_observed' and inserted_at >= %s",
+        (since,),
+    )
+    return {row["server"] for row in rows}
 
 
 def buffer_rows_in(service: str, mark: str) -> int:
