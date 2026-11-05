@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -288,6 +289,70 @@ class TestGuardrailJudgment:
         data = synthesized(logging_obj(), mcp_arguments=original)
         assert blocked(lambda: pre(runtime.guardrail, data)).code == "MINT-SCHEMA-ERROR"
         assert snapshots.queries == []
+
+    @staticmethod
+    def timing_lines(caplog):
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith("decision_ms=")]
+
+    def test_at_debug_level_a_call_leaves_one_timing_line_with_its_decision_ref(
+        self, tmp_path, contract_snapshot, caplog
+    ):
+        import re
+
+        runtime, store, _ = build_runtime(tmp_path, contract_snapshot)
+        with caplog.at_level(logging.DEBUG, logger="mint_litellm.guardrail"):
+            pre(runtime.guardrail, synthesized(logging_obj()))
+        (line,) = self.timing_lines(caplog)
+        found = re.fullmatch(r"decision_ms=(\d+\.\d{3}) ref=(\S+) allowed=true", line)
+        assert found and float(found[1]) >= 0
+        (event,) = store.of_kind("decision_evaluated")
+        assert found[2] == event.payload["decision_ref"]
+
+    def test_the_timing_covers_the_pre_record_and_the_blocked_calls_too(
+        self, tmp_path, contract_snapshot, caplog
+    ):
+        runtime, store, _ = build_runtime(tmp_path, contract_snapshot)
+        commit = store.insert_event
+
+        async def slow_insert(event, consume=None):
+            await asyncio.sleep(0.05)
+            return await commit(event, consume)
+
+        store.insert_event = slow_insert
+        master = UserAPIKeyAuth(api_key="litellm_proxy_master_key", user_id="default_user_id")
+        with caplog.at_level(logging.DEBUG, logger="mint_litellm.guardrail"):
+            blocked(lambda: pre(runtime.guardrail, synthesized(logging_obj()), user=master))
+        (line,) = self.timing_lines(caplog)
+        assert "allowed=false" in line and "ref=None" not in line
+        assert float(line.split()[0].split("=")[1]) >= 45
+
+    def test_an_internal_error_is_timed_without_a_reference(
+        self, tmp_path, contract_snapshot, caplog
+    ):
+        runtime, _, _ = build_runtime(tmp_path, contract_snapshot)
+
+        async def explode(data, auth):
+            raise RuntimeError("boom")
+
+        runtime.judge_call = explode
+        with caplog.at_level(logging.DEBUG, logger="mint_litellm.guardrail"):
+            blocked(lambda: pre(runtime.guardrail, synthesized(logging_obj())))
+        (line,) = self.timing_lines(caplog)
+        assert line.endswith("ref=None allowed=false")
+
+    def test_without_debug_nothing_is_timed_or_logged(
+        self, tmp_path, contract_snapshot, caplog, monkeypatch
+    ):
+        from mint_litellm.plugin import guardrail as guardrail_module
+
+        def forbidden():
+            raise AssertionError("the clock must not be read when DEBUG is off")
+
+        monkeypatch.setattr(guardrail_module.time, "perf_counter", forbidden)
+        runtime, _, _ = build_runtime(tmp_path, contract_snapshot)
+        with caplog.at_level(logging.INFO, logger="mint_litellm.guardrail"):
+            assert pre(runtime.guardrail, synthesized(logging_obj())) is None
+        assert self.timing_lines(caplog) == []
 
     def test_an_external_cancel_is_not_turned_into_a_block_and_leaves_one_cancelled_event(
         self, tmp_path, contract_snapshot
@@ -1064,6 +1129,57 @@ class TestConstructors:
             MintLogger()
         with pytest.raises(RuntimeError):
             MintGuardrail(guardrail_name="mint", event_hook=["pre_mcp_call"], default_on=True)
+
+    @staticmethod
+    def invalid_environment(monkeypatch, tmp_path):
+        marker = tmp_path / "exit-code"
+        monkeypatch.setenv("MINT_EXIT_CODE_FILE", str(marker))
+        monkeypatch.setenv("MINT_INSTANCE_ID", "inst")
+        monkeypatch.setenv("MINT_DATABASE_URL", "postgresql://nobody@db.invalid:1/mint")
+        monkeypatch.setenv("MINT_OPA_URL", "http://opa.invalid:1")
+        monkeypatch.setenv("MINT_FINGERPRINT_KEY", "")
+        monkeypatch.setattr("mint_litellm.plugin.selfcheck._runtime", None)
+        return marker
+
+    @pytest.mark.parametrize("build", ["guardrail", "logger"])
+    def test_a_constructor_failure_before_the_first_startup_leaves_the_exit_marker(
+        self, tmp_path, monkeypatch, build
+    ):
+        marker = self.invalid_environment(monkeypatch, tmp_path)
+        with pytest.raises(RuntimeError, match="MINT_FINGERPRINT_KEY"):
+            if build == "guardrail":
+                MintGuardrail(guardrail_name="mint", event_hook=["pre_mcp_call"], default_on=True)
+            else:
+                MintLogger()
+        assert marker.read_text(encoding="utf-8") == "3"
+
+    def test_a_failure_after_the_process_passed_its_checks_does_not_leave_it(
+        self, tmp_path, monkeypatch
+    ):
+        runtime, _, _ = build_runtime(tmp_path)
+        assert runtime.verified
+        monkeypatch.setattr("mint_litellm.plugin.selfcheck._runtime", runtime)
+        marker = tmp_path / "exit-code"
+        monkeypatch.setenv("MINT_EXIT_CODE_FILE", str(marker))
+        import litellm
+
+        litellm.callbacks.append(MintLogger(runtime=runtime))
+        with pytest.raises(RuntimeError, match="must not be listed"):
+            MintGuardrail(runtime=runtime, guardrail_name="mint", default_on=True)
+        assert not marker.exists()
+        runtime.verified = False
+        with pytest.raises(RuntimeError, match="must not be listed"):
+            MintGuardrail(runtime=runtime, guardrail_name="mint", default_on=True)
+        assert marker.read_text(encoding="utf-8") == "3"
+
+    def test_without_the_marker_setting_a_constructor_failure_writes_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        self.invalid_environment(monkeypatch, tmp_path)
+        monkeypatch.delenv("MINT_EXIT_CODE_FILE")
+        with pytest.raises(RuntimeError):
+            MintLogger()
+        assert list(tmp_path.iterdir()) == []
 
     def test_unexpected_errors_are_converted_to_runtime_error(self):
         class Broken:

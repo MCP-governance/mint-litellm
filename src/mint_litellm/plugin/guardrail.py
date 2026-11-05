@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from fastapi import HTTPException
@@ -25,7 +26,11 @@ from litellm.types.guardrails import GuardrailEventHooks
 
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.plugin.logger import MintLogger, internal_block
-from mint_litellm.plugin.selfcheck import PluginRuntime, get_runtime
+from mint_litellm.plugin.selfcheck import (
+    PluginRuntime,
+    get_runtime,
+    leave_startup_failure_marker,
+)
 from mint_litellm.types.decision import MINT_CTX_KEY
 
 log = logging.getLogger("mint_litellm.guardrail")
@@ -54,8 +59,10 @@ class MintGuardrail(CustomGuardrail):
             self._register_logger()
             self._runtime.ensure_started()
         except RuntimeError:
+            leave_startup_failure_marker()
             raise
         except Exception as exc:
+            leave_startup_failure_marker()
             raise RuntimeError(f"MintGuardrail could not start: {type(exc).__name__}") from exc
 
     def _register_logger(self) -> None:
@@ -103,16 +110,34 @@ class MintGuardrail(CustomGuardrail):
         return None
 
     async def _judge(self, user_api_key_dict, data):
-        """도구 호출을 판정한다. 차단은 예외이고, 병렬 단계가 돌려주는 값은 버려진다."""
-        hook = compat.parse_hook_data(data)
+        """도구 호출을 판정한다. 차단은 예외이고, 병렬 단계가 돌려주는 값은 버려진다.
+
+        DEBUG 로그가 켜져 있을 때만 판정 진입부터 반환까지의 시간(선기록 포함)을 재서 한 줄 남긴다.
+        꺼져 있으면 시간을 재지 않는다.
+        """
+        timed = log.isEnabledFor(logging.DEBUG)
+        started = time.perf_counter() if timed else 0.0
+        reference = None
+        allowed = False
         try:
-            outcome = await self._runtime.judge_call(data, user_api_key_dict)
-        except Exception as exc:
-            log.error("도구 호출 판정 오류: %s", type(exc).__name__)
-            raise internal_block() from exc
-        details = compat.logging_details(hook.logging_obj)
-        if details is not None:
-            details[MINT_CTX_KEY] = outcome.context
-        if not outcome.allowed:
-            assert outcome.error is not None
-            raise HTTPException(status_code=403, detail=outcome.error.detail())
+            hook = compat.parse_hook_data(data)
+            try:
+                outcome = await self._runtime.judge_call(data, user_api_key_dict)
+            except Exception as exc:
+                log.error("도구 호출 판정 오류: %s", type(exc).__name__)
+                raise internal_block() from exc
+            reference, allowed = outcome.snapshot.decision_ref, outcome.allowed
+            details = compat.logging_details(hook.logging_obj)
+            if details is not None:
+                details[MINT_CTX_KEY] = outcome.context
+            if not outcome.allowed:
+                assert outcome.error is not None
+                raise HTTPException(status_code=403, detail=outcome.error.detail())
+        finally:
+            if timed:
+                log.debug(
+                    "decision_ms=%.3f ref=%s allowed=%s",
+                    (time.perf_counter() - started) * 1000,
+                    reference,
+                    str(allowed).lower(),
+                )

@@ -16,7 +16,7 @@ from litellm.integrations.custom_logger import CustomLogger
 
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.plugin.result import observe_response, observe_unknown_outcome
-from mint_litellm.plugin.selfcheck import PluginRuntime, get_runtime
+from mint_litellm.plugin.selfcheck import PluginRuntime, get_runtime, leave_startup_failure_marker
 from mint_litellm.types.decision import MINT_CTX_KEY, MintContext
 from mint_litellm.types.errors import error_for_reason
 from mint_litellm.types.ids import new_uuid7
@@ -43,8 +43,10 @@ class MintLogger(CustomLogger):
             self._runtime.logger = self
             self._runtime.ensure_started()
         except RuntimeError:
+            leave_startup_failure_marker()
             raise
         except Exception as exc:
+            leave_startup_failure_marker()
             raise RuntimeError(f"MintLogger could not start: {type(exc).__name__}") from exc
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):

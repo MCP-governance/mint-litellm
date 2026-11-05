@@ -6,6 +6,7 @@ LiteLLM은 가드레일 생성자가 ``ValueError``·``TypeError``를 던지면 
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ DEFAULT_BUFFER_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_DECISION_BUDGET_MS = 300
 DEFAULT_SELFCHECK_GRACE_SECONDS = 120.0
 SELFCHECK_GRACE_RANGE = (10, 600)
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,7 @@ class PluginConfig:
     fingerprint_key_version: int = 1
     readiness_url: str | None = None
     selfcheck_grace_seconds: float = DEFAULT_SELFCHECK_GRACE_SECONDS
+    log_level: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> PluginConfig:
@@ -72,6 +75,7 @@ class PluginConfig:
             fingerprint_key=key,
             fingerprint_key_version=_integer(env, "MINT_FINGERPRINT_KEY_VERSION", 1, 1),
             readiness_url=env.get("MINT_READINESS_URL") or None,
+            log_level=_log_level(env.get("MINT_LOG_LEVEL")),
             selfcheck_grace_seconds=float(
                 _integer(
                     env,
@@ -82,6 +86,28 @@ class PluginConfig:
                 )
             ),
         )
+
+
+def _log_level(raw: str | None) -> str | None:
+    if raw is None or not raw.strip():
+        return None
+    level = raw.strip().upper()
+    if level not in LOG_LEVELS:
+        raise RuntimeError(f"MINT_LOG_LEVEL must be one of {', '.join(LOG_LEVELS)}")
+    return level
+
+
+def configure_logging(level: str | None) -> None:
+    """``MINT_LOG_LEVEL``이 있으면 플러그인 로그의 수준을 정하고 표준 오류로 내보낸다."""
+    if level is None:
+        return
+    logger = logging.getLogger("mint_litellm")
+    logger.setLevel(level)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logger.addHandler(handler)
+        logger.propagate = False
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
