@@ -233,16 +233,34 @@ EXIT_CODE = 3
 EXIT_CODE_FILE_ENV = "MINT_EXIT_CODE_FILE"
 
 
-def terminate_process() -> None:
-    """프록시를 멈춘다. 워커이면 감독 프로세스에도 종료를 알려 컨테이너 재시작 정책이 받게 한다.
+def leave_exit_marker() -> None:
+    """``MINT_EXIT_CODE_FILE``이 있으면 그 파일에 종료 코드 표식을 남긴다.
 
-    uvicorn의 다중 워커 감독 프로세스는 워커가 몇 번으로 끝났든 0으로 끝난다. 진입점이 종료 코드를
-    바꿀 수 있도록 ``MINT_EXIT_CODE_FILE``이 있으면 그 파일에 표식을 남긴다.
+    uvicorn의 다중 워커 감독 프로세스는 워커가 몇 번으로 끝났든 0으로 끝난다. 진입점이 이 표식을
+    읽어 종료 코드를 바꾼다.
     """
     path = os.environ.get(EXIT_CODE_FILE_ENV)
     if path:
         with contextlib.suppress(OSError), open(path, "w", encoding="utf-8") as marker:
             marker.write(str(EXIT_CODE))
+
+
+def leave_startup_failure_marker() -> None:
+    """생성자 오류로 기동이 중단될 때 표식을 남긴다.
+
+    구성 오류(RuntimeError)로 가드레일·로거를 만들지 못하면 LiteLLM이 워커를 끝내지만 자가 점검의
+    종료 경로를 거치지 않는다. 이미 점검을 통과한 프로세스에서 나중에 만든 객체의 오류는 프록시를
+    멈추지 않으므로 표식을 남기지 않는다.
+    """
+    runtime = _runtime
+    if runtime is not None and runtime.verified:
+        return
+    leave_exit_marker()
+
+
+def terminate_process() -> None:
+    """프록시를 멈춘다. 워커이면 감독 프로세스에도 종료를 알려 컨테이너 재시작 정책이 받게 한다."""
+    leave_exit_marker()
     parent = os.getppid()
     if multiprocessing.parent_process() is not None or parent > 1:
         with contextlib.suppress(OSError):
