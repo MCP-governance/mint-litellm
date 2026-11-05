@@ -95,8 +95,9 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         rule=(
             "판정 하나의 시간 예산(밀리초, 기본 300). 상태 조회·정책 평가·선기록은 남은 시간만큼만 "
             "기다리고, 시간 초과는 결과 불명으로 다룬다. 데이터베이스가 응답하지 않아도 이 "
-            "시간에서 끝나며(서버 쪽 `statement_timeout`·`lock_timeout`과 연결 시도 제한도 같은 "
-            "값으로 건다), 상태 조회가 넘으면 `MINT-DEPENDENCY-DB`로 차단한다. "
+            "시간에서 끝나며(서버 쪽 잠금 제한 `lock_timeout`은 같은 값, 문장 제한 "
+            "`statement_timeout`은 열 배, 연결 시도 제한도 건다), 상태 조회가 넘으면 "
+            "`MINT-DEPENDENCY-DB`로 차단한다. "
             "저장된 설정으로 덮지 않는다."
         ),
     ),

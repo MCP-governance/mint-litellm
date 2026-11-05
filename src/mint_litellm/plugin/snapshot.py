@@ -415,9 +415,10 @@ class PluginDatabase:
     """판정 프로세스 전용 연결. 상태 표 조회와 사건 추가, 호출별 승인 소비만 한다.
 
     DB가 응답하지 않아도 호출한 쪽의 시간 제한(판정 예산)에서 끝나도록 세 겹으로 건다.
-    서버 쪽 문장·잠금 제한(``statement_timeout``, ``lock_timeout``)은 ``acquire_timeout``과
-    같고, 연결 시도에는 ``connect_timeout``을 건다. 응답이 아예 없는 연결에는 두 제한이 소용없으므로
-    호출한 쪽이 기다리기를 그만두면 연결을 닫아 버린다(``_run``).
+    서버 쪽 잠금 제한(``lock_timeout``)은 ``acquire_timeout``과 같고 문장 제한
+    (``statement_timeout``)은 그 열 배(최소 1초)이며, 연결 시도에는 ``connect_timeout``을 건다.
+    응답이 아예 없는 연결에는 이 제한들이 소용없으므로 호출한 쪽이 기다리기를 그만두면 연결을
+    끊어 버린다(``_run``).
     """
 
     dsn: str
@@ -433,6 +434,9 @@ class PluginDatabase:
                     from psycopg_pool import AsyncConnectionPool
 
                     milliseconds = max(10, int(self.acquire_timeout * 1000))
+                    # 문장은 호출한 쪽이 포기한 뒤에도 서버에서 끝까지 갈 수 있게(커밋 결과 불명)
+                    # 예산의 열 배까지 두고, 잠금 대기는 예산에서 끊는다.
+                    statement_ms = max(1000, milliseconds * 10)
                     pool = AsyncConnectionPool(
                         self.dsn,
                         min_size=1,
@@ -442,7 +446,7 @@ class PluginDatabase:
                             # libpq는 2초보다 짧은 값을 2초로 본다.
                             "connect_timeout": max(2, math.ceil(self.acquire_timeout)),
                             "options": (
-                                f"-c statement_timeout={milliseconds}"
+                                f"-c statement_timeout={statement_ms}"
                                 f" -c lock_timeout={milliseconds}"
                             ),
                         },
