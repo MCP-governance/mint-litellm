@@ -17,6 +17,9 @@ from mint_litellm.plugin.policy.bundle import (
 REGO = "package mint\n"
 STALE = REGO + "# stale\n"
 MANAGED_ENTRY = {"etag": "", "manifest": {"revision": "", "roots": [""]}}
+VERSION = {
+    "build_commit": "c", "build_hostname": "", "build_timestamp": "t", "version": "1.21.4"
+}
 META = {"policy_version_id": "version", "bundle_sha256": "ignored"}
 
 
@@ -74,18 +77,19 @@ async def activate_against_fake_opa(
         rego = served_rego() if callable(served_rego) and request == "/v1/policies" else served_rego
         if request == "/v1/policies":
             reads.append(rego)
+        system = served_system or {
+            "bundles": {"/loaded/bundle.tar.gz": MANAGED_ENTRY},
+            "version": VERSION,
+        }
         tree = served_tree or {
             "mint": {"x": 1, "data": served_data, "meta": {
                 "policy_version_id": "version", "bundle_sha256": digest}}
         }
         replies = {
             "/v1/data": tree,
-            "/v1/data/system": served_system or {
-                "bundles": {"/loaded/bundle.tar.gz": MANAGED_ENTRY},
-                "version": {"version": "1.21.4"},
-            },
+            "/v1/data/system": system,
             "/v1/data/mint/meta": {"policy_version_id": "version", "bundle_sha256": digest},
-            "/v1/data/system/bundles": {"/loaded/bundle.tar.gz": MANAGED_ENTRY},
+            "/v1/data/system/bundles": system["bundles"],
             "/v1/policies": [
                 {"id": "/loaded/bundle.tar.gz/mint/a.rego", "raw": rego, "ast": POLICY_AST}
             ],
@@ -155,12 +159,22 @@ def test_activation_waits_for_the_reload_when_the_metadata_is_already_current():
 
 @pytest.mark.parametrize(
     "extra",
-    [{"injected": {"k": 1}}, {"sub": 1}],
+    [
+        {"injected": {"k": 1}},
+        {"sub": 1},
+        {"version": {**VERSION, "version": {"injected": 1}}},
+        {"version": {}},
+        {"version": {**VERSION, "version": 1}},
+        {"bundles": {"/loaded/bundle.tar.gz": {"etag": {"x": 1}, "manifest": {}}}},
+        {"bundles": {"/loaded/bundle.tar.gz": {"etag": "", "manifest": {"roots": [1]}}}},
+        {"bundles": {"/loaded/bundle.tar.gz": {"etag": "", "manifest": {"roots": "mint"}}}},
+        {"bundles": {"/loaded/bundle.tar.gz": {"etag": "", "manifest": {"extra": 1}}}},
+    ],
 )
 def test_activation_rejects_data_injected_under_system(extra):
     system = {
         "bundles": {"/loaded/bundle.tar.gz": MANAGED_ENTRY},
-        "version": {"version": "1.21.4"},
+        "version": VERSION,
         **extra,
     }
     with pytest.raises(BundleContentMismatch):

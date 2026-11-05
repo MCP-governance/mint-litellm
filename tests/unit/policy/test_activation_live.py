@@ -277,3 +277,33 @@ def test_activation_rejects_content_changed_with_unchanged_metadata(live_databas
             assert await loaded_bundle_sha256(opa_url) == good.bundle_sha256
 
     _run(run)
+
+
+def test_watch_path_overwrites_injected_version_information(live_database):
+    import psycopg
+
+    bundle_dir = Path(os.environ["MINT_TEST_OPA_BUNDLE_DIR"])
+    opa_url = os.environ["MINT_TEST_OPA_URL"].rstrip("/")
+    prepared = prepare_bundle(ROOT, "version", opa=opa_command(), opa_policy_path="/work/policy")
+    forged = dataclasses.replace(prepared, archive=_tampered(
+        prepared.archive, "system/version/data.json", lambda _: b'{"version": {"injected": 1}}'
+    ))
+
+    async def run():
+        async with await psycopg.AsyncConnection.connect(live_database) as conn:
+            async def publish(data):
+                publish_bundle(bundle_dir / "mint.tar.gz", data)
+
+            await register_bundle(conn, instance_id="test", bundle=forged)
+            await activate_bundle(
+                conn, instance_id="test", actor="operator", bundle=forged,
+                publish=publish, opa_url=opa_url, timeout_seconds=30,
+            )
+            async with httpx.AsyncClient(trust_env=False) as client:
+                reply = await client.get(f"{opa_url}/v1/data/system/version")
+            assert set(reply.json()["result"]) == {
+                "build_commit", "build_hostname", "build_timestamp", "version"
+            }
+            assert all(type(v) is str for v in reply.json()["result"].values())
+
+    _run(run)

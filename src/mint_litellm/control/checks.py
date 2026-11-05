@@ -349,7 +349,8 @@ def _check_keys_and_teams(report, judge, litellm: LiteLLMAdmin) -> None:
     report.observations["guardrail_optout_subjects"] = subjects
     if subjects:
         report.add("가드레일 제외 대상", Level.WARN,
-                   f"가드레일 제외 메타데이터를 가진 키·팀이 {subjects}개 있습니다.")
+                   f"가드레일 제외 메타데이터를 가진 키·팀이 {subjects}개 있습니다. 이 키·팀은 "
+                   "MCP를 호출할 수 없게 됩니다.")
     bad: list[str] = []
     for owner, kind, objects in (("키", "key", keys), ("팀", "team", teams)):
         for obj in objects:
