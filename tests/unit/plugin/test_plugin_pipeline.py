@@ -1,7 +1,7 @@
 import asyncio
 import json
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from plugin_helpers import (
@@ -1004,6 +1004,73 @@ class TestObligations:
         assert outcome.allowed
         assert [t.value for t in outcome.snapshot.obligation_types] == ["alert"]
         assert "high" not in json.dumps(outcome.snapshot.model_dump(mode="json"))
+
+
+CONSENT_OBLIGATION = evaluator(
+    "Allow", obligations=({"type": "require_consent", "purpose": "support"},)
+)
+CALL_APPROVAL_OBLIGATION = evaluator("RequireApproval", policy_ids=("R2",))
+ONE_TICK = timedelta(microseconds=1)
+
+
+def window_case(kind: str, *, start: datetime | None = None, end: datetime | None = None):
+    """유효 기간이 있는 근거 하나를 시작·끝 시각으로 바꾼 스냅숏과 정책 결과 대역."""
+    fields = {k: v for k, v in (("valid_from", start), ("valid_until", end)) if v is not None}
+    if kind == "approval":
+        return snapshot(approvals=(approval(**fields),)), evaluator()
+    if kind == "allowlist":
+        server = server_row(basis_allowlist_ids=("al1",))
+        return snapshot(server=server, allowlists={"al1": allowlist(**fields)}), evaluator()
+    if kind == "consent":
+        fields = {("granted_at" if k == "valid_from" else k): v for k, v in fields.items()}
+        return snapshot(consents=(consent(**fields),)), CONSENT_OBLIGATION
+    return snapshot(call_approvals=(call_approval(expires_at=end),)), CALL_APPROVAL_OBLIGATION
+
+
+class TestValidityWindow:
+    """모든 유효 기간은 시작 시각을 포함하고 끝 시각은 포함하지 않는다."""
+
+    @pytest.mark.parametrize(
+        ("kind", "expected"),
+        [
+            ("approval", "MINT-APPROVAL-EXPIRED"),
+            ("allowlist", "MINT-ALLOWLIST-EXPIRED"),
+            ("consent", "MINT-CONSENT-EXPIRED"),
+            ("call_approval", "MINT-CALL-APPROVAL-REQUIRED"),
+        ],
+    )
+    def test_at_the_end_instant_the_basis_has_already_expired(self, tmp_path, kind, expected):
+        snap, evaluate = window_case(kind, end=NOW)
+        assert code(decide(harness(tmp_path, snap, evaluate=evaluate))) == expected
+
+    @pytest.mark.parametrize("kind", ["approval", "allowlist", "consent", "call_approval"])
+    def test_one_tick_before_the_end_instant_the_basis_is_valid(self, tmp_path, kind):
+        snap, evaluate = window_case(kind, end=NOW + ONE_TICK)
+        assert decide(harness(tmp_path, snap, evaluate=evaluate)).allowed
+
+    @pytest.mark.parametrize("kind", ["approval", "allowlist", "consent"])
+    def test_at_the_start_instant_the_basis_is_valid(self, tmp_path, kind):
+        snap, evaluate = window_case(kind, start=NOW, end=NOW + timedelta(days=1))
+        assert decide(harness(tmp_path, snap, evaluate=evaluate)).allowed
+
+    @pytest.mark.parametrize("kind", ["approval", "allowlist", "consent"])
+    def test_one_tick_before_the_start_instant_the_basis_is_not_valid_yet(self, tmp_path, kind):
+        snap, evaluate = window_case(kind, start=NOW + ONE_TICK, end=NOW + timedelta(days=1))
+        assert not decide(harness(tmp_path, snap, evaluate=evaluate)).allowed
+
+    def test_the_expiry_in_the_policy_input_counts_whole_days_left_of_a_valid_approval(
+        self, tmp_path
+    ):
+        calls: list = []
+        snap, _ = window_case("approval", end=NOW)
+        decide(harness(tmp_path, snap, evaluate=evaluator(calls=calls)))
+        assert calls == []
+        snap, _ = window_case("approval", end=NOW + ONE_TICK)
+        decide(harness(tmp_path, snap, evaluate=evaluator(calls=calls)))
+        assert calls[0]["approval"]["expires_in_days"] == 0
+        snap, _ = window_case("approval", end=NOW + timedelta(days=2, seconds=1))
+        decide(harness(tmp_path, snap, evaluate=evaluator(calls=calls)))
+        assert calls[1]["approval"]["expires_in_days"] == 2
 
 
 class TestRecording:
