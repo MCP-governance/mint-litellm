@@ -25,7 +25,7 @@ from typing import Any
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.compat.litellm_1_106 import RegistryEntry
 from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer, SystemEventKeys
-from mint_litellm.plugin.config import PluginConfig
+from mint_litellm.plugin.config import PluginConfig, configure_logging
 from mint_litellm.plugin.discovery import DiscoveryResult, evaluate_listed_tool
 from mint_litellm.plugin.pipeline import (
     Outcome,
@@ -229,13 +229,25 @@ def contract_mismatches(
     return found
 
 
+EXIT_CODE = 3
+EXIT_CODE_FILE_ENV = "MINT_EXIT_CODE_FILE"
+
+
 def terminate_process() -> None:
-    """프록시를 멈춘다. 워커이면 감독 프로세스에도 종료를 알려 컨테이너 재시작 정책이 받게 한다."""
+    """프록시를 멈춘다. 워커이면 감독 프로세스에도 종료를 알려 컨테이너 재시작 정책이 받게 한다.
+
+    uvicorn의 다중 워커 감독 프로세스는 워커가 몇 번으로 끝났든 0으로 끝난다. 진입점이 종료 코드를
+    바꿀 수 있도록 ``MINT_EXIT_CODE_FILE``이 있으면 그 파일에 표식을 남긴다.
+    """
+    path = os.environ.get(EXIT_CODE_FILE_ENV)
+    if path:
+        with contextlib.suppress(OSError), open(path, "w", encoding="utf-8") as marker:
+            marker.write(str(EXIT_CODE))
     parent = os.getppid()
     if multiprocessing.parent_process() is not None or parent > 1:
         with contextlib.suppress(OSError):
             os.kill(parent, signal.SIGTERM)
-    os._exit(3)
+    os._exit(EXIT_CODE)
 
 
 async def wait_for_readiness(url: str, timeout: float) -> bool:
@@ -523,6 +535,7 @@ def get_runtime(env: Mapping[str, str] | None = None) -> PluginRuntime:
     global _runtime
     if _runtime is None:
         config = PluginConfig.from_env(os.environ if env is None else env)
+        configure_logging(config.log_level)
         database = PluginDatabase(
             config.database_url,
             max_size=config.db_pool_size,

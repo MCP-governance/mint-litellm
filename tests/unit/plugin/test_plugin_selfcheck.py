@@ -17,6 +17,7 @@ from mint_litellm.plugin.selfcheck import (
     collect_view,
     contract_mismatches,
     guardrail_definition_check,
+    terminate_process,
     worker_id,
 )
 from mint_litellm.plugin.snapshot import RegisteredServer
@@ -794,3 +795,39 @@ def test_without_readiness_a_non_required_runtime_stays_blocked_and_recovers(tmp
     asyncio.run(scenario())
     assert stopped == [] and runtime.verified
     assert store.of_kind("enforcement_unverified")[0].payload["error"] == "readiness_timeout"
+
+
+class TestTerminateProcess:
+    @staticmethod
+    def stubbed(monkeypatch):
+        import os
+
+        calls = {"killed": [], "exited": []}
+        monkeypatch.setattr(os, "kill", lambda pid, sig: calls["killed"].append((pid, sig)))
+        monkeypatch.setattr(os, "_exit", lambda code: calls["exited"].append(code))
+        monkeypatch.setattr(os, "getppid", lambda: 4242)
+        return calls
+
+    def test_it_leaves_the_exit_marker_tells_the_parent_and_exits_with_3(
+        self, tmp_path, monkeypatch
+    ):
+        import signal
+
+        marker = tmp_path / "exit-code"
+        monkeypatch.setenv("MINT_EXIT_CODE_FILE", str(marker))
+        calls = self.stubbed(monkeypatch)
+        terminate_process()
+        assert marker.read_text(encoding="utf-8") == "3"
+        assert calls == {"killed": [(4242, signal.SIGTERM)], "exited": [3]}
+
+    def test_without_a_marker_file_setting_it_only_exits(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MINT_EXIT_CODE_FILE", raising=False)
+        calls = self.stubbed(monkeypatch)
+        terminate_process()
+        assert calls["exited"] == [3] and list(tmp_path.iterdir()) == []
+
+    def test_an_unwritable_marker_does_not_stop_the_exit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MINT_EXIT_CODE_FILE", str(tmp_path / "missing" / "dir" / "code"))
+        calls = self.stubbed(monkeypatch)
+        terminate_process()
+        assert calls["exited"] == [3] and len(calls["killed"]) == 1
