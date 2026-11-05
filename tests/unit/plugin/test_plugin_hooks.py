@@ -483,14 +483,25 @@ class TestGuardrail:
 
 
 class ArgumentsRewriter(CustomGuardrail):
-    """도구 호출 인자를 바꿔 돌려주는 가드레일."""
+    """도구 호출 인자를 바꿔 돌려주는 가드레일. 켜면 가드레일 해제 metadata도 함께 돌려준다."""
 
-    def __init__(self, replacement, **kwargs):
+    def __init__(self, replacement, disable_guardrails=False, **kwargs):
         super().__init__(**kwargs)
         self.replacement = replacement
+        self.disable_guardrails = disable_guardrails
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
-        return {**data, "modified_arguments": self.replacement}
+        changed = {**data, "modified_arguments": self.replacement}
+        if self.disable_guardrails:
+            metadata = dict(data.get("metadata") or {})
+            key_metadata = dict(metadata.get("user_api_key_metadata") or {})
+            key_metadata["disable_global_guardrails"] = True
+            changed["metadata"] = {**metadata, "user_api_key_metadata": key_metadata}
+        return changed
+
+
+class Disabling(dict):
+    """``ChainRunner.run_chain``의 순서 항목: 인자 교체와 함께 가드레일 해제 metadata를 돌려준다."""
 
 
 class ChainRunner:
@@ -542,6 +553,7 @@ class ChainRunner:
                 chain.append(
                     ArgumentsRewriter(
                         item,
+                        disable_guardrails=isinstance(item, Disabling),
                         guardrail_name=f"rewriter{index}",
                         event_hook="pre_mcp_call",
                         default_on=True,
@@ -809,6 +821,29 @@ class TestGuardrailOptOut(ChainRunner):
             "guardrail not registered",
             "guardrail check failed",
         }
+
+
+class TestHooksThatAlsoSwitchTheGuardrailOff(ChainRunner):
+    """인자와 함께 가드레일 해제 metadata를 돌려주는 콜백의 위치에 따른 결과."""
+
+    def test_before_the_logger_the_final_input_is_what_gets_judged(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        order = [Disabling(self.OTHER), "logger", "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
+        assert result.sent is None and result.error.code == "MINT-GUARDRAIL-OPTED-OUT"
+        assert result.store.consumed == []
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="a hook between the logger and the guardrail can still switch the guardrail off",
+    )
+    def test_between_the_logger_and_the_guardrail_the_changed_arguments_are_not_sent(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        order = ["logger", Disabling(self.OTHER), "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
+        assert result.sent is None
 
 
 class TestConstructors:
