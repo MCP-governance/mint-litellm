@@ -1,5 +1,6 @@
 import asyncio
 import io
+import os
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -128,6 +129,10 @@ def run_checks(
         controlled=[registered()] if controlled == "default" else controlled,
         allowed_pre_hooks=allowed,
     )
+
+
+def event_kinds(store):
+    return sorted(e.kind.value for e in store.events.values())
 
 
 def failed(results):
@@ -432,7 +437,7 @@ def test_a_runtime_is_unverified_until_every_item_passes(tmp_path):
 def test_a_passing_startup_verifies_without_stopping(tmp_path):
     runtime, store, stopped, _ = make_runtime(tmp_path)
     asyncio.run(runtime._startup())
-    assert runtime.verified and stopped == [] and store.events == {}
+    assert runtime.verified and stopped == [] and event_kinds(store) == ["enforcement_verified"]
 
 
 def test_a_failing_startup_records_the_failure_and_stops_the_process(tmp_path):
@@ -458,7 +463,7 @@ def test_a_failure_that_resolves_within_the_grace_period_does_not_stop(tmp_path)
         await task
 
     asyncio.run(scenario())
-    assert runtime.verified and stopped == [] and store.events == {}
+    assert runtime.verified and stopped == [] and event_kinds(store) == ["enforcement_verified"]
 
 
 def test_a_non_required_runtime_stays_blocked_and_recovers_later(tmp_path):
@@ -697,6 +702,89 @@ def test_a_mismatch_is_also_recorded_when_another_item_stops_the_startup(tmp_pat
     assert len(store.of_kind("enforcement_unverified")) == 1
 
 
+class TestVerifiedEvent:
+    def test_every_worker_that_passes_records_one_event_of_its_own(self, tmp_path):
+        store = FakeStore()
+        for index in range(2):
+            runtime, _, _, _ = make_runtime(tmp_path / str(index), store=store)
+            asyncio.run(runtime._startup())
+        events = store.of_kind("enforcement_verified")
+        assert len(events) == 2 and len({e.source_key for e in events}) == 2
+        for event in events:
+            assert event.source_key.startswith("selfcheck:")
+            assert event.source_key.endswith(":1:enforcement_verified")
+            assert event.payload["worker_id"] == str(os.getpid())
+            assert [c["item"] for c in event.payload["checks"]] == list(range(1, 9))
+            assert all(c["ok"] for c in event.payload["checks"])
+            assert event.payload["checks"][2]["name"] == SelfCheckItem.GUARDRAIL_ORDER.name
+            assert event.payload["allowed_hooks_used"] == []
+
+    def test_the_allowed_hooks_in_use_are_named(self, tmp_path):
+        late = view(callbacks=[LOGGER, GUARDRAIL, hook("Rewriter"), hook(INTERNAL[0])])
+        runtime, store, _, _ = make_runtime(tmp_path, v=late)
+        runtime.config = replace(runtime.config, allowed_pre_hooks=frozenset({"Rewriter", "Idle"}))
+        asyncio.run(runtime._startup())
+        (event,) = store.of_kind("enforcement_verified")
+        assert event.payload["allowed_hooks_used"] == ["Rewriter"]
+
+    def test_a_failed_startup_records_no_verification(self, tmp_path):
+        runtime, store, _, _ = make_runtime(tmp_path, v=view(callbacks=[GUARDRAIL]))
+        asyncio.run(runtime._startup())
+        assert store.of_kind("enforcement_verified") == []
+
+    def test_the_restored_configuration_is_verified_once_on_the_next_decision(self, tmp_path):
+        runtime, store, stopped, state = make_runtime(tmp_path)
+        asyncio.run(runtime._startup())
+        state["view"] = view(callbacks=[LOGGER, GUARDRAIL, hook("Late")])
+        asyncio.run(runtime.refresh_order())
+        assert len(store.of_kind("enforcement_unverified")) == 1
+        assert len(store.of_kind("enforcement_verified")) == 1
+        state["view"] = view(callbacks=[LOGGER, GUARDRAIL])
+        for _ in range(3):
+            asyncio.run(runtime.refresh_order())
+        assert runtime.deps.verified() is True
+        first, second = sorted(store.of_kind("enforcement_verified"), key=lambda e: e.inserted_at)
+        assert first.source_key.split(":")[1] != second.source_key.split(":")[1]
+        assert event_kinds(store) == [
+            "enforcement_unverified",
+            "enforcement_verified",
+            "enforcement_verified",
+        ]
+
+    def test_an_order_that_recovers_before_the_first_pass_is_not_a_verification(self, tmp_path):
+        runtime, store, _, state = make_runtime(
+            tmp_path, v=view(callbacks=[LOGGER, GUARDRAIL, hook("Late")])
+        )
+        assert asyncio.run(runtime.verify()) is False
+        state["view"] = view(callbacks=[LOGGER, GUARDRAIL])
+        asyncio.run(runtime.refresh_order())
+        assert runtime.order_ok is True and store.events == {}
+
+    def test_a_copy_that_went_through_the_buffer_converges_into_one_row(self, tmp_path):
+        class CommitsThenFails(FakeStore):
+            armed = True
+
+            async def insert_event(self, event, consume=None):
+                inserted = await super().insert_event(event, consume)
+                if self.armed and event.kind.value == "enforcement_verified":
+                    self.armed = False
+                    raise ConnectionResetError("response lost")
+                return inserted
+
+        store = CommitsThenFails()
+        runtime, _, _, _ = make_runtime(tmp_path, store=store)
+
+        async def scenario():
+            await runtime._startup()
+            runtime.recorder._buffer.close()
+            await runtime.recorder.replay()
+
+        asyncio.run(scenario())
+        assert len(store.of_kind("enforcement_verified")) == 1
+        (report,) = store.of_kind("buffer_replayed")
+        assert report.payload["duplicates"] == 1 and report.payload["replayed"] == 0
+
+
 def test_a_hook_after_the_guardrail_that_is_not_allowed_stops_the_startup(tmp_path):
     late = view(callbacks=[LOGGER, GUARDRAIL, hook("Rewriter")])
     runtime, store, stopped, _ = make_runtime(tmp_path, v=late)
@@ -712,7 +800,7 @@ def test_the_same_hook_in_the_allowed_list_starts(tmp_path):
     runtime, store, stopped, _ = make_runtime(tmp_path, v=late)
     runtime.config = replace(runtime.config, allowed_pre_hooks=frozenset({"Rewriter"}))
     asyncio.run(runtime._startup())
-    assert runtime.verified and stopped == [] and store.events == {}
+    assert runtime.verified and stopped == [] and event_kinds(store) == ["enforcement_verified"]
 
 
 def test_a_default_setup_with_only_the_internal_hooks_starts(tmp_path):
@@ -721,7 +809,7 @@ def test_a_default_setup_with_only_the_internal_hooks_starts(tmp_path):
         tmp_path, v=view(callbacks=[LOGGER, GUARDRAIL, *internal])
     )
     asyncio.run(runtime._startup())
-    assert runtime.verified and stopped == [] and store.events == {}
+    assert runtime.verified and stopped == [] and event_kinds(store) == ["enforcement_verified"]
 
 
 class TestCallbacksChangedAfterStartup:
@@ -819,7 +907,7 @@ def test_a_check_that_finishes_after_the_limit_is_not_a_pass(tmp_path):
 def test_readiness_that_uses_most_of_the_limit_still_leaves_time_for_the_checks(tmp_path):
     runtime, store, stopped, _ = make_runtime(tmp_path, grace=0.5, ready_delay=0.2)
     asyncio.run(runtime._startup())
-    assert runtime.verified and stopped == [] and store.events == {}
+    assert runtime.verified and stopped == [] and event_kinds(store) == ["enforcement_verified"]
 
 
 def test_without_readiness_a_non_required_runtime_stays_blocked_and_recovers(tmp_path):

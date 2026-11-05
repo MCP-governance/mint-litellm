@@ -145,6 +145,22 @@ def order_check(
     return OrderCheck(True)
 
 
+def allowed_hooks_used(
+    callbacks: Sequence[Any],
+    is_pre_hook: Callable[[Any], bool],
+    *,
+    guardrail: Any,
+    allowed: frozenset[str],
+) -> list[str]:
+    """운영자가 허용 목록에 올려 가드레일 뒤에 실제로 놓인 사전 훅의 클래스 이름."""
+    items = list(callbacks)
+    position = next((i for i, cb in enumerate(items) if cb is guardrail), None)
+    if position is None:
+        return []
+    names = (compat.class_name(cb) for cb in items[position + 1 :] if is_pre_hook(cb))
+    return sorted({name for name in names if name in allowed})
+
+
 def check_items(
     view: LiteLLMView,
     *,
@@ -311,6 +327,7 @@ class PluginRuntime:
     order_snapshot: tuple[int, tuple[int, ...]] | None = None
     order_ok: bool = True
     order_offenders: tuple[str, ...] = ()
+    hooks_used: list[str] = field(default_factory=list)
     keys: SystemEventKeys = field(default_factory=SystemEventKeys, repr=False)
     _reported: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -389,8 +406,41 @@ class PluginRuntime:
         was_ok = self.order_ok
         self.order_snapshot = callbacks_snapshot(view.callbacks)
         self.order_ok, self.order_offenders = order.ok, order.offenders
+        self.hooks_used = allowed_hooks_used(
+            view.callbacks,
+            view.is_pre_hook,
+            guardrail=self.guardrail,
+            allowed=self.config.allowed_pre_hooks,
+        )
         if was_ok and not order.ok:
             await self._report_order_failure(order.offenders)
+        elif order.ok and not was_ok and self.verified:
+            self.last_results = [
+                CheckResult(r.item, True) if r.item is SelfCheckItem.GUARDRAIL_ORDER else r
+                for r in self.last_results
+            ]
+            await self._report_verified(SystemEventKeys())
+
+    async def _report_verified(self, keys: SystemEventKeys | None = None) -> None:
+        """이 워커가 호출을 받을 수 있게 된 때 한 번 남긴다. 호출마다 남기지 않는다."""
+        kind = EventKind.ENFORCEMENT_VERIFIED
+        keys = keys if keys is not None else self.keys
+        await self.recorder.record(
+            Event(
+                instance_id=self.config.instance_id,
+                inserted_at=datetime.now(UTC),
+                kind=kind,
+                source_key=keys.next(kind),
+                payload={
+                    "worker_id": str(os.getpid()),
+                    "checks": [
+                        {"item": int(r.item), "name": r.item.name, "ok": r.ok}
+                        for r in self.last_results
+                    ],
+                    "allowed_hooks_used": list(self.hooks_used),
+                },
+            )
+        )
 
     async def _report_order_failure(self, offenders: tuple[str, ...]) -> None:
         log.error("MINT 사전 훅 순서가 어긋났다: %s", ", ".join(offenders[:5]) or "-")
@@ -431,6 +481,12 @@ class PluginRuntime:
         )
         self.order_ok, self.order_offenders = order.ok, order.offenders
         self.order_snapshot = callbacks_snapshot(view.callbacks)
+        self.hooks_used = allowed_hooks_used(
+            view.callbacks,
+            view.is_pre_hook,
+            guardrail=self.guardrail,
+            allowed=self.config.allowed_pre_hooks,
+        )
         self.last_results = results
         self.last_mismatches = contract_mismatches(view, controlled or [])
         return results
@@ -476,6 +532,7 @@ class PluginRuntime:
                 if self.verified and loop.time() < deadline:
                     log.info("MINT 자가 점검 통과")
                     await self._report_mismatches()
+                    await self._report_verified()
                     return
                 # 시간 제한이 지난 뒤에 끝난 점검은 통과로 치지 않는다.
                 self.verified = False
@@ -488,6 +545,7 @@ class PluginRuntime:
                 return
             while not await self.verify():
                 await asyncio.sleep(self.recheck_seconds)
+            await self._report_verified()
         except Exception as exc:
             log.error("자가 점검 실행 오류: %s", type(exc).__name__)
             await self._fail(error=type(exc).__name__)

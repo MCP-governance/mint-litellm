@@ -1010,6 +1010,29 @@ class TestCallbacksAddedAfterStartup(ChainRunner):
         assert event.payload == {"cause": "callbacks_changed", "hooks": ["ArgumentsRewriter"]}
 
 
+class TestOrderRestoredAfterStartup(ChainRunner):
+    def test_removing_the_late_guardrail_makes_the_next_call_pass_and_records_it_once(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        import litellm
+
+        from mint_litellm.plugin.selfcheck import callbacks_snapshot
+
+        rig = self.build_rig(tmp_path, monkeypatch, contract_snapshot)
+        rig.runtime.order_snapshot = callbacks_snapshot(litellm.callbacks)
+        late = self.rewriter(self.OTHER, 9)
+        litellm.callbacks.append(late)
+        assert self.call(rig).error.code == "MINT-ENFORCEMENT-UNVERIFIED"
+        litellm.callbacks.remove(late)
+        for _ in range(3):
+            result = self.call(rig)
+            assert result.error is None and result.sent == self.SENT
+        assert len(rig.store.of_kind("enforcement_unverified")) == 1
+        (event,) = rig.store.of_kind("enforcement_verified")
+        assert event.payload["allowed_hooks_used"] == []
+        assert event.payload["worker_id"].isdigit()
+
+
 class TestConstructors:
     def test_a_missing_configuration_raises_runtime_error_only(self, monkeypatch):
         for name in ("MINT_INSTANCE_ID", "MINT_DATABASE_URL"):
