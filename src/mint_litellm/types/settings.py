@@ -116,6 +116,16 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         ),
     ),
     MintSettingRow(
+        key="MINT_ALLOWED_PRE_HOOKS",
+        source=SettingSource.ENV,
+        rule=(
+            "MINT 가드레일 뒤에 둘 수 있는 사전 훅의 클래스 이름(쉼표로 구분, 기본은 비어 있음). "
+            "LiteLLM 내부 훅은 항상 허용한다. 이 밖의 사전 훅이 뒤에 있으면 자가 점검 3번이 "
+            "실패해 기동을 중단한다. 목록에 올린 훅이 MINT 대조 뒤에 인자를 바꾸지 않는 것은 "
+            "운영자의 책임이다."
+        ),
+    ),
+    MintSettingRow(
         key="MINT_FINGERPRINT_KEY_VERSION",
         source=SettingSource.ENV,
         rule=(
@@ -138,9 +148,11 @@ class SelfCheckItem(IntEnum):
 
 
 SELF_CHECK_DESCRIPTIONS: dict[SelfCheckItem, str] = {
-    SelfCheckItem.CALLBACK_REGISTERED: "MINT 로거가 LiteLLM 콜백에 등록되어 있다.",
+    SelfCheckItem.CALLBACK_REGISTERED: "MINT 로거가 정확히 하나 등록되어 있다.",
     SelfCheckItem.GUARDRAIL_MODES: "MINT 가드레일이 두 모드로 등록되어 있고 `default_on`이다.",
-    SelfCheckItem.GUARDRAIL_ORDER: "MINT 가드레일이 사전 훅 순서의 마지막이다.",
+    SelfCheckItem.GUARDRAIL_ORDER: (
+        "MINT 로거가 MINT 가드레일 바로 앞에 있고, 가드레일 뒤에는 허용된 사전 훅만 있다."
+    ),
     SelfCheckItem.KEY_ACCESS_STRICT: (
         "통제 서버가 `allow_all_keys: false`이고 `require_key_mcp_access_defined`가 true이다."
     ),
@@ -189,18 +201,21 @@ SETTINGS_TABLE: tuple[SettingRow, ...] = (
     SettingRow(
         key="guardrails[MINT]",
         location=SettingLocation.GUARDRAILS,
-        value="mode: [pre_mcp_call, post_mcp_call], default_on: true, 사전 훅 순서 마지막",
+        value="mode: [pre_mcp_call, post_mcp_call], default_on: true, 뒤에는 허용된 사전 훅만",
         grade=SettingGrade.REQUIRED,
         self_checks=(SelfCheckItem.GUARDRAIL_MODES, SelfCheckItem.GUARDRAIL_ORDER),
-        reason="가드레일이 없거나 순서가 뒤바뀌면 목록 필터와 인자 변경 보장이 사라진다.",
+        reason="가드레일이 없거나 뒤에 다른 사전 훅이 있으면 목록 필터와 인자 대조가 사라진다.",
     ),
     SettingRow(
         key="callbacks",
         location=SettingLocation.LITELLM_SETTINGS,
-        value="MINT 로거 등록",
+        value="MINT 로거를 적지 않는다(MINT 가드레일이 등록)",
         grade=SettingGrade.REQUIRED,
         self_checks=(SelfCheckItem.CALLBACK_REGISTERED,),
-        reason="도구 호출 판정은 로거의 사전 훅이 수행한다. 키·팀 설정으로 끌 수 없는 지점이다.",
+        reason=(
+            "도구 호출 판정은 로거의 사전 훅이 수행하며 로거는 MINT 가드레일이 등록한다. "
+            "설정에 따로 적으면 두 번 등록되므로 기동을 거부한다."
+        ),
     ),
     SettingRow(
         key="mcp_servers.<이름>.allow_all_keys",

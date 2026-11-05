@@ -18,7 +18,7 @@ from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.types.guardrails import GuardrailEventHooks
 
 from mint_litellm.compat import litellm_1_106 as compat
-from mint_litellm.plugin.logger import internal_block
+from mint_litellm.plugin.logger import MintLogger, internal_block
 from mint_litellm.plugin.pipeline import arguments_digest
 from mint_litellm.plugin.result import record_consumed_without_dispatch
 from mint_litellm.plugin.selfcheck import PluginRuntime, get_runtime
@@ -35,11 +35,34 @@ class MintGuardrail(CustomGuardrail):
             super().__init__(**kwargs)
             self._runtime = runtime if runtime is not None else get_runtime()
             self._runtime.guardrail = self
+            self._register_logger()
             self._runtime.ensure_started()
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(f"MintGuardrail could not start: {type(exc).__name__}") from exc
+
+    def _register_logger(self) -> None:
+        """MINT 로거를 이 가드레일 바로 앞에 올린다.
+
+        LiteLLM은 이 생성자가 끝난 직후 가드레일을 목록 끝에 붙이므로 로거가 그 바로 앞에 놓인다.
+        설정의 ``callbacks``에 로거가 따로 적혀 있으면 두 곳에 등록되므로 기동을 거부한다.
+        """
+        for existing in compat.litellm_callbacks():
+            if not isinstance(existing, MintLogger):
+                continue
+            if not existing.registered_by_guardrail:
+                raise RuntimeError(
+                    "the MINT logger must not be listed in litellm_settings.callbacks; "
+                    "the MINT guardrail registers it"
+                )
+            # 가드레일을 다시 만드는 경우: 이전 등록을 지우고 새 가드레일 앞에 다시 올린다.
+            compat.unregister_callback(existing)
+        logger = self._runtime.logger
+        if not isinstance(logger, MintLogger):
+            logger = MintLogger(runtime=self._runtime)
+        logger.registered_by_guardrail = True
+        compat.register_callback(logger)
 
     def get_supported_event_hooks(self):
         return [GuardrailEventHooks.pre_mcp_call, GuardrailEventHooks.post_mcp_call]

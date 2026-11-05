@@ -67,6 +67,7 @@ class LiteLLMView:
     user_url_validation: bool
     registry: Sequence[RegistryEntry]
     missing_symbols: Sequence[str]
+    is_pre_hook: Callable[[Any], bool] = compat.is_pre_call_hook
 
 
 def collect_view(env: Mapping[str, str] | None = None) -> LiteLLMView:
@@ -93,13 +94,55 @@ def _hook_names(event_hook: Any) -> set[str]:
     return {str(getattr(i, "value", i)) for i in items}
 
 
-def _is_guardrail(callback: Any) -> bool:
-    return hasattr(callback, "guardrail_name") and hasattr(callback, "event_hook")
+@dataclass(frozen=True)
+class OrderCheck:
+    """MINT 로거가 가드레일 바로 앞이고 가드레일 뒤에 허용된 사전 훅만 있는지."""
+
+    ok: bool
+    offenders: tuple[str, ...] = ()
+    detail: str = ""
 
 
-def _runs_before_tool_call(callback: Any) -> bool:
-    event_hook = getattr(callback, "event_hook", None)
-    return event_hook is None or "pre_mcp_call" in _hook_names(event_hook)
+def order_check(
+    callbacks: Sequence[Any],
+    is_pre_hook: Callable[[Any], bool],
+    *,
+    logger: Any,
+    guardrail: Any,
+    allowed: frozenset[str] = frozenset(),
+) -> OrderCheck:
+    """``litellm.callbacks``의 실행 순서로 확인한다. 어긋난 훅은 클래스 이름으로 돌려준다."""
+    items = list(callbacks)
+    positions = {id(cb): i for i, cb in enumerate(items)}
+    l_pos = positions.get(id(logger)) if logger is not None else None
+    g_pos = positions.get(id(guardrail)) if guardrail is not None else None
+    if l_pos is None or g_pos is None:
+        return OrderCheck(False, (), "the MINT logger and guardrail must both be registered")
+    if getattr(guardrail, "run_in_parallel", False) is not False:
+        return OrderCheck(
+            False, (compat.class_name(guardrail),), "the MINT guardrail must not run in parallel"
+        )
+    if g_pos != l_pos + 1:
+        between = items[l_pos + 1 : g_pos] if l_pos < g_pos else [logger, guardrail]
+        names = tuple(dict.fromkeys(compat.class_name(cb) for cb in between))
+        return OrderCheck(
+            False, names, "the MINT logger must sit directly before the MINT guardrail"
+        )
+    permitted = compat.LITELLM_INTERNAL_PRE_HOOKS | allowed
+    names = tuple(
+        dict.fromkeys(
+            compat.class_name(cb)
+            for cb in items[g_pos + 1 :]
+            if is_pre_hook(cb) and compat.class_name(cb) not in permitted
+        )
+    )
+    if names:
+        return OrderCheck(
+            False,
+            names,
+            "pre-call hooks after the MINT guardrail are not allowed: " + ", ".join(names[:5]),
+        )
+    return OrderCheck(True)
 
 
 def check_items(
@@ -109,6 +152,7 @@ def check_items(
     guardrail: Any,
     controlled: Sequence[RegisteredServer] | None,
     fingerprint_key_set: bool = True,
+    allowed_pre_hooks: frozenset[str] = frozenset(),
 ) -> list[CheckResult]:
     """8개 항목을 확인한다. ``controlled``가 ``None``이면 MINT DB를 읽지 못한 것이다."""
     results: list[CheckResult] = []
@@ -119,10 +163,11 @@ def check_items(
     callbacks = list(view.callbacks)
     positions = {id(cb): i for i, cb in enumerate(callbacks)}
 
+    same_kind = [cb for cb in callbacks if logger is not None and type(cb) is type(logger)]
     add(
         SelfCheckItem.CALLBACK_REGISTERED,
-        logger is not None and id(logger) in positions,
-        "logger is not registered in litellm_settings.callbacks",
+        logger is not None and len(same_kind) == 1 and same_kind[0] is logger,
+        "the MINT logger must be registered exactly once, by the MINT guardrail",
     )
 
     modes = _hook_names(getattr(guardrail, "event_hook", None)) if guardrail else set()
@@ -135,26 +180,14 @@ def check_items(
         "guardrail is missing, lacks a mode, or is not default_on",
     )
 
-    order_ok = False
-    if guardrail is not None and logger is not None:
-        g_pos, l_pos = positions.get(id(guardrail)), positions.get(id(logger))
-        later = [
-            cb
-            for i, cb in enumerate(callbacks)
-            if g_pos is not None and i > g_pos and _is_guardrail(cb) and _runs_before_tool_call(cb)
-        ]
-        order_ok = (
-            g_pos is not None
-            and l_pos is not None
-            and l_pos < g_pos
-            and not later
-            and getattr(guardrail, "run_in_parallel", False) is False
-        )
-    add(
-        SelfCheckItem.GUARDRAIL_ORDER,
-        order_ok,
-        "MINT guardrail must follow the logger and be the last pre-call guardrail",
+    order = order_check(
+        callbacks,
+        view.is_pre_hook,
+        logger=logger,
+        guardrail=guardrail,
+        allowed=allowed_pre_hooks,
     )
+    add(SelfCheckItem.GUARDRAIL_ORDER, order.ok, order.detail)
 
     by_id = {entry.server_id: entry for entry in view.registry}
     if controlled is None:
@@ -274,6 +307,10 @@ class PluginRuntime:
     guardrail: Any = None
     last_results: list[CheckResult] = field(default_factory=list)
     last_mismatches: list[tuple[str, str]] = field(default_factory=list)
+    callbacks_reader: Callable[[], Sequence[Any]] = compat.litellm_callbacks
+    order_snapshot: tuple[int, tuple[int, ...]] | None = None
+    order_ok: bool = True
+    order_offenders: tuple[str, ...] = ()
     keys: SystemEventKeys = field(default_factory=SystemEventKeys, repr=False)
     _reported: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -285,7 +322,7 @@ class PluginRuntime:
             snapshots=self.database,
             recorder=self.recorder,
             evaluate=self.evaluate,
-            verified=lambda: self.verified,
+            verified=lambda: self.verified and self.order_ok,
         )
 
     @property
@@ -301,6 +338,7 @@ class PluginRuntime:
         stop: StageResult | None = None,
         attempt: tuple[UUID, int] | None = None,
     ):
+        await self.refresh_order()
         deps = self.deps if not unverified else _unverified(self.deps)
         request = build_request(
             data,
@@ -319,6 +357,7 @@ class PluginRuntime:
         return outcome
 
     async def judge_listed_tool(self, data: Mapping[str, Any], auth: Any) -> DiscoveryResult:
+        await self.refresh_order()
         return await evaluate_listed_tool(
             data,
             auth,
@@ -326,6 +365,44 @@ class PluginRuntime:
             hook_parser=compat.parse_hook_data,
             resolver=compat.resolve_listed_server,
             principal_factory=compat.principal_from_auth,
+        )
+
+    async def refresh_order(self) -> None:
+        """시작 뒤 콜백 목록이 바뀌었으면 ③을 다시 확인한다. 어긋나면 이후 호출을 막는다.
+
+        목록의 길이와 객체 식별자가 점검 때와 같으면 다시 보지 않는다. 통과로 바뀐 것은 사건 없이
+        `status`로만 보이고, 실패로 바뀐 때에만 시스템 사건을 한 번 남긴다.
+        """
+        if self.order_snapshot is None:
+            return
+        current = callbacks_snapshot(self.callbacks_reader())
+        if current == self.order_snapshot:
+            return
+        view = self.view_collector()
+        order = order_check(
+            view.callbacks,
+            view.is_pre_hook,
+            logger=self.logger,
+            guardrail=self.guardrail,
+            allowed=self.config.allowed_pre_hooks,
+        )
+        was_ok = self.order_ok
+        self.order_snapshot = callbacks_snapshot(view.callbacks)
+        self.order_ok, self.order_offenders = order.ok, order.offenders
+        if was_ok and not order.ok:
+            await self._report_order_failure(order.offenders)
+
+    async def _report_order_failure(self, offenders: tuple[str, ...]) -> None:
+        log.error("MINT 사전 훅 순서가 어긋났다: %s", ", ".join(offenders[:5]) or "-")
+        kind = EventKind.ENFORCEMENT_UNVERIFIED
+        await self.recorder.record(
+            Event(
+                instance_id=self.config.instance_id,
+                inserted_at=datetime.now(UTC),
+                kind=kind,
+                source_key=SystemEventKeys().next(kind),
+                payload={"cause": "callbacks_changed", "hooks": list(offenders)},
+            )
         )
 
     async def run_checks(self) -> list[CheckResult]:
@@ -343,7 +420,17 @@ class PluginRuntime:
             guardrail=self.guardrail,
             controlled=controlled,
             fingerprint_key_set=self.config.fingerprint_key is not None,
+            allowed_pre_hooks=self.config.allowed_pre_hooks,
         )
+        order = order_check(
+            view.callbacks,
+            view.is_pre_hook,
+            logger=self.logger,
+            guardrail=self.guardrail,
+            allowed=self.config.allowed_pre_hooks,
+        )
+        self.order_ok, self.order_offenders = order.ok, order.offenders
+        self.order_snapshot = callbacks_snapshot(view.callbacks)
         self.last_results = results
         self.last_mismatches = contract_mismatches(view, controlled or [])
         return results
@@ -450,6 +537,11 @@ class PluginRuntime:
             ", ".join(f"{SELF_CHECK_DESCRIPTIONS[r.item]}" for r in self.last_results if not r.ok)
             or (error or "unknown"),
         )
+
+
+def callbacks_snapshot(callbacks: Sequence[Any]) -> tuple[int, tuple[int, ...]]:
+    items = list(callbacks)
+    return len(items), tuple(id(cb) for cb in items)
 
 
 def _unverified(deps: PipelineDeps) -> PipelineDeps:

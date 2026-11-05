@@ -255,6 +255,65 @@ def litellm_callbacks() -> list[Any]:
     return list(litellm.callbacks)
 
 
+def register_callback(callback: Any) -> None:
+    """LiteLLM이 가드레일 등을 목록에 올릴 때 쓰는 공개 등록 방법. 중복은 올리지 않는다."""
+    import litellm
+
+    litellm.logging_callback_manager.add_litellm_callback(callback)
+
+
+def unregister_callback(callback: Any) -> None:
+    import litellm
+
+    litellm.callbacks[:] = [cb for cb in litellm.callbacks if cb is not callback]
+
+
+# LiteLLM 1.106.6이 시작 때 모든 설정 콜백과 가드레일 뒤에 붙이는 내부 사전 훅이다. 소스로 확인한
+# 바로는 MCP 도구 호출에서 인자도 가드레일 관련 metadata도 바꾸지 않는다. 판본을 올리면 다시 본다.
+LITELLM_INTERNAL_PRE_HOOKS: frozenset[str] = frozenset(
+    {
+        "_PROXY_MaxParallelRequestsHandler_v3",
+        "_PROXY_CacheControlCheck",
+        "ResponsesIDSecurity",
+        "SkillsInjectionHook",
+        "_PROXY_MaxIterationsHandler",
+        "_PROXY_MaxBudgetPerSessionHandler",
+        "_PROXY_SensitiveDataRoutingHandler",
+    }
+)
+
+
+def class_name(callback: Any) -> str:
+    return type(callback).__name__
+
+
+def is_pre_call_hook(callback: Any) -> bool:
+    """LiteLLM이 MCP 호출의 사전 훅 순회에서 이 콜백의 훅을 부를 수 있는지.
+
+    순회와 같은 기준이다. 가드레일은 병렬 실행이 아니고 ``pre_mcp_call``에서 도는 것(판정이 어려우면
+    돈다고 본다), 그 밖의 로거는 말단 클래스가 ``async_pre_call_hook``을 재정의한 것이다.
+    """
+    try:
+        from litellm.integrations.custom_guardrail import CustomGuardrail
+        from litellm.integrations.custom_logger import CustomLogger
+    except ImportError:
+        return False
+    if not isinstance(callback, CustomLogger):
+        return False
+    if isinstance(callback, CustomGuardrail):
+        if getattr(callback, "run_in_parallel", False):
+            return False
+        event_hook = getattr(callback, "event_hook", None)
+        if event_hook is None or not isinstance(event_hook, (str, list, tuple, set, frozenset)):
+            return True
+        items = [event_hook] if isinstance(event_hook, str) else event_hook
+        return "pre_mcp_call" in {str(getattr(item, "value", item)) for item in items}
+    cls = type(callback)
+    return "async_pre_call_hook" in vars(cls) and (
+        cls.async_pre_call_hook != CustomLogger.async_pre_call_hook
+    )
+
+
 def general_settings() -> Mapping[str, Any]:
     # 시작 단계에서 모듈 전역이 다시 바인딩되므로 가져올 때마다 모듈에서 읽는다.
     return importlib.import_module("litellm.proxy.proxy_server").general_settings

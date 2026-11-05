@@ -23,6 +23,7 @@ def test_defaults():
     assert config.buffer_max_bytes == 50 * 1024 * 1024
     assert config.decision_budget_seconds == 0.3
     assert config.fingerprint_key is None and config.opa_url == "http://opa:8181"
+    assert config.allowed_pre_hooks == frozenset()
     assert config.selfcheck_grace_seconds == 120.0
 
 
@@ -40,6 +41,7 @@ def test_every_setting_can_be_given():
         "MINT_FINGERPRINT_KEY_VERSION": "3",
         "MINT_READINESS_URL": "http://localhost:4000/health/readiness",
         "MINT_SELFCHECK_GRACE_SECONDS": "30",
+        "MINT_ALLOWED_PRE_HOOKS": " Rewriter , _Other1,, ",
     }
     config = PluginConfig.from_env(env)
     assert config.mode_ceiling is Mode.OBSERVE and config.required is False
@@ -48,6 +50,7 @@ def test_every_setting_can_be_given():
     assert config.db_pool_size == 4 and config.decision_budget_seconds == 0.5
     assert config.fingerprint_key == bytes(range(32)) and config.fingerprint_key_version == 3
     assert config.opa_url == "http://opa:8181" and config.selfcheck_grace_seconds == 30.0
+    assert config.allowed_pre_hooks == {"Rewriter", "_Other1"}
 
 
 @pytest.mark.parametrize(
@@ -71,6 +74,8 @@ def test_every_setting_can_be_given():
         {"MINT_SELFCHECK_GRACE_SECONDS": "9"},
         {"MINT_SELFCHECK_GRACE_SECONDS": "601"},
         {"MINT_SELFCHECK_GRACE_SECONDS": "two minutes"},
+        {"MINT_ALLOWED_PRE_HOOKS": "Rewriter, not a name"},
+        {"MINT_ALLOWED_PRE_HOOKS": "pkg.module.Rewriter"},
     ],
 )
 def test_invalid_values_raise_runtime_error_only(override):

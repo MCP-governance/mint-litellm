@@ -40,6 +40,8 @@ def internal_block() -> HTTPException:
 
 
 class MintLogger(CustomLogger):
+    registered_by_guardrail = False
+
     def __init__(self, runtime: PluginRuntime | None = None, **kwargs: Any) -> None:
         # LiteLLM은 생성자가 RuntimeError 밖의 예외를 던지면 기동을 계속하므로 모두 바꾼다.
         try:

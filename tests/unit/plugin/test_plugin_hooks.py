@@ -45,6 +45,14 @@ RAW_KEY = "sk-" + "t" * 40
 URL = "https://mcp.example/api"
 
 
+@pytest.fixture(autouse=True)
+def isolated_callbacks(monkeypatch):
+    """가드레일을 만들면 로거가 전역 콜백 목록에 올라가므로 시험마다 비운다."""
+    import litellm
+
+    monkeypatch.setattr(litellm, "callbacks", [])
+
+
 @pytest.fixture
 def registry(monkeypatch):
     """전역 서버 관리자에 서버 하나와 도구 경로를 임시로 올린다."""
@@ -508,20 +516,33 @@ class ChainRunner:
     SENT = {"q": "x"}
     OTHER = {"q": "y"}
 
-    def run_chain(
+    @staticmethod
+    def rewriter(item, index):
+        return ArgumentsRewriter(
+            item,
+            disable_guardrails=isinstance(item, Disabling),
+            guardrail_name=f"rewriter{index}",
+            event_hook="pre_mcp_call",
+            default_on=True,
+        )
+
+    def build_rig(
         self,
         tmp_path,
         monkeypatch,
-        order,
         snap,
+        *,
+        order=None,
+        before=(),
+        after=(),
         evaluate="allow",
-        empty_arguments=False,
-        user=None,
         guardrail_instance="registered",
     ):
-        """``order``의 문자열은 MINT 로거·가드레일, 그 밖의 값은 인자를 그 값으로 바꾸는 가드레일.
+        """호출 사슬을 세운다.
 
-        도구 호출 데이터는 LiteLLM이 키 객체에서 직접 만든다.
+        ``order``가 있으면 그 순서 그대로이다(문자열은 MINT 로거·가드레일, 그 밖의 값은 인자를
+        바꾸는 가드레일). 없으면 LiteLLM이 하는 대로 ``before``의 콜백을 올린 뒤 가드레일을 만들어
+        로거를 등록시키고 가드레일을 목록 끝에 붙이고 ``after``의 콜백을 붙인다.
         """
         import litellm
         from litellm.caching.caching import DualCache
@@ -529,6 +550,9 @@ class ChainRunner:
 
         runtime, store, _ = build_runtime(tmp_path, snap, evaluate=evaluate)
         logger = make_logger(runtime)
+        monkeypatch.setattr(litellm, "callbacks", [])
+        if order is None:
+            litellm.callbacks.extend(self.rewriter(item, i) for i, item in enumerate(before))
         guardrail = MintGuardrail(
             runtime=runtime,
             guardrail_name="mint",
@@ -543,24 +567,29 @@ class ChainRunner:
                 raise RuntimeError("boom")
 
             guardrail.should_run_guardrail = explode
-        chain = []
-        for index, item in enumerate(order):
-            if item == "logger":
-                chain.append(logger)
-            elif item == "guardrail":
-                chain.append(guardrail)
-            else:
-                chain.append(
-                    ArgumentsRewriter(
-                        item,
-                        disable_guardrails=isinstance(item, Disabling),
-                        guardrail_name=f"rewriter{index}",
-                        event_hook="pre_mcp_call",
-                        default_on=True,
-                    )
-                )
-        monkeypatch.setattr(litellm, "callbacks", chain)
+        if order is None:
+            litellm.callbacks.append(guardrail)
+            litellm.callbacks.extend(
+                self.rewriter(item, 100 + i) if not isinstance(item, CustomLogger) else item
+                for i, item in enumerate(after)
+            )
+        else:
+            chain = []
+            for index, item in enumerate(order):
+                if item == "logger":
+                    chain.append(logger)
+                elif item == "guardrail":
+                    chain.append(guardrail)
+                else:
+                    chain.append(self.rewriter(item, index))
+            litellm.callbacks[:] = chain
         proxy = ProxyLogging(user_api_key_cache=DualCache())
+        return SimpleNamespace(
+            runtime=runtime, store=store, logger=logger, guardrail=guardrail, proxy=proxy
+        )
+
+    def call(self, rig, *, empty_arguments=False, user=None):
+        """사슬에 도구 호출 하나를 보낸다. 도구 호출 데이터는 LiteLLM이 키 객체에서 직접 만든다."""
         obj = logging_obj()
         start = {} if empty_arguments else dict(self.SENT)
         user = user if user is not None else auth()
@@ -573,11 +602,14 @@ class ChainRunner:
             "user_api_key_user_id": user.user_id,
             "user_api_key_team_id": user.team_id,
         }
+        proxy = rig.proxy
         data = proxy.convert_mcp_to_llm_format(
             proxy.create_mcp_request_object_from_kwargs(kwargs), kwargs
         )
         data["litellm_logging_obj"] = obj
-        result = SimpleNamespace(error=None, sent=None, obj=obj, store=store, logger=logger)
+        result = SimpleNamespace(
+            error=None, sent=None, obj=obj, store=rig.store, logger=rig.logger, runtime=rig.runtime
+        )
         try:
             data = run(
                 proxy.pre_call_hook(user_api_key_dict=user, data=data, call_type="call_mcp_tool")
@@ -588,6 +620,28 @@ class ChainRunner:
         converted = proxy.convert_mcp_hook_response_to_kwargs(data, {"arguments": start})
         result.sent = converted["arguments"]
         return result
+
+    def run_chain(
+        self,
+        tmp_path,
+        monkeypatch,
+        order,
+        snap,
+        evaluate="allow",
+        empty_arguments=False,
+        user=None,
+        guardrail_instance="registered",
+    ):
+        """``order``대로 세운 사슬에 호출 하나를 보낸다."""
+        rig = self.build_rig(
+            tmp_path,
+            monkeypatch,
+            snap,
+            order=order,
+            evaluate=evaluate,
+            guardrail_instance=guardrail_instance,
+        )
+        return self.call(rig, empty_arguments=empty_arguments, user=user)
 
 
 class TestCallbackChain(ChainRunner):
@@ -824,26 +878,136 @@ class TestGuardrailOptOut(ChainRunner):
 
 
 class TestHooksThatAlsoSwitchTheGuardrailOff(ChainRunner):
-    """인자와 함께 가드레일 해제 metadata를 돌려주는 콜백의 위치에 따른 결과."""
+    """인자와 함께 가드레일 해제 metadata를 돌려주는 콜백은 로거 앞에서만 설 수 있다."""
 
-    def test_before_the_logger_the_final_input_is_what_gets_judged(
+    def test_before_the_pair_the_final_input_is_what_gets_judged(
         self, tmp_path, monkeypatch, contract_snapshot
     ):
-        order = [Disabling(self.OTHER), "logger", "guardrail"]
-        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
+        rig = self.build_rig(
+            tmp_path, monkeypatch, contract_snapshot, before=[Disabling(self.OTHER)]
+        )
+        result = self.call(rig)
         assert result.sent is None and result.error.code == "MINT-GUARDRAIL-OPTED-OUT"
         assert result.store.consumed == []
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="a hook between the logger and the guardrail can still switch the guardrail off",
-    )
-    def test_between_the_logger_and_the_guardrail_the_changed_arguments_are_not_sent(
+    def test_the_registration_puts_the_logger_directly_before_the_guardrail(
         self, tmp_path, monkeypatch, contract_snapshot
     ):
-        order = ["logger", Disabling(self.OTHER), "guardrail"]
-        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
-        assert result.sent is None
+        import litellm
+
+        self.build_rig(tmp_path, monkeypatch, contract_snapshot, before=[Disabling(self.OTHER)])
+        names = [type(cb).__name__ for cb in litellm.callbacks]
+        assert names == ["ArgumentsRewriter", "MintLogger", "MintGuardrail"]
+
+    def test_a_hook_after_the_guardrail_cannot_pass_the_order_check(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        import litellm
+
+        from mint_litellm.compat import litellm_1_106 as compat
+        from mint_litellm.plugin.selfcheck import order_check
+
+        rig = self.build_rig(
+            tmp_path, monkeypatch, contract_snapshot, after=[Disabling(self.OTHER)]
+        )
+        check = order_check(
+            litellm.callbacks,
+            compat.is_pre_call_hook,
+            logger=rig.logger,
+            guardrail=rig.guardrail,
+        )
+        assert not check.ok and check.offenders == ("ArgumentsRewriter",)
+        allowed = order_check(
+            litellm.callbacks,
+            compat.is_pre_call_hook,
+            logger=rig.logger,
+            guardrail=rig.guardrail,
+            allowed=frozenset({"ArgumentsRewriter"}),
+        )
+        assert allowed.ok
+
+
+class TestLoggerRegistration:
+    def test_the_guardrail_registers_the_logger_right_before_itself(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        import litellm
+
+        rig = ChainRunner().build_rig(tmp_path, monkeypatch, contract_snapshot)
+        assert litellm.callbacks == [rig.logger, rig.guardrail]
+        assert rig.logger.registered_by_guardrail is True
+
+    def test_a_logger_listed_in_the_configuration_makes_the_startup_fail(
+        self, tmp_path, monkeypatch
+    ):
+        import litellm
+
+        runtime, _, _ = build_runtime(tmp_path)
+        monkeypatch.setattr(litellm, "callbacks", [MintLogger(runtime=runtime)])
+        with pytest.raises(RuntimeError, match="litellm_settings.callbacks"):
+            MintGuardrail(
+                runtime=runtime,
+                guardrail_name="mint",
+                event_hook=["pre_mcp_call", "post_mcp_call"],
+                default_on=True,
+            )
+
+    def test_creating_the_guardrail_again_keeps_one_logger_directly_before_it(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        import litellm
+
+        rig = ChainRunner().build_rig(tmp_path, monkeypatch, contract_snapshot)
+        litellm.callbacks.remove(rig.guardrail)
+        again = MintGuardrail(
+            runtime=rig.runtime,
+            guardrail_name="mint",
+            event_hook=["pre_mcp_call", "post_mcp_call"],
+            default_on=True,
+        )
+        litellm.callbacks.append(again)
+        assert litellm.callbacks == [rig.logger, again]
+
+    def test_the_default_configuration_with_only_the_internal_hooks_passes(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        import litellm
+
+        from mint_litellm.compat import litellm_1_106 as compat
+        from mint_litellm.plugin.selfcheck import order_check
+
+        rig = ChainRunner().build_rig(tmp_path, monkeypatch, contract_snapshot)
+        rig.proxy._init_litellm_callbacks(llm_router=None)  # 시작 때 LiteLLM이 내부 훅을 붙인다
+        hooks = {
+            type(cb).__name__
+            for cb in litellm.callbacks
+            if compat.is_pre_call_hook(cb) and cb not in (rig.logger, rig.guardrail)
+        }
+        assert hooks == compat.LITELLM_INTERNAL_PRE_HOOKS
+        check = order_check(
+            litellm.callbacks, compat.is_pre_call_hook, logger=rig.logger, guardrail=rig.guardrail
+        )
+        assert check.ok, check
+
+
+class TestCallbacksAddedAfterStartup(ChainRunner):
+    def test_a_guardrail_added_later_blocks_the_next_call_with_one_event(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        import litellm
+
+        from mint_litellm.plugin.selfcheck import callbacks_snapshot
+
+        rig = self.build_rig(tmp_path, monkeypatch, contract_snapshot)
+        assert self.call(rig).error is None
+        rig.runtime.order_snapshot = callbacks_snapshot(litellm.callbacks)
+        litellm.callbacks.append(self.rewriter(self.OTHER, 9))
+        first = self.call(rig)
+        second = self.call(rig)
+        assert first.error.code == second.error.code == "MINT-ENFORCEMENT-UNVERIFIED"
+        assert first.sent is None and second.sent is None
+        (event,) = rig.store.of_kind("enforcement_unverified")
+        assert event.payload == {"cause": "callbacks_changed", "hooks": ["ArgumentsRewriter"]}
 
 
 class TestConstructors:
