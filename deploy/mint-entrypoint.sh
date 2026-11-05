@@ -59,10 +59,15 @@ MINT_EXIT_CODE_FILE="${MINT_EXIT_CODE_FILE:-/tmp/mint-exit-code}"
 export MINT_EXIT_CODE_FILE
 rm -f "$MINT_EXIT_CODE_FILE"
 
+child=
+stopping=0
+# 자식을 띄우기 전에 trap을 건다. 그 사이에 온 신호는 자식을 띄운 직후 전달한다.
+trap 'stopping=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT
 docker/prod_entrypoint.sh "$@" &
 child=$!
-stopping=0
-trap 'stopping=1; kill -TERM "$child" 2>/dev/null' TERM INT
+if [ "$stopping" = 1 ]; then
+    kill -TERM "$child" 2>/dev/null
+fi
 wait "$child"
 status=$?
 # 신호를 받으면 wait가 먼저 돌아온다. 자식이 끝날 때까지 기다린다.
