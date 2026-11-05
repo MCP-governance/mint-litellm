@@ -67,17 +67,17 @@ def test_an_existing_file_without_a_key_fails_instead_of_being_overwritten(tmp_p
 
 
 def test_concurrent_initializations_leave_exactly_one_key(tmp_path, monkeypatch):
-    """모든 실행이 ``파일 없음``을 본 상태에서 게시 직전에 함께 멈췄다가 동시에 게시한다."""
+    """모든 실행이 ``파일 없음``을 본 상태에서 키를 만드는 지점에 함께 멈췄다가 동시에 진행한다."""
     path = tmp_path / "mint" / "secrets.env"
     count = 8
     gate = threading.Barrier(count, timeout=10)
-    real_link = os.link
+    real_new_key = secrets_file.new_key
 
-    def link_after_everyone_is_ready(source, target):
-        gate.wait()
-        return real_link(source, target)
+    def new_key_after_everyone_is_ready():
+        gate.wait()  # 구현이 어떻든 키를 만들려면 이 지점을 지난다
+        return real_new_key()
 
-    monkeypatch.setattr(secrets_file.os, "link", link_after_everyone_is_ready)
+    monkeypatch.setattr(secrets_file, "new_key", new_key_after_everyone_is_ready)
     results: list[object] = []
 
     def run():
@@ -146,3 +146,33 @@ def test_the_directory_is_created_private_and_shared_directories_are_refused(tmp
     with pytest.raises(ControlError, match="다른 사용자가 쓸 수"):
         secrets_file.ensure_fingerprint_key(shared / "secrets.env")
     assert not (shared / "secrets.env").exists()
+
+
+@POSIX
+def test_an_existing_file_is_refused_under_a_linked_or_shared_directory(tmp_path):
+    real = tmp_path / "real"
+    secrets_file.ensure_fingerprint_key(real / "secrets.env")
+    alias = tmp_path / "alias"
+    alias.symlink_to(real)
+    with pytest.raises(ControlError, match="심볼릭 링크"):
+        secrets_file.load_fingerprint_key({}, alias / "secrets.env")
+    with pytest.raises(ControlError, match="심볼릭 링크"):
+        secrets_file.ensure_fingerprint_key(alias / "secrets.env")
+    real.chmod(0o777)  # 파일은 0600이어도 디렉터리를 다른 사용자가 바꿀 수 있다
+    with pytest.raises(ControlError, match="다른 사용자가 쓸 수"):
+        secrets_file.load_fingerprint_key({}, real / "secrets.env")
+    with pytest.raises(ControlError, match="다른 사용자가 쓸 수"):
+        secrets_file.ensure_fingerprint_key(real / "secrets.env")
+    real.chmod(0o700)
+    assert secrets_file.load_fingerprint_key({}, real / "secrets.env")[0]
+
+
+@POSIX
+def test_invalid_utf8_and_unreadable_files_become_control_errors(tmp_path):
+    path = tmp_path / "secrets.env"
+    path.write_bytes(b"MINT_FINGERPRINT_KEY=\xff\xfe\n")
+    path.chmod(0o600)
+    with pytest.raises(ControlError, match="읽을 수 없습니다"):
+        secrets_file.load_fingerprint_key({}, path)
+    with pytest.raises(ControlError, match="읽을 수 없습니다"):
+        secrets_file.ensure_fingerprint_key(path)

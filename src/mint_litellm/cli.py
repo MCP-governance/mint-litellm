@@ -198,6 +198,11 @@ def _gather_env(run: Run) -> dict[str, str]:
     return env
 
 
+def _env_file_keys(run: Run) -> frozenset[str]:
+    path = getattr(run.args, "env_file", None)
+    return frozenset(litellm_config.load_env_file(Path(path))) if path else frozenset()
+
+
 def _config_path(run: Run) -> Path | None:
     return Path(run.args.config) if getattr(run.args, "config", None) else run.cfg.litellm_config
 
@@ -222,6 +227,7 @@ def _check(run: Run) -> None:
         replicas=run.cfg.replicas,
         registered_servers=registered,
         check_fingerprint=True,
+        env_file_keys=_env_file_keys(run),
         policy_state=policy_check.verify_active_policy(
             run.conn, ctx.instance_id, run.environ.get("MINT_OPA_URL")
         ),

@@ -361,3 +361,70 @@ def test_a_readable_fingerprint_file_satisfies_the_row(healthy, tmp_path):
 def test_without_the_option_the_fingerprint_row_is_not_evaluated(healthy):
     report = run(good_config(), healthy)
     assert not [f for f in report.findings if f.item == "MINT_FINGERPRINT_KEY"]
+
+
+def optout_keys(stub, *metadata):
+    keys = fixture("key_list_full")
+    base = key_entry("k-good")
+    keys["keys"] = [{**base, "token": f"t{i}", "metadata": meta} for i, meta in enumerate(metadata)]
+    stub.set("/key/list", keys)
+    stub.set("/team/list", [])
+
+
+def test_excluding_only_other_guardrails_is_not_counted_and_not_warned(healthy, stub):
+    optout_keys(stub, {"opted_out_global_guardrails": ["pii"]}, {"opted_out_global_guardrails": []},
+                {"disable_global_guardrails": False}, {})
+    report = run(good_config(), healthy)
+    assert report.observations["guardrail_optout_subjects"] == 0
+    assert "가드레일 제외 대상" not in levels(report)
+
+
+def test_the_mint_guardrail_name_comes_from_the_config(healthy, stub):
+    optout_keys(stub, {"opted_out_global_guardrails": ["mint-prod"]},
+                {"opted_out_global_guardrails": "mint-prod"},
+                {"opted_out_global_guardrails": ["mint"]},
+                {"opted_out_global_guardrails": ["pii", "mint-prod"]},
+                {"disable_global_guardrails": True})
+    config = good_config()
+    config["guardrails"][0]["guardrail_name"] = "mint-prod"
+    report = run(config, healthy)
+    assert report.observations["guardrail_optout_subjects"] == 4  # 이름이 다른 'mint'는 해당 없음
+    message = next(f.message for f in report.findings if f.item == "가드레일 제외 대상")
+    assert "MCP를 호출할 수 없게 됩니다" in message
+
+
+def fingerprint_message(env, **kwargs):
+    report = checks.run_checks(good_config(), env, None, compat_probe=lambda: [],
+                               check_fingerprint=True, **kwargs)
+    return report, next(f for f in report.findings if f.item == "MINT_FINGERPRINT_KEY")
+
+
+def test_the_fingerprint_row_names_where_the_checked_value_came_from(tmp_path):
+    import base64
+
+    from mint_litellm.control import secrets_file
+
+    good = base64.urlsafe_b64encode(b"k" * 32).decode()
+    absent = {"MINT_SECRETS_FILE": str(tmp_path / "none.env")}
+    _, found = fingerprint_message({**absent, "MINT_FINGERPRINT_KEY": good})
+    assert "이 프로세스의 환경 변수" in found.message and "대조하지 않음" in found.message
+    _, found = fingerprint_message(
+        {**absent, "MINT_FINGERPRINT_KEY": good},
+        env_file_keys=frozenset({"MINT_FINGERPRINT_KEY"}),
+    )
+    assert "--env-file" in found.message
+    path = tmp_path / "secrets.env"
+    secrets_file.ensure_fingerprint_key(path)
+    _, found = fingerprint_message({"MINT_SECRETS_FILE": str(path)})
+    assert f"비밀 파일 {path.as_posix()}" in found.message and "대조하지 않음" in found.message
+
+
+def test_a_secret_file_with_invalid_utf8_is_unverified_not_a_crash(tmp_path):
+    import os
+
+    path = tmp_path / "secrets.env"
+    path.write_bytes(b"MINT_FINGERPRINT_KEY=\xff\xfe\n")
+    if os.name != "nt":
+        path.chmod(0o600)
+    report, found = fingerprint_message({"MINT_SECRETS_FILE": str(path)})
+    assert found.level is Level.SKIP and "MINT_FINGERPRINT_KEY" in report.incomplete

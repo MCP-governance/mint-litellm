@@ -26,6 +26,7 @@ _OPTOUT_KEYS = ("opted_out_global_guardrails", "disable_global_guardrails")
 # 설정 표에는 없지만 필수로 취급하는 점검 항목
 POLICY_ITEM = "정책 번들 내용"
 FINGERPRINT_ITEM = "MINT_FINGERPRINT_KEY"
+KEY_NAME_IN_FILE = "MINT_FINGERPRINT_KEY"
 EXTRA_REQUIRED = frozenset({POLICY_ITEM, FINGERPRINT_ITEM})
 
 # 호환 계층이 쓰는 LiteLLM 비공개 심볼: (모듈, 객체, 속성)
@@ -121,6 +122,7 @@ def run_checks(
     registered_servers: list[dict] | None = None,
     policy_state: PolicyState | None = None,
     check_fingerprint: bool = False,
+    env_file_keys: frozenset[str] = frozenset(),
     compat_probe: Callable[[], list[str] | None] = probe_compat_symbols,
 ) -> Report:
     report = Report()
@@ -148,7 +150,7 @@ def run_checks(
     # 관리 API 기반 행
     if litellm is not None:
         _check_registry_rows(report, judge, litellm, registered_servers or [], config)
-        _check_keys_and_teams(report, judge, litellm)
+        _check_keys_and_teams(report, judge, litellm, _mint_guardrail_names(config))
         if not file_missing:
             _check_guardrail_registered(report, litellm, config)
     else:
@@ -161,7 +163,7 @@ def run_checks(
     if policy_state is not None:
         _policy_finding(report, policy_state)
     if check_fingerprint:
-        _fingerprint_finding(report, env)
+        _fingerprint_finding(report, env, env_file_keys)
     missing = compat_probe()
     if missing is None:
         report.add("호환 계층 비공개 심볼", Level.SKIP,
@@ -328,7 +330,19 @@ def _permission_of(litellm: LiteLLMAdmin, kind: str, obj: Mapping[str, Any]) -> 
     return (detail or {}).get("object_permission") or {}
 
 
-def _check_keys_and_teams(report, judge, litellm: LiteLLMAdmin) -> None:
+def _mint_guardrail_names(config: Mapping[str, Any]) -> frozenset[str]:
+    """설정 파일에서 MINT 가드레일의 이름. 설정이 없거나 정의가 없으면 기본 이름을 쓴다."""
+    names = {
+        g.get("guardrail_name")
+        for g in config.get("guardrails") or []
+        if str((g.get("litellm_params") or {}).get("guardrail", "")).endswith(".MintGuardrail")
+    } - {None}
+    return frozenset(names or {"mint"})
+
+
+def _check_keys_and_teams(
+    report, judge, litellm: LiteLLMAdmin, mint_names: frozenset[str]
+) -> None:
     keys = litellm.list_keys()
     teams = litellm.list_teams()
     registry_ids = {s["server_id"] for s in litellm.list_servers()}
@@ -338,9 +352,13 @@ def _check_keys_and_teams(report, judge, litellm: LiteLLMAdmin) -> None:
     report.observations["unbound_keys"] = unbound
 
     def optout(meta: Mapping[str, Any] | None) -> bool:
+        """MINT 가드레일 제외 또는 전역 가드레일 전체 비활성. 다른 가드레일 제외는 해당 없음."""
         meta = meta or {}
-        return bool(meta.get("opted_out_global_guardrails")) or _truthy(
-            meta.get("disable_global_guardrails")
+        excluded = meta.get("opted_out_global_guardrails") or []
+        if isinstance(excluded, str):
+            excluded = [excluded]
+        return _truthy(meta.get("disable_global_guardrails")) or bool(
+            mint_names & {str(name) for name in excluded}
         )
 
     subjects = sum(1 for k in keys if optout(k.get("metadata"))) + sum(
@@ -349,8 +367,8 @@ def _check_keys_and_teams(report, judge, litellm: LiteLLMAdmin) -> None:
     report.observations["guardrail_optout_subjects"] = subjects
     if subjects:
         report.add("가드레일 제외 대상", Level.WARN,
-                   f"가드레일 제외 메타데이터를 가진 키·팀이 {subjects}개 있습니다. 이 키·팀은 "
-                   "MCP를 호출할 수 없게 됩니다.")
+                   f"MINT 가드레일을 제외했거나 전역 가드레일을 끈 키·팀이 {subjects}개 있습니다. "
+                   "이 키·팀은 MCP를 호출할 수 없게 됩니다.")
     bad: list[str] = []
     for owner, kind, objects in (("키", "key", keys), ("팀", "team", teams)):
         for obj in objects:
@@ -402,25 +420,35 @@ def _policy_finding(report: Report, state: PolicyState) -> None:
         report.add(POLICY_ITEM, Level.SKIP, state.detail)
 
 
-def _fingerprint_finding(report: Report, env: Mapping[str, str]) -> None:
-    """LiteLLM 서비스에 넘기는 인자 지문 키와 키 판본이 있고 형식이 맞는지 본다.
+def _fingerprint_finding(
+    report: Report, env: Mapping[str, str], env_file_keys: frozenset[str]
+) -> None:
+    """검사에 쓰인 인자 지문 키와 키 판본이 있고 형식이 맞는지 본다.
 
     환경 변수에 없으면 서비스에 같은 값을 주는 비밀 파일을 본다. 읽을 수 없으면 확인 못한 것이다.
+    출처를 함께 적는다: 실행 중인 LiteLLM 서비스가 실제로 받은 값과 대조하지는 않는다.
     """
     try:
-        key, version = secrets_file.load_fingerprint_key(env)
+        key, version, source = secrets_file.load_fingerprint_key_with_source(env)
     except ControlError as error:
         # 키가 없다는 것과 파일을 읽을 수 없다는 것을 구분한다.
         wrong = "찾을 수 없습니다" in str(error) or "정수가 아닙니다" in str(error)
         level = Level.FAIL if wrong else Level.SKIP
         report.add(FINGERPRINT_ITEM, level, str(error))
         return
+    if source != "environment":
+        origin = f"비밀 파일 {source}"
+    elif KEY_NAME_IN_FILE in env_file_keys:
+        origin = "--env-file"
+    else:
+        origin = "이 프로세스의 환경 변수"
+    note = f" (검사 출처: {origin}; 실행 중인 LiteLLM 서비스가 받은 값과는 대조하지 않음)"
     try:
         fingerprint.decode_fingerprint_key(key)
     except ValueError as error:
-        report.add(FINGERPRINT_ITEM, Level.FAIL, f"키 형식이 올바르지 않습니다: {error}")
+        report.add(FINGERPRINT_ITEM, Level.FAIL, f"키 형식이 올바르지 않습니다: {error}{note}")
         return
     if version < 1:
-        report.add(FINGERPRINT_ITEM, Level.FAIL, "키 판본은 1 이상이어야 합니다.")
+        report.add(FINGERPRINT_ITEM, Level.FAIL, f"키 판본은 1 이상이어야 합니다.{note}")
         return
-    report.add(FINGERPRINT_ITEM, Level.OK, f"키 판본 {version}")
+    report.add(FINGERPRINT_ITEM, Level.OK, f"키 판본 {version}{note}")
