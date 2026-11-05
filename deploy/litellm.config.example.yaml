@@ -15,7 +15,6 @@ guardrails:
       default_on: true
 
 litellm_settings:
-  callbacks: [mint_litellm.plugin.logger.mint_logger]
   user_url_validation: true
   key_generation_settings:
     personal_key_generation:

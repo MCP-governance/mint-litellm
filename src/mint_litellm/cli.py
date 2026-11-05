@@ -221,7 +221,7 @@ def _check(run: Run) -> None:
         (ctx.instance_id,),
     )
     report = checks.run_checks(
-        litellm_config.load_config(_config_path(run)),
+        litellm_config.load_effective(_config_path(run)),
         _gather_env(run),
         _optional_litellm(run),
         replicas=run.cfg.replicas,
@@ -252,7 +252,7 @@ def _status(run: Run) -> None:
         run.context(),
         run.cfg,
         _optional_litellm(run),
-        litellm_config.load_config(_config_path(run)),
+        litellm_config.load_effective(_config_path(run)),
         _gather_env(run),
         policy_check.verify_active_policy(
             run.conn, run.context().instance_id, run.environ.get("MINT_OPA_URL")
@@ -401,7 +401,7 @@ def _server_register(run: Run) -> None:
         run.litellm(),
         run.args.server_id,
         run.args.url,
-        litellm_config.load_config(_config_path(run)),
+        litellm_config.load_effective(_config_path(run)),
     )
 
 

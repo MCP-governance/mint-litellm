@@ -74,7 +74,8 @@ def test_every_settings_row_is_reported(healthy):
          "guardrails[MINT]"),
         (lambda c: c["guardrails"].append({"guardrail_name": "z", "litellm_params": {
             "guardrail": "other"}}), "guardrails[MINT]"),
-        (lambda c: c["litellm_settings"].pop("callbacks"), "callbacks"),
+        (lambda c: c["litellm_settings"].update(callbacks=["x.plugin.MintLogger"]), "callbacks"),
+        (lambda c: c["litellm_settings"].update(callbacks=["x.mint_logger"]), "callbacks"),
         (lambda c: c["mcp_servers"]["everything"].update(allow_all_keys=True),
          "mcp_servers.<이름>.allow_all_keys"),
         (lambda c: c["mcp_servers"]["everything"].pop("server_id"),
@@ -381,16 +382,47 @@ def test_excluding_only_other_guardrails_is_not_counted_and_not_warned(healthy, 
 
 def test_the_mint_guardrail_name_comes_from_the_config(healthy, stub):
     optout_keys(stub, {"opted_out_global_guardrails": ["mint-prod"]},
-                {"opted_out_global_guardrails": "mint-prod"},
                 {"opted_out_global_guardrails": ["mint"]},
                 {"opted_out_global_guardrails": ["pii", "mint-prod"]},
                 {"disable_global_guardrails": True})
     config = good_config()
     config["guardrails"][0]["guardrail_name"] = "mint-prod"
     report = run(config, healthy)
-    assert report.observations["guardrail_optout_subjects"] == 4  # 이름이 다른 'mint'는 해당 없음
+    assert report.observations["guardrail_optout_subjects"] == 3  # 이름이 다른 'mint'는 해당 없음
     message = next(f.message for f in report.findings if f.item == "가드레일 제외 대상")
     assert "MCP를 호출할 수 없게 됩니다" in message
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"opted_out_global_guardrails": "mint"},  # 목록이 아니면 LiteLLM은 무시한다
+        {"opted_out_global_guardrails": True},
+        {"opted_out_global_guardrails": 5},
+        {"opted_out_global_guardrails": {"mint": True}},
+        {"opted_out_global_guardrails": None},
+        {"opted_out_global_guardrails": [[1, 2], {"a": 1}, 7]},
+        {"disable_global_guardrails": "true"},  # True일 때만 센다
+        {"disable_global_guardrails": 1},
+        {"disable_global_guardrails": "yes"},
+        {"disable_global_guardrails": [True]},
+        {"disable_global_guardrails": None},
+        {"disable_global_guardrails": False},
+    ],
+)
+def test_values_that_litellm_ignores_are_not_counted_and_never_raise(healthy, stub, meta):
+    optout_keys(stub, meta)
+    report = run(good_config(), healthy)
+    assert report.observations["guardrail_optout_subjects"] == 0
+    assert "가드레일 제외 대상" not in levels(report)
+
+
+def test_only_a_list_naming_the_mint_guardrail_or_true_is_counted(healthy, stub):
+    optout_keys(stub, {"opted_out_global_guardrails": ["mint"]},
+                {"opted_out_global_guardrails": ["x", [1], "mint"]},
+                {"disable_global_guardrails": True},
+                {"disable_global_guardrails": True, "opted_out_global_guardrails": "bad"})
+    assert run(good_config(), healthy).observations["guardrail_optout_subjects"] == 4
 
 
 def fingerprint_message(env, **kwargs):

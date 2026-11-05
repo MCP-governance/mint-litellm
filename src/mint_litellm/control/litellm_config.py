@@ -5,10 +5,12 @@ from typing import Any
 
 import yaml
 
+from mint_litellm.compat import litellm_config_loader
 from mint_litellm.control.errors import ControlError
 
 GUARDRAIL_CLASS = "mint_litellm.plugin.guardrail.MintGuardrail"
-LOGGER_REF = "mint_litellm.plugin.logger.mint_logger"
+# 가드레일이 로거를 등록하므로 설정의 callbacks에는 적지 않는다. 적혀 있으면 거부한다.
+LOGGER_SUFFIXES = (".MintLogger", ".mint_logger")
 GUARDRAIL_MODES = ("pre_mcp_call", "post_mcp_call")
 
 _HEADER = "# MINT 통제에 필요한 LiteLLM 설정 조각. 기존 config.yaml의 같은 키에 합친다.\n"
@@ -35,7 +37,6 @@ def snippet(servers: dict[str, tuple[str, str]], *, no_spend_logs: bool) -> str:
             }
         ],
         "litellm_settings": {
-            "callbacks": [LOGGER_REF],
             "user_url_validation": True,
             "key_generation_settings": {
                 "personal_key_generation": {"allowed_user_roles": ["proxy_admin"]}
@@ -49,6 +50,13 @@ def snippet(servers: dict[str, tuple[str, str]], *, no_spend_logs: bool) -> str:
             for name, (server_id, url) in servers.items()
         }
     return _HEADER + yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
+
+
+def load_effective(path: Path | None, *, require_loader: bool = False) -> dict[str, Any] | None:
+    """LiteLLM의 설정 로더로 ``include``까지 병합한 설정. 로더는 ``compat``에 격리되어 있다."""
+    if path is None:
+        return None
+    return litellm_config_loader.load_effective_config(path, require_loader=require_loader)
 
 
 def load_config(path: Path | None) -> dict[str, Any] | None:

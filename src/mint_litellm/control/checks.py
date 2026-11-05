@@ -13,7 +13,7 @@ from typing import Any
 from mint_litellm.control import secrets_file
 from mint_litellm.control.errors import ControlError
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
-from mint_litellm.control.litellm_config import GUARDRAIL_MODES
+from mint_litellm.control.litellm_config import GUARDRAIL_MODES, LOGGER_SUFFIXES
 from mint_litellm.control.policy_check import PolicyState
 from mint_litellm.types import fingerprint
 from mint_litellm.types.decision import normalize_auth_type, url_sha256
@@ -205,8 +205,13 @@ def _check_file_rows(judge, config, general, lsettings, servers_cfg, env, replic
 
     callbacks = lsettings.get("callbacks") or []
     callbacks = [callbacks] if isinstance(callbacks, str) else callbacks
-    judge("callbacks", any(isinstance(c, str) and (c.endswith(".MintLogger") or
-          c.endswith(".mint_logger")) for c in callbacks), "MINT 로거가 callbacks에 없습니다.")
+    logged = [
+        c for c in callbacks
+        if isinstance(c, str) and c.endswith(LOGGER_SUFFIXES)
+    ]
+    judge("callbacks", not logged,
+          "MINT 로거는 가드레일이 등록하므로 litellm_settings.callbacks에 적으면 안 됩니다: "
+          + ", ".join(logged))
 
     open_servers = [n for n, s in servers_cfg.items() if _truthy((s or {}).get("allow_all_keys"))]
     judge("mcp_servers.<이름>.allow_all_keys", not open_servers,
@@ -352,14 +357,12 @@ def _check_keys_and_teams(
     report.observations["unbound_keys"] = unbound
 
     def optout(meta: Mapping[str, Any] | None) -> bool:
-        """MINT 가드레일 제외 또는 전역 가드레일 전체 비활성. 다른 가드레일 제외는 해당 없음."""
+        """LiteLLM 판정과 같은 기준: 제외는 목록일 때만, 전체 비활성은 ``True``일 때만 센다."""
         meta = meta or {}
-        excluded = meta.get("opted_out_global_guardrails") or []
-        if isinstance(excluded, str):
-            excluded = [excluded]
-        return _truthy(meta.get("disable_global_guardrails")) or bool(
-            mint_names & {str(name) for name in excluded}
-        )
+        excluded = meta.get("opted_out_global_guardrails")
+        if meta.get("disable_global_guardrails") is True:
+            return True
+        return isinstance(excluded, list) and any(name in excluded for name in mint_names)
 
     subjects = sum(1 for k in keys if optout(k.get("metadata"))) + sum(
         1 for t in teams if optout(t.get("metadata"))

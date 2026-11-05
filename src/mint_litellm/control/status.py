@@ -79,9 +79,50 @@ def collect(
         if policy_state is None
         else {"state": policy_state.state, "detail": policy_state.detail},
         "servers": servers,
+        "enforcement": enforcement_states(ctx),
+        "allowed_pre_hooks": allowed_pre_hooks(env),
         "alerts": alerts,
         "observations": {name: observations.get(name, "확인 불가") for name in OBSERVATION_ITEMS},
     }
+
+
+def enforcement_states(ctx: Context) -> list[dict[str, Any]]:
+    """워커마다 가장 최근의 ``enforcement_verified``·``enforcement_unverified``.
+
+    표시는 최근 전환이며, 그 워커가 지금 살아 있다는 뜻이 아니다.
+    """
+    rows = fetchall(
+        ctx.conn,
+        "SELECT kind, inserted_at, payload FROM mint.events WHERE instance_id = %s"
+        " AND kind IN ('enforcement_verified', 'enforcement_unverified')"
+        " ORDER BY inserted_at DESC, event_id DESC LIMIT 1000",
+        (ctx.instance_id,),
+    )
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        payload = row["payload"] if isinstance(row["payload"], dict) else {}
+        worker = str(payload.get("worker_id") or "-")
+        if worker in latest:
+            continue
+        passed = row["kind"] == "enforcement_verified"
+        failed = payload.get("failed") or []
+        latest[worker] = {
+            "worker_id": worker,
+            "passed": passed,
+            "cause": None if passed else payload.get("cause")
+            or ("startup_check" if failed else payload.get("error")),
+            "failed": failed,
+            "hooks": payload.get("hooks") or [],
+            "allowed_hooks_used": payload.get("allowed_hooks_used") if passed else None,
+            "last_transition_at": row["inserted_at"].isoformat(),
+            "payload": payload,
+        }
+    return sorted(latest.values(), key=lambda s: s["worker_id"])
+
+
+def allowed_pre_hooks(env: dict[str, str]) -> list[str]:
+    names = env.get("MINT_ALLOWED_PRE_HOOKS", "").split(",")
+    return sorted({name.strip() for name in names if name.strip()})
 
 
 def _mismatch_alerts(ctx: Context) -> list[dict[str, Any]]:
@@ -126,6 +167,23 @@ def render(info: dict[str, Any]) -> str:
         label = {"match": "일치", "mismatch": "불일치", "unverified": "확인 불가"}[bundle["state"]]
         detail = f" ({bundle['detail']})" if bundle["detail"] else ""
         lines.append(f"정책 번들 내용: {label}{detail}")
+    hooks = ", ".join(info["allowed_pre_hooks"]) or "없음"
+    lines.append(f"허용 사전 훅: {hooks}")
+    lines.append("집행 점검(워커별 최근 전환; 워커가 살아 있다는 뜻은 아님)")
+    if not info["enforcement"]:
+        lines.append("  기록 없음")
+    for state in info["enforcement"]:
+        if state["passed"]:
+            used = "허용 목록 사용" if state["allowed_hooks_used"] else "허용 목록 미사용"
+            lines.append(f"  {state['worker_id']}: 통과 ({used}) {state['last_transition_at']}")
+        else:
+            names = ", ".join(
+                f"{item.get('name', '?')}: {item.get('detail', '')}" for item in state["failed"]
+            ) or ", ".join(state["hooks"])
+            reason = state["cause"] or "원인 미상"
+            lines.append(
+                f"  {state['worker_id']}: 실패 ({reason}) {names} {state['last_transition_at']}"
+            )
     lines.append("관측 항목")
     lines.extend(f"  {k}: {v}" for k, v in info["observations"].items())
     return "\n".join(lines)

@@ -13,7 +13,8 @@ def test_snippet_has_the_required_guardrail_callback_and_server_entries():
     )
     guardrail = data["guardrails"][0]["litellm_params"]
     assert guardrail["mode"] == ["pre_mcp_call", "post_mcp_call"] and guardrail["default_on"]
-    assert litellm_config.LOGGER_REF in data["litellm_settings"]["callbacks"]
+    assert "callbacks" not in data["litellm_settings"]  # 로거는 가드레일이 등록한다
+    assert data["guardrails"][-1]["litellm_params"]["guardrail"].endswith(".MintGuardrail")
     assert data["general_settings"]["require_key_mcp_access_defined"] is True
     assert data["general_settings"]["store_prompts_in_spend_logs"] is False
     assert "disable_spend_logs" not in data["general_settings"]
