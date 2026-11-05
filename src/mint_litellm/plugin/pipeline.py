@@ -901,8 +901,8 @@ def build_request(
     principal = principal_factory(user_api_key_dict, instance_id=instance_id)
     resolved: ResolvedServer | None = None
     failure: StageResult | None = None
-    if hook.tool_name is None:
-        failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="hook data has no tool")
+    if hook.tool_name is None or hook.server_name is None:
+        failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="hook data has no server or tool")
     elif not hook.arguments_ok:
         failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="arguments are not an object")
     else:

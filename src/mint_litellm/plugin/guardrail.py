@@ -81,8 +81,10 @@ class MintGuardrail(CustomGuardrail):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         if call_type == compat.LIST_TOOLS:
             return await self._discover(user_api_key_dict, data)
-        if call_type == compat.CALL_TOOL and isinstance(data, dict):
-            await self._judge(user_api_key_dict, data)
+        if call_type == compat.CALL_TOOL:
+            # 가드레일이 도는 단계의 호출 데이터는 서버·도구 이름이 있는 객체여야 한다. 아니면
+            # 판정 없이 통과시키지 않고 차단한다. REST 요청 본문 단계는 LiteLLM이 건너뛴다.
+            await self._judge(user_api_key_dict, data if isinstance(data, dict) else {})
         return None
 
     async def _discover(self, user_api_key_dict, data):
@@ -99,8 +101,6 @@ class MintGuardrail(CustomGuardrail):
     async def _judge(self, user_api_key_dict, data):
         """도구 호출을 판정한다. 차단은 예외이고, 병렬 단계가 돌려주는 값은 버려진다."""
         hook = compat.parse_hook_data(data)
-        if not hook.is_synthesized:
-            return
         try:
             outcome = await self._runtime.judge_call(data, user_api_key_dict)
         except Exception as exc:

@@ -251,11 +251,46 @@ class TestGuardrailJudgment:
         invocation, attempt = json.loads(internal_block().detail)["reference"].rsplit(":", 1)
         assert attempt == "1" and len(invocation) == 36
 
-    def test_the_rest_request_body_stage_is_ignored(self, tmp_path):
+    def test_data_without_a_server_or_tool_name_is_blocked_not_passed(self, tmp_path):
+        # 가드레일이 도는 단계에서 이름이 없는 호출은 판정할 수 없으므로 차단한다. REST 요청 본문
+        # 단계는 LiteLLM이 가드레일을 건너뛰어 여기에 오지 않는다.
         runtime, store, snapshots = build_runtime(tmp_path)
         body_stage = {"arguments": {}, "litellm_logging_obj": logging_obj(), "server_id": "x"}
-        assert pre(runtime.guardrail, body_stage) is None
-        assert store.events == {} and snapshots.queries == []
+        assert blocked(lambda: pre(runtime.guardrail, body_stage)).code == "MINT-SCHEMA-ERROR"
+        assert len(store.of_kind("decision_evaluated")) == 1 and snapshots.queries == []
+
+        def code(data):
+            return blocked(lambda: pre(runtime.guardrail, data)).code
+
+        for missing in ("mcp_server_name", "mcp_tool_name"):
+            data = synthesized(logging_obj())
+            del data[missing]
+            assert code(data) == "MINT-SCHEMA-ERROR"
+            assert code({**data, missing: None}) == "MINT-SCHEMA-ERROR"
+        assert snapshots.queries == []
+
+    @pytest.mark.parametrize("data", [None, [], "text", 7], ids=["none", "list", "text", "number"])
+    def test_call_data_that_is_not_an_object_is_blocked(self, tmp_path, data):
+        runtime, store, snapshots = build_runtime(tmp_path)
+        assert blocked(lambda: pre(runtime.guardrail, data)).code == "MINT-SCHEMA-ERROR"
+        assert len(store.of_kind("decision_evaluated")) == 1 and snapshots.queries == []
+
+    @pytest.mark.parametrize("original", [None, "", [], 0, "text"])
+    def test_original_arguments_that_are_not_an_object_are_a_schema_error(
+        self, tmp_path, contract_snapshot, original
+    ):
+        runtime, _, snapshots = build_runtime(tmp_path, contract_snapshot)
+        data = synthesized(logging_obj(), mcp_arguments=original)
+        assert blocked(lambda: pre(runtime.guardrail, data)).code == "MINT-SCHEMA-ERROR"
+        assert snapshots.queries == []
+
+    def test_a_missing_arguments_key_is_judged_as_no_arguments(self, tmp_path, contract_snapshot):
+        calls: list = []
+        runtime, _, _ = build_runtime(tmp_path, contract_snapshot, evaluate=evaluator(calls=calls))
+        data = synthesized(logging_obj())
+        del data["mcp_arguments"]
+        assert pre(runtime.guardrail, data) is None
+        assert calls[0]["arguments"]["keys"] == []
 
     def test_an_unverified_runtime_blocks_every_call(self, tmp_path, contract_snapshot):
         runtime, store, snapshots = build_runtime(tmp_path, contract_snapshot, verified=False)
@@ -678,6 +713,33 @@ class TestParallelStage(ChainRunner):
         rig = self.build_rig(tmp_path, monkeypatch, contract_snapshot, before=[replacement])
         result = self.call(rig)
         assert result.error.code == "MINT-SCHEMA-ERROR" and result.sent is None
+
+    def test_the_rest_request_body_stage_is_skipped_by_litellm_not_by_mint(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        rig = self.build_rig(tmp_path, monkeypatch, contract_snapshot)
+        body = {"arguments": {"q": "x"}, "server_id": "x", "litellm_logging_obj": logging_obj()}
+        user = auth()
+        out = run(
+            rig.proxy.pre_call_hook(
+                user_api_key_dict=user, data=body, call_type="call_mcp_tool", skip_guardrails=True
+            )
+        )
+        assert out is not None and rig.store.events == {}
+
+    def test_a_guardrail_stage_call_without_a_server_name_is_blocked_in_the_chain(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        rig = self.build_rig(tmp_path, monkeypatch, contract_snapshot)
+        data, _, _, user = self.data_for(rig)
+        del data["mcp_server_name"]
+        with pytest.raises(HTTPException) as raised:
+            run(
+                rig.proxy.pre_call_hook(
+                    user_api_key_dict=user, data=data, call_type="call_mcp_tool"
+                )
+            )
+        assert MintError.from_detail(raised.value.detail).code == "MINT-SCHEMA-ERROR"
 
     def test_an_empty_replacement_is_ignored_by_litellm_and_by_the_judgment(
         self, tmp_path, monkeypatch, contract_snapshot

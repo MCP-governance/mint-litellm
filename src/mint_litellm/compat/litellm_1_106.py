@@ -41,7 +41,7 @@ class HookData:
     """사전 훅 ``data``에서 읽는 값.
 
     REST 호출은 같은 호출에서 사전 훅 단계가 두 번 있다. 첫 번째는 요청 본문 단계라
-    ``mcp_server_name``이 없고(가드레일은 건너뛰어진다), 두 번째(합성 단계)만 서버 이름과
+    ``mcp_server_name``이 없고(LiteLLM이 가드레일을 건너뛴다), 두 번째(합성 단계)만 서버 이름과
     도구 이름이 있다. ``arguments_ok``가 거짓이면 전송될 인자가 객체가 아니다.
     """
 
@@ -52,17 +52,15 @@ class HookData:
     logging_obj: Any
     arguments_ok: bool = True
 
-    @property
-    def is_synthesized(self) -> bool:
-        return self.server_name is not None and self.tool_name is not None
-
 
 def effective_arguments(data: Mapping[str, Any]) -> Mapping[str, Any] | None:
     """업스트림에 전달될 인자. 객체가 아니면 None이다.
 
     앞선 훅이 돌려준 수정본이 있으면 그것이다. LiteLLM은 비어 있는 값을 수정본으로 치지 않는다.
+    원래 인자는 키가 없을 때만 빈 객체이고, 값이 None이나 문자열 같은 비객체면 None이다.
     """
-    arguments = data.get("modified_arguments") or data.get("mcp_arguments") or {}
+    modified = data.get("modified_arguments")
+    arguments = modified if modified else data.get("mcp_arguments", {})
     return arguments if isinstance(arguments, Mapping) else None
 
 
