@@ -80,10 +80,12 @@ def arguments_witness_problem() -> str | None:
         from litellm.proxy.utils import ProxyLogging
 
         proxy = ProxyLogging.__new__(ProxyLogging)
-        kwargs = {"name": "probe", "arguments": {"k": ["v", 1]}, "server_name": "probe"}
+        original = {"k": ["v", 1], "한글": 'it\'s "q"\n', "n": {"a": None, "b": 1.5}}
+        kwargs = {"name": "probe", "arguments": original, "server_name": "probe"}
         request = proxy.create_mcp_request_object_from_kwargs(kwargs)
         data = proxy.convert_mcp_to_llm_format(request, kwargs)
-        same = arguments_match_original(data, dict(data["mcp_arguments"]))
+        # 변환기가 돌려준 값이 아니라 알려진 원래 입력과 직접 대조한다.
+        same = data["mcp_arguments"] == original and arguments_match_original(data, original)
         other = arguments_match_original(data, {"k": ["x"]})
     except Exception as exc:
         return f"arguments witness: {type(exc).__name__}"

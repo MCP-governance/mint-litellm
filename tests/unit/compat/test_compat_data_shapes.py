@@ -171,6 +171,24 @@ class TestHookData:
         pytest.importorskip("litellm")
         assert compat.arguments_witness_problem() is None
 
+    @pytest.mark.parametrize("both", [False, True], ids=["arguments-only", "arguments-and-message"])
+    def test_the_startup_probe_compares_with_the_known_original_input(self, monkeypatch, both):
+        pytest.importorskip("litellm")
+        from litellm.proxy.utils import ProxyLogging
+
+        real = ProxyLogging.convert_mcp_to_llm_format
+
+        def altered(self, request, kwargs):
+            data = real(self, request, kwargs)
+            data["mcp_arguments"] = {"changed": 1}
+            if both:
+                # 변환기가 두 곳을 함께 바꿔도 알려진 원래 입력과 다르면 잡혀야 한다.
+                data["messages"][0]["content"] = "Tool: probe\nArguments: {'changed': 1}"
+            return data
+
+        monkeypatch.setattr(ProxyLogging, "convert_mcp_to_llm_format", altered)
+        assert compat.arguments_witness_problem() is not None
+
     def test_the_call_id_is_read_from_the_logging_object_first(self):
         data = synthesized(litellm_call_id="from-data")
         assert compat.parse_hook_data(data).litellm_call_id == "call-1"
