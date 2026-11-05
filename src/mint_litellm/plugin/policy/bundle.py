@@ -114,11 +114,32 @@ async def loaded_bundle_sha256(opa_url: str, client: httpx.AsyncClient | None = 
     unexpected = _unexpected_data(tree, _rule_paths(policies))
     if unexpected:
         raise BundleContentMismatch(f"data outside the bundle contract at {unexpected}")
+    if not _system_is_managed(bundles, (await get("/v1/data/system")).get("result")):
+        raise BundleContentMismatch("data under system is not managed by OPA")
     data = {}
     document = (await get("/v1/data/mint/data")).get("result")
     if document is not None:
         data[DATA_FILE] = document
     return bundle_content_sha256(modules, data)
+
+
+def _system_is_managed(bundles: dict, system: object) -> bool:
+    """``data.system``이 OPA가 만든 항목뿐인지 본다(전체 조회는 이 경로를 빼고 돌려준다)."""
+    if not isinstance(system, dict) or set(system) != {"bundles", "version"}:
+        return False
+    version = system["version"]
+    if system["bundles"] != bundles or not (
+        isinstance(version, dict)
+        and set(version) <= {"build_commit", "build_hostname", "build_timestamp", "version"}
+    ):
+        return False
+    return all(
+        isinstance(entry, dict)
+        and set(entry) == {"etag", "manifest"}
+        and isinstance(entry["manifest"], dict)
+        and set(entry["manifest"]) <= {"revision", "roots", "metadata"}
+        for entry in bundles.values()
+    )
 
 
 def _rule_paths(policies: object) -> set[tuple[str, ...]]:

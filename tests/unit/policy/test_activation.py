@@ -16,6 +16,7 @@ from mint_litellm.plugin.policy.bundle import (
 
 REGO = "package mint\n"
 STALE = REGO + "# stale\n"
+MANAGED_ENTRY = {"etag": "", "manifest": {"revision": "", "roots": [""]}}
 META = {"policy_version_id": "version", "bundle_sha256": "ignored"}
 
 
@@ -51,7 +52,9 @@ POLICY_AST = {
 }
 
 
-async def activate_against_fake_opa(served_rego, served_data, served_tree=None, timeout=3):
+async def activate_against_fake_opa(
+    served_rego, served_data, served_tree=None, timeout=3, served_system=None
+):
     """등록된 해시는 ``REGO``와 ``{"k": 1}``의 것이고, 가짜 OPA는 인자로 받은 내용을 돌려준다.
 
     ``served_rego``는 호출마다 다른 내용을 돌려주는 함수일 수 있다.
@@ -77,8 +80,12 @@ async def activate_against_fake_opa(served_rego, served_data, served_tree=None, 
         }
         replies = {
             "/v1/data": tree,
+            "/v1/data/system": served_system or {
+                "bundles": {"/loaded/bundle.tar.gz": MANAGED_ENTRY},
+                "version": {"version": "1.21.4"},
+            },
             "/v1/data/mint/meta": {"policy_version_id": "version", "bundle_sha256": digest},
-            "/v1/data/system/bundles": {"/loaded/bundle.tar.gz": {}},
+            "/v1/data/system/bundles": {"/loaded/bundle.tar.gz": MANAGED_ENTRY},
             "/v1/policies": [
                 {"id": "/loaded/bundle.tar.gz/mint/a.rego", "raw": rego, "ast": POLICY_AST}
             ],
@@ -144,3 +151,17 @@ def test_activation_waits_for_the_reload_when_the_metadata_is_already_current():
     published, _, reads = asyncio.run(activate_against_fake_opa(served, {"k": 1}, timeout=5))
     assert published == [b"bundle"]
     assert reads[:3] == [STALE] * 3 and reads[3] == REGO
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"injected": {"k": 1}}, {"sub": 1}],
+)
+def test_activation_rejects_data_injected_under_system(extra):
+    system = {
+        "bundles": {"/loaded/bundle.tar.gz": MANAGED_ENTRY},
+        "version": {"version": "1.21.4"},
+        **extra,
+    }
+    with pytest.raises(BundleContentMismatch):
+        asyncio.run(activate_against_fake_opa(REGO, {"k": 1}, timeout=4, served_system=system))

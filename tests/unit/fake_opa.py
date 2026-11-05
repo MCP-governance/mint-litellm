@@ -15,7 +15,11 @@ class FakeOpa:
 
     def __init__(self, rules=RULES, data=None, bundles=None):
         self.rules, self.data = rules, DATA if data is None else data
-        self.bundles = {"mint": {}} if bundles is None else bundles
+        self.bundles = (
+            {"mint": {"etag": "1", "manifest": {"revision": "1", "roots": ["mint"]}}}
+            if bundles is None
+            else bundles
+        )
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -24,6 +28,9 @@ class FakeOpa:
                     "/v1/data/system/bundles": {"result": outer.bundles},
                     "/v1/policies": {"result": [outer.module()]},
                     "/v1/data": {"result": outer.tree()},
+                    "/v1/data/system": {
+                        "result": {"bundles": outer.bundles, "version": {"version": "1.21.4"}}
+                    },
                     "/v1/data/mint/data": {"result": outer.data},
                 }.get(self.path)
                 payload = json.dumps(body if body is not None else {}).encode()
