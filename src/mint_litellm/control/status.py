@@ -141,7 +141,7 @@ def _mismatch_alerts(ctx: Context) -> list[dict[str, Any]]:
     rows = fetchall(
         ctx.conn,
         "SELECT DISTINCT ON (e.payload->>'server_id') e.payload->>'server_id' AS server_id,"
-        " e.payload->>'field' AS field, e.inserted_at FROM mint.events e"
+        " e.payload->'fields' AS fields, e.inserted_at FROM mint.events e"
         " WHERE e.instance_id = %s AND e.kind = 'server_identity_mismatch_observed'"
         " AND e.inserted_at > COALESCE((SELECT max(r.inserted_at) FROM mint.events r"
         " WHERE r.instance_id = e.instance_id AND r.kind = 'server_registered'"
@@ -153,7 +153,7 @@ def _mismatch_alerts(ctx: Context) -> list[dict[str, Any]]:
         {
             "kind": "server_identity_mismatch_observed",
             "server_id": r["server_id"],
-            "field": r["field"],
+            "fields": r["fields"] if isinstance(r["fields"], list) else [],
             "observed_at": r["inserted_at"].isoformat(),
         }
         for r in rows

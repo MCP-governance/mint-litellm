@@ -275,11 +275,13 @@ def _check_registry_rows(
     report, judge, litellm: LiteLLMAdmin, registered: list[dict], config: Mapping[str, Any]
 ) -> None:
     listing = litellm.list_servers()
-    names: dict[str, int] = {}
-    for entry in listing:
+    owners: dict[str, set[Any]] = {}
+    for position, entry in enumerate(listing):
+        owner = entry.get("server_id", position)
         for label in {entry.get("server_name"), entry.get("alias")} - {None, ""}:
-            names[label] = names.get(label, 0) + 1
-    duplicated = sorted(n for n, c in names.items() if c > 1)
+            # 런타임 점검과 같은 정규화이다: 공백은 밑줄과 같은 이름으로 본다.
+            owners.setdefault(str(label).replace(" ", "_"), set()).add(owner)
+    duplicated = sorted(name for name, ids in owners.items() if len(ids) > 1)
     judge("서버 이름·별칭 유일성", not duplicated, "중복된 이름·별칭: " + ", ".join(duplicated))
     by_id = {e["server_id"]: e for e in listing}
     problems: list[str] = []
@@ -358,12 +360,14 @@ def _check_keys_and_teams(
     report.observations["unbound_keys"] = unbound
 
     def optout(meta: Mapping[str, Any] | None) -> bool:
-        """LiteLLM 판정과 같은 기준: 제외는 목록일 때만, 전체 비활성은 ``True``일 때만 센다."""
+        """다른 가드레일을 끈 키·팀: MINT 외 이름이 목록에 있거나 전체 비활성이 ``True``일 때."""
         meta = meta or {}
         excluded = meta.get("opted_out_global_guardrails")
         if meta.get("disable_global_guardrails") is True:
             return True
-        return isinstance(excluded, list) and any(name in excluded for name in mint_names)
+        return isinstance(excluded, list) and any(
+            isinstance(name, str) and name not in mint_names for name in excluded
+        )
 
     subjects = sum(1 for k in keys if optout(k.get("metadata"))) + sum(
         1 for t in teams if optout(t.get("metadata"))

@@ -44,6 +44,15 @@ def test_changed_rules_or_data_with_unchanged_registration_are_a_mismatch(conn, 
     assert state.state == "mismatch" and state.expected != state.loaded
 
 
+def test_a_meta_that_names_another_version_or_hash_is_a_mismatch(conn, opa):
+    activate(conn, expected_hash())
+    opa.meta = {**opa.meta, "policy_version_id": "v2"}  # 규칙·데이터는 같고 메타만 다르다
+    state = policy_check.verify_active_policy(conn, INSTANCE, opa.url)
+    assert state.state == "mismatch" and "메타" in state.detail
+    opa.meta = {"policy_version_id": "v1", "bundle_sha256": "f" * 64}
+    assert policy_check.verify_active_policy(conn, INSTANCE, opa.url).state == "mismatch"
+
+
 def test_an_unexpected_bundle_layout_is_a_mismatch(conn, opa):
     activate(conn, expected_hash())
     opa.bundles = {"mint": {}, "other": {}}
