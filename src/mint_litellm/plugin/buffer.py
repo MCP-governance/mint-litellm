@@ -82,6 +82,17 @@ class EventStore(Protocol):
         ...
 
 
+@dataclass
+class TakeTicket:
+    """재적재 코루틴과 인수 스레드가 한 파일의 소유권을 넘기는 표.
+
+    코루틴이 취소돼 결과를 받지 못해도 스레드가 인수한 파일을 놓치지 않게 한다.
+    """
+
+    path: Path | None = None
+    abandoned: bool = False
+
+
 @dataclass(frozen=True)
 class Overflow:
     dropped_events: int
@@ -176,12 +187,15 @@ class LocalBuffer:
             except OSError:
                 return []
 
-    def take(self, path: Path) -> Path | None:
+    def take(self, path: Path, ticket: TakeTicket | None = None) -> Path | None:
         """파일 하나를 재적재용으로 인수한다(이름을 바꾸고 잠근다). 이미 다른 쪽이 가져갔으면 None.
 
-        한 번에 한 파일만 인수해야 재적재가 중간에 끝나도 남는 파일이 하나뿐이다.
+        한 번에 한 파일만 인수해야 재적재가 중간에 끝나도 남는 파일이 하나뿐이다. 기다리던 쪽이
+        ``abandon``한 표이면 인수하지 않는다.
         """
         with self._lock, self._directory_lock():
+            if ticket is not None and ticket.abandoned:
+                return None
             # 후보를 모은 뒤에 다른 프로세스가 가져가 잠갔을 수 있다. 닫힌 파일이 아니면 잠금이
             # 풀려 있는지 다시 확인한 뒤에만 이름을 바꾼다.
             name = path.name
@@ -207,7 +221,17 @@ class LocalBuffer:
                         os.rename(target, path)
                     return None
                 self._held[target] = handle
+            if ticket is not None:
+                ticket.path = target
             return target
+
+    def abandon(self, ticket: TakeTicket) -> None:
+        """인수를 기다리던 쪽이 취소됐다. 인수한 파일은 돌려놓고, 아직이면 인수하지 못하게 한다."""
+        with self._lock:
+            ticket.abandoned = True
+            path, ticket.path = ticket.path, None
+        if path is not None:
+            self.release(path)
 
     def release(self, path: Path) -> None:
         """재적재를 마치지 못한 파일을 다시 닫힌 파일로 돌려놓는다."""
@@ -406,6 +430,7 @@ class EvidenceRecorder:
         self._replaying: asyncio.Task[None] | None = None
         self._keys = SystemEventKeys()
         self._overflow_lock = asyncio.Lock()
+        self._pending_overflow: tuple[Overflow, Event] | None = None
 
     async def try_database(
         self,
@@ -433,19 +458,28 @@ class EvidenceRecorder:
         """DB에 쓰지 못한 사건을 버퍼에, 그것도 안 되면 표준 오류에 남긴다."""
         evidence = await self._write_local(event)
         if evidence is Evidence.BUFFER:
-            # 건수는 보고를 마칠 때까지 남겨 둔다. 보고하다 취소되면 다음 기록이 다시 보고한다.
-            async with self._overflow_lock:
-                overflow = self._buffer.peek_overflow()
-                if overflow is not None:
-                    await self._append_system(
-                        EventKind.BUFFER_OVERFLOW,
-                        {
-                            "dropped_events": overflow.dropped_events,
-                            "dropped_files": overflow.dropped_files,
-                        },
-                    )
-                    self._buffer.settle_overflow(overflow)
+            await self._report_overflow()
         return evidence
+
+    async def _report_overflow(self) -> None:
+        """건수는 보고를 마칠 때까지 남긴다. 보고하다 취소되면 같은 사건을 같은 키로 다시 보낸다."""
+        async with self._overflow_lock:
+            if self._pending_overflow is None:
+                overflow = self._buffer.peek_overflow()
+                if overflow is None:
+                    return
+                event = self._system_event(
+                    EventKind.BUFFER_OVERFLOW,
+                    {
+                        "dropped_events": overflow.dropped_events,
+                        "dropped_files": overflow.dropped_files,
+                    },
+                )
+                self._pending_overflow = (overflow, event)
+            overflow, event = self._pending_overflow
+            await self._store_system(event)
+            self._buffer.settle_overflow(overflow)
+            self._pending_overflow = None
 
     async def _write_local(self, event: Event) -> Evidence:
         try:
@@ -501,20 +535,14 @@ class EvidenceRecorder:
             )
 
     async def _take(self, candidate: Path) -> Path | None:
-        """파일을 인수한다. 기다리다 취소돼도 스레드가 인수한 파일은 돌려놓는다."""
-        task = asyncio.ensure_future(asyncio.to_thread(self._buffer.take, candidate))
+        """파일을 인수한다. 취소되거나 루프가 곧 끝나도 스레드가 인수한 파일은 돌려놓는다."""
+        ticket = TakeTicket()
+        task = asyncio.ensure_future(asyncio.to_thread(self._buffer.take, candidate, ticket))
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            task.add_done_callback(self._give_back)
+            self._buffer.abandon(ticket)
             raise
-
-    def _give_back(self, task: asyncio.Future[Path | None]) -> None:
-        if task.cancelled() or task.exception() is not None:
-            return
-        taken = task.result()
-        if taken is not None:
-            self._buffer.release(taken)
 
     def _schedule_replay(self) -> None:
         now = time.monotonic()
@@ -530,15 +558,20 @@ class EvidenceRecorder:
         except RuntimeError:
             return
 
-    async def _append_system(self, kind: EventKind, payload: dict[str, int]) -> None:
-        """시스템 사건도 DB → 버퍼 → 표준 오류 순서로 남긴다. 버퍼 넘침을 다시 알리지는 않는다."""
-        event = Event(
+    def _system_event(self, kind: EventKind, payload: dict[str, int]) -> Event:
+        return Event(
             instance_id=self._instance_id,
             inserted_at=_utcnow(),
             kind=kind,
             source_key=self._keys.next(kind),
             payload=payload,
         )
+
+    async def _append_system(self, kind: EventKind, payload: dict[str, int]) -> None:
+        await self._store_system(self._system_event(kind, payload))
+
+    async def _store_system(self, event: Event) -> None:
+        """시스템 사건도 DB → 버퍼 → 표준 오류 순서로 남긴다. 버퍼 넘침을 다시 알리지는 않는다."""
         if self._store is not None:
             try:
                 async with asyncio.timeout(self._budget):

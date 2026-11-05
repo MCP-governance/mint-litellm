@@ -585,15 +585,24 @@ class TestEvidenceRecorder:
         names = files(buffer._dir)
         assert len(names) == 3 and all(n.endswith(".jsonl") for n in names)
 
-    def test_cancelling_while_a_file_is_being_taken_gives_it_back(self, tmp_path):
+    @pytest.mark.parametrize("slow_part", ["before", "after"])
+    @pytest.mark.parametrize("wait_afterwards", [True, False], ids=["waits", "ends-at-once"])
+    def test_cancelling_while_a_file_is_being_taken_gives_it_back(
+        self, tmp_path, slow_part, wait_afterwards
+    ):
         store = FakeStore()
         rec, buffer = self.three_segments(tmp_path, store)
         real_take, started = buffer.take, threading.Event()
 
-        def slow_take(path):
+        def slow_take(path, ticket=None):
+            if slow_part == "before":
+                started.set()
+                time.sleep(0.3)
+                return real_take(path, ticket)
+            taken = real_take(path, ticket)
             started.set()
             time.sleep(0.3)
-            return real_take(path)
+            return taken
 
         buffer.take = slow_take
 
@@ -603,8 +612,10 @@ class TestEvidenceRecorder:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            await asyncio.sleep(0.6)
+            if wait_afterwards:
+                await asyncio.sleep(0.6)
 
+        # 기다리지 않으면 스레드가 끝나기 전에 루프가 닫힌다. 그래도 파일은 돌아와 있어야 한다.
         asyncio.run(scenario())
         names = files(buffer._dir)
         assert len(names) == 3 and all(n.endswith(".jsonl") for n in names)
@@ -641,6 +652,45 @@ class TestEvidenceRecorder:
         asyncio.run(rec.fallback(make_event(2)))
         (report,) = store.of_kind("buffer_overflow")
         assert report.payload == {"dropped_events": 5, "dropped_files": 2}
+        assert buffer.peek_overflow() is None
+
+    def test_a_report_cancelled_after_it_was_stored_is_retried_under_the_same_key(self, tmp_path):
+        class CommitsThenHangs(FakeStore):
+            hang = True
+
+            def __init__(self):
+                super().__init__()
+                self.entered = asyncio.Event()
+
+            async def insert_event(self, event, consume=None):
+                inserted = await super().insert_event(event, consume)
+                if self.hang and event.kind is EventKind.BUFFER_OVERFLOW:
+                    self.entered.set()
+                    await asyncio.sleep(60)
+                return inserted
+
+        store = CommitsThenHangs()
+        rec, buffer = recorder(tmp_path, store)
+        buffer._dropped_events, buffer._dropped_files = 5, 2
+
+        async def cancelled_report():
+            task = asyncio.create_task(rec.fallback(make_event(1)))
+            await store.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(cancelled_report())
+        buffer._dropped_events += 3
+        buffer._dropped_files += 1
+        store.hang = False
+        asyncio.run(rec.fallback(make_event(2)))
+        asyncio.run(rec.fallback(make_event(3)))
+        reports = sorted(store.of_kind("buffer_overflow"), key=lambda e: e.source_key)
+        payloads = sorted(
+            (e.payload["dropped_events"], e.payload["dropped_files"]) for e in reports
+        )
+        assert payloads == [(3, 1), (5, 2)]
         assert buffer.peek_overflow() is None
 
     def test_drops_counted_while_a_report_is_written_wait_for_the_next_one(self, tmp_path):
