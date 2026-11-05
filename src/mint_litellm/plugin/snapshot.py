@@ -1,0 +1,522 @@
+"""판정 스냅숏과 플러그인의 DB 접근.
+
+스냅숏은 한 번의 읽기 전용 REPEATABLE READ 트랜잭션에서 단일 질의로 읽는다. 상태 세대와
+서버·관계·승인·거부·호출별 승인·동의·설정·정책 판본이 같은 시점의 값이다. 캐시는 없다.
+LiteLLM의 표는 읽지 않는다.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+from uuid import UUID
+
+from mint_litellm.plugin.buffer import ConsumeRequest, ConsumptionLost
+from mint_litellm.types.events import Event
+from mint_litellm.types.identity import OrgStatus, SubjectType
+from mint_litellm.types.reason_codes import OBSERVATION_CANDIDATES, Reason
+from mint_litellm.types.settings import Mode
+
+SNAPSHOT_SQL = """
+WITH
+s AS (SELECT * FROM mint.settings WHERE instance_id = %(iid)s),
+srv AS (
+    SELECT * FROM mint.servers WHERE instance_id = %(iid)s AND server_id = %(server_id)s
+),
+b AS (
+    SELECT * FROM mint.org_bindings
+    WHERE instance_id = %(iid)s
+      AND ((subject_type = 'team' AND subject_id = %(team_id)s)
+        OR (subject_type = 'user' AND subject_id = %(user_id)s))
+),
+o AS (
+    SELECT org_id, status FROM mint.orgs
+    WHERE instance_id = %(iid)s
+      AND org_id IN (SELECT org_id FROM b UNION
+                     SELECT default_org_id FROM s WHERE default_org_id IS NOT NULL)
+),
+ap AS (
+    SELECT * FROM mint.approvals
+    WHERE instance_id = %(iid)s AND server_id = %(server_id)s AND status <> 'pending'
+      AND ((scope_type = 'key' AND scope_id = %(key_id)s)
+        OR (scope_type = 'user' AND scope_id = %(user_id)s)
+        OR (scope_type = 'team' AND scope_id = %(team_id)s)
+        OR (scope_type = 'org' AND scope_id IN (SELECT org_id FROM o)))
+)
+SELECT jsonb_build_object(
+    'now', now(),
+    'epoch', (SELECT epoch FROM mint.state_epoch WHERE instance_id = %(iid)s),
+    'settings', (SELECT to_jsonb(s) FROM s),
+    'bindings', (SELECT coalesce(jsonb_agg(to_jsonb(b)), '[]'::jsonb) FROM b),
+    'orgs', (SELECT coalesce(jsonb_agg(to_jsonb(o)), '[]'::jsonb) FROM o),
+    'server', (SELECT to_jsonb(srv) FROM srv),
+    'allowlists', (
+        SELECT coalesce(jsonb_agg(to_jsonb(a)), '[]'::jsonb) FROM mint.allowlists a
+        WHERE a.instance_id = %(iid)s AND a.id = ANY (SELECT unnest(basis_allowlist_ids) FROM srv)
+    ),
+    'relations', (
+        SELECT coalesce(jsonb_agg(to_jsonb(r)), '[]'::jsonb) FROM mint.usage_relations r
+        WHERE r.instance_id = %(iid)s AND r.id IN (SELECT relation_id FROM ap)
+    ),
+    'approvals', (SELECT coalesce(jsonb_agg(to_jsonb(ap)), '[]'::jsonb) FROM ap),
+    'denials', (
+        SELECT coalesce(jsonb_agg(to_jsonb(d)), '[]'::jsonb) FROM mint.denials d
+        WHERE d.instance_id = %(iid)s AND d.lifted_at IS NULL
+          AND (d.server_id IS NULL OR d.server_id = %(server_id)s)
+          AND ((d.scope_type = 'key' AND d.scope_id = %(key_id)s)
+            OR (d.scope_type = 'user' AND d.scope_id = %(user_id)s)
+            OR (d.scope_type = 'team' AND d.scope_id = %(team_id)s)
+            OR (d.scope_type = 'org' AND d.scope_id IN (SELECT org_id FROM o))
+            OR (d.scope_type = 'server' AND d.scope_id = %(server_id)s))
+    ),
+    'call_approvals', (
+        SELECT coalesce(jsonb_agg(to_jsonb(c)), '[]'::jsonb) FROM mint.call_approvals c
+        WHERE c.instance_id = %(iid)s AND c.status = 'approved'
+          AND c.server_id = %(server_id)s AND c.tool = %(tool)s
+          AND c.principal_id = %(principal_id)s
+    ),
+    'consents', (
+        SELECT coalesce(jsonb_agg(to_jsonb(k)), '[]'::jsonb) FROM mint.consents k
+        WHERE k.instance_id = %(iid)s AND k.server_id = %(server_id)s
+          AND k.human_user_id = %(user_id)s
+    ),
+    'policy_version', (
+        SELECT to_jsonb(p) FROM mint.policy_versions p
+        WHERE p.instance_id = %(iid)s AND p.status = 'active'
+    )
+) AS doc
+"""
+
+INSERT_EVENT_SQL = """
+INSERT INTO mint.events
+    (event_id, instance_id, inserted_at, kind, source_key, invocation_id, attempt_id,
+     actor, subject, payload)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (instance_id, source_key) DO NOTHING
+"""
+
+CONSUME_SQL = """
+UPDATE mint.call_approvals
+SET status = 'consumed', consumed_invocation_id = %(invocation_id)s
+WHERE instance_id = %(iid)s AND id = %(id)s AND status = 'approved'
+  AND expires_at > clock_timestamp()
+  AND principal_type = %(principal_type)s AND principal_id = %(principal_id)s
+  AND server_id = %(server_id)s AND tool = %(tool)s AND args_fp = %(args_fp)s
+  AND policy_version_id = %(policy_version_id)s AND contract_version IS NULL
+  AND state_version = %(state_version)s
+"""
+
+NEGATIVE_STATE_SQL = """
+SELECT
+    coalesce((SELECT status = 'revoked' FROM mint.approvals
+              WHERE instance_id = %(iid)s AND id = %(approval_id)s), false)
+ OR coalesce((SELECT status IN ('terminating', 'terminated') FROM mint.usage_relations
+              WHERE instance_id = %(iid)s AND id = %(relation_id)s), false)
+ OR coalesce((SELECT status IN ('rejected', 'suspended', 'terminating', 'terminated')
+              FROM mint.servers
+              WHERE instance_id = %(iid)s AND server_id = %(server_id)s), false)
+ OR EXISTS (
+        SELECT 1 FROM mint.denials d
+        WHERE d.instance_id = %(iid)s AND d.lifted_at IS NULL
+          AND (d.server_id IS NULL OR d.server_id = %(server_id)s)
+          AND (d.tools IS NULL OR %(tool)s = ANY (d.tools))
+          AND (d.org_id IS NULL OR d.org_id = %(org_id)s)
+          AND ((d.scope_type = 'key' AND d.scope_id = %(key_id)s)
+            OR (d.scope_type = 'user' AND d.scope_id = %(user_id)s)
+            OR (d.scope_type = 'team' AND d.scope_id = %(team_id)s)
+            OR (d.scope_type = 'org' AND d.scope_id = %(org_id)s)
+            OR (d.scope_type = 'server' AND d.scope_id = %(server_id)s)))
+"""
+
+
+def _time(value: Any) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _maybe_time(value: Any) -> datetime | None:
+    return None if value is None else _time(value)
+
+
+@dataclass(frozen=True)
+class SettingsRow:
+    mode: Mode = Mode.ENFORCE
+    observable_reasons: frozenset[Reason] = OBSERVATION_CANDIDATES
+    observable_policy_ids: frozenset[str] = frozenset()
+    default_org_id: str | None = None
+    settings_version: int | None = None
+
+
+@dataclass(frozen=True)
+class ServerRow:
+    id: str
+    server_id: str
+    status: str
+    url_sha256: str
+    transport: str
+    auth_type: str
+    basis_allowlist_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AllowlistRow:
+    id: str
+    kind: str
+    status: str
+    valid_from: datetime
+    valid_until: datetime
+
+
+@dataclass(frozen=True)
+class RelationRow:
+    id: str
+    status: str
+
+
+@dataclass(frozen=True)
+class ApprovalRow:
+    id: str
+    org_id: str
+    relation_id: str
+    approval_class: str
+    tools: tuple[str, ...]
+    scope_type: str
+    scope_id: str
+    valid_from: datetime
+    valid_until: datetime
+    conditions: Mapping[str, Any]
+    status: str
+
+
+@dataclass(frozen=True)
+class DenialRow:
+    id: str
+    org_id: str | None
+    scope_type: str
+    scope_id: str
+    server_id: str | None
+    tools: tuple[str, ...] | None
+
+
+@dataclass(frozen=True)
+class CallApprovalRow:
+    id: UUID
+    org_id: str
+    principal_type: str
+    principal_id: str
+    server_id: str
+    tool: str
+    args_fp: str
+    fp_key_version: int
+    policy_version_id: str
+    contract_version: str | None
+    expires_at: datetime
+    state_version: int
+
+
+@dataclass(frozen=True)
+class ConsentRow:
+    id: str
+    org_id: str
+    purpose: str
+    source: str
+    granted_at: datetime
+    valid_until: datetime
+    revoked_at: datetime | None
+
+
+@dataclass(frozen=True)
+class PolicyVersionRow:
+    id: str
+    bundle_sha256: str
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    now: datetime
+    epoch: int | None
+    settings: SettingsRow | None
+    bindings: Mapping[tuple[SubjectType, str], str]
+    org_status: Mapping[str, OrgStatus]
+    server: ServerRow | None
+    allowlists: Mapping[str, AllowlistRow]
+    relations: Mapping[str, RelationRow]
+    approvals: tuple[ApprovalRow, ...]
+    denials: tuple[DenialRow, ...]
+    call_approvals: tuple[CallApprovalRow, ...]
+    consents: tuple[ConsentRow, ...]
+    policy_version: PolicyVersionRow | None
+
+
+def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
+    """질의 결과 JSON을 값 객체로 바꾼다."""
+    settings = doc.get("settings")
+    server = doc.get("server")
+    policy = doc.get("policy_version")
+    return Snapshot(
+        now=_time(doc["now"]),
+        epoch=doc.get("epoch"),
+        settings=None
+        if settings is None
+        else SettingsRow(
+            mode=Mode(settings["mode"]),
+            observable_reasons=frozenset(Reason(r) for r in settings["observable_reasons"]),
+            observable_policy_ids=frozenset(settings["observable_policy_ids"]),
+            default_org_id=settings.get("default_org_id"),
+            settings_version=settings["settings_version"],
+        ),
+        bindings={
+            (SubjectType(b["subject_type"]), b["subject_id"]): b["org_id"] for b in doc["bindings"]
+        },
+        org_status={o["org_id"]: OrgStatus(o["status"]) for o in doc["orgs"]},
+        server=None
+        if server is None
+        else ServerRow(
+            id=server["id"],
+            server_id=server["server_id"],
+            status=server["status"],
+            url_sha256=server["url_sha256"],
+            transport=server["transport"],
+            auth_type=server["auth_type"],
+            basis_allowlist_ids=tuple(server["basis_allowlist_ids"]),
+        ),
+        allowlists={
+            a["id"]: AllowlistRow(
+                id=a["id"],
+                kind=a["kind"],
+                status=a["status"],
+                valid_from=_time(a["valid_from"]),
+                valid_until=_time(a["valid_until"]),
+            )
+            for a in doc["allowlists"]
+        },
+        relations={r["id"]: RelationRow(id=r["id"], status=r["status"]) for r in doc["relations"]},
+        approvals=tuple(
+            ApprovalRow(
+                id=a["id"],
+                org_id=a["org_id"],
+                relation_id=a["relation_id"],
+                approval_class=a["class"],
+                tools=tuple(a["tools"]),
+                scope_type=a["scope_type"],
+                scope_id=a["scope_id"],
+                valid_from=_time(a["valid_from"]),
+                valid_until=_time(a["valid_until"]),
+                conditions=a["conditions"],
+                status=a["status"],
+            )
+            for a in doc["approvals"]
+        ),
+        denials=tuple(
+            DenialRow(
+                id=d["id"],
+                org_id=d["org_id"],
+                scope_type=d["scope_type"],
+                scope_id=d["scope_id"],
+                server_id=d["server_id"],
+                tools=None if d["tools"] is None else tuple(d["tools"]),
+            )
+            for d in doc["denials"]
+        ),
+        call_approvals=tuple(
+            CallApprovalRow(
+                id=UUID(c["id"]),
+                org_id=c["org_id"],
+                principal_type=c["principal_type"],
+                principal_id=c["principal_id"],
+                server_id=c["server_id"],
+                tool=c["tool"],
+                args_fp=c["args_fp"],
+                fp_key_version=c["fp_key_version"],
+                policy_version_id=c["policy_version_id"],
+                contract_version=c["contract_version"],
+                expires_at=_time(c["expires_at"]),
+                state_version=c["state_version"],
+            )
+            for c in doc["call_approvals"]
+        ),
+        consents=tuple(
+            ConsentRow(
+                id=k["id"],
+                org_id=k["org_id"],
+                purpose=k["purpose"],
+                source=k["source"],
+                granted_at=_time(k["granted_at"]),
+                valid_until=_time(k["valid_until"]),
+                revoked_at=_maybe_time(k["revoked_at"]),
+            )
+            for k in doc["consents"]
+        ),
+        policy_version=None
+        if policy is None
+        else PolicyVersionRow(id=policy["id"], bundle_sha256=policy["bundle_sha256"]),
+    )
+
+
+@dataclass(frozen=True)
+class SnapshotQuery:
+    instance_id: str
+    server_id: str
+    tool: str
+    principal_id: str | None
+    key_id: str | None
+    user_id: str | None
+    team_id: str | None
+
+
+@dataclass(frozen=True)
+class NegativeStateQuery:
+    instance_id: str
+    server_id: str
+    tool: str
+    key_id: str | None
+    user_id: str | None
+    team_id: str | None
+    org_id: str | None
+    approval_id: str | None
+    relation_id: str | None
+
+
+@dataclass(frozen=True)
+class RegisteredServer:
+    server_id: str
+    status: str
+    url_sha256: str
+    transport: str
+    auth_type: str
+
+
+@dataclass
+class PluginDatabase:
+    """판정 프로세스 전용 연결. 상태 표 조회와 사건 추가, 호출별 승인 소비만 한다."""
+
+    dsn: str
+    max_size: int = 8
+    acquire_timeout: float = 0.3
+    _pool: Any = field(default=None, init=False, repr=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+
+    async def _connection(self):
+        if self._pool is None:
+            async with self._lock:
+                if self._pool is None:
+                    from psycopg_pool import AsyncConnectionPool
+
+                    pool = AsyncConnectionPool(
+                        self.dsn,
+                        min_size=1,
+                        max_size=self.max_size,
+                        kwargs={"autocommit": True},
+                        open=False,
+                        timeout=self.acquire_timeout,
+                    )
+                    await pool.open()
+                    self._pool = pool
+        return self._pool.connection()
+
+    async def close(self) -> None:
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            await pool.close()
+
+    async def read_snapshot(self, query: SnapshotQuery) -> Snapshot:
+        from psycopg import IsolationLevel
+
+        params = {
+            "iid": query.instance_id,
+            "server_id": query.server_id,
+            "tool": query.tool,
+            "principal_id": query.principal_id,
+            "key_id": query.key_id,
+            "user_id": query.user_id,
+            "team_id": query.team_id,
+        }
+        async with await self._connection() as conn:
+            await conn.set_isolation_level(IsolationLevel.REPEATABLE_READ)
+            await conn.set_read_only(True)
+            async with conn.transaction():
+                cursor = await conn.execute(SNAPSHOT_SQL, params)
+                row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("snapshot query returned no row")
+        return parse_snapshot(row[0])
+
+    async def insert_event(self, event: Event, consume: ConsumeRequest | None = None) -> bool:
+        from psycopg.types.json import Jsonb
+
+        async with await self._connection() as conn:
+            await conn.set_isolation_level(None)
+            await conn.set_read_only(False)
+            async with conn.transaction():
+                cursor = await conn.execute(
+                    INSERT_EVENT_SQL,
+                    (
+                        event.event_id,
+                        event.instance_id,
+                        event.inserted_at,
+                        event.kind.value,
+                        event.source_key,
+                        event.invocation_id,
+                        event.attempt_id,
+                        event.actor,
+                        None if event.subject is None else Jsonb(event.subject),
+                        Jsonb(event.payload),
+                    ),
+                )
+                inserted = cursor.rowcount == 1
+                if consume is not None:
+                    cursor = await conn.execute(
+                        CONSUME_SQL,
+                        {
+                            "iid": event.instance_id,
+                            "id": consume.call_approval_id,
+                            "invocation_id": consume.invocation_id,
+                            "principal_type": consume.principal_type,
+                            "principal_id": consume.principal_id,
+                            "server_id": consume.server_id,
+                            "tool": consume.tool,
+                            "args_fp": consume.args_fp,
+                            "policy_version_id": consume.policy_version_id,
+                            "state_version": consume.state_version,
+                        },
+                    )
+                    if cursor.rowcount != 1:
+                        raise ConsumptionLost
+        return inserted
+
+    async def read_epoch(self, instance_id: str) -> int | None:
+        async with await self._connection() as conn:
+            cursor = await conn.execute(
+                "SELECT epoch FROM mint.state_epoch WHERE instance_id = %s", (instance_id,)
+            )
+            row = await cursor.fetchone()
+        return None if row is None else row[0]
+
+    async def has_negative_state(self, query: NegativeStateQuery) -> bool:
+        params = {
+            "iid": query.instance_id,
+            "server_id": query.server_id,
+            "tool": query.tool,
+            "key_id": query.key_id,
+            "user_id": query.user_id,
+            "team_id": query.team_id,
+            "org_id": query.org_id,
+            "approval_id": query.approval_id,
+            "relation_id": query.relation_id,
+        }
+        async with await self._connection() as conn:
+            cursor = await conn.execute(NEGATIVE_STATE_SQL, params)
+            row = await cursor.fetchone()
+        return bool(row and row[0])
+
+    async def registered_servers(self, instance_id: str) -> Sequence[RegisteredServer]:
+        async with await self._connection() as conn:
+            cursor = await conn.execute(
+                "SELECT server_id, status, url_sha256, transport, auth_type"
+                " FROM mint.servers WHERE instance_id = %s ORDER BY server_id",
+                (instance_id,),
+            )
+            rows = await cursor.fetchall()
+        return [RegisteredServer(*row) for row in rows]
