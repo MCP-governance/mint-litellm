@@ -49,6 +49,8 @@ jobs:
         timeout-minutes: 15
       - name: 인수시험
         run: uv run --no-sync pytest tests/integration -ra --durations=15
+        env:
+          MINT_INTEGRATION_REQUIRED: "1"
         timeout-minutes: 40
       - name: 실패 시 컨테이너 로그 수집
         if: failure()

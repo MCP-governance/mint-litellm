@@ -52,12 +52,19 @@ def _readiness() -> dict[str, bool]:
     return result
 
 
+def _unready(message: str) -> None:
+    """CI(MINT_INTEGRATION_REQUIRED 설정)에서는 준비 실패를 실패로, 로컬에서는 건너뛰기로 처리한다."""
+    if os.environ.get("MINT_INTEGRATION_REQUIRED"):
+        pytest.fail(message, pytrace=False)
+    pytest.skip(message)
+
+
 @pytest.fixture(scope="session")
 def stack():
     status = _readiness()
     missing = [name for name, ok in status.items() if not ok]
     if missing:
-        pytest.skip(f"통합 스택이 준비되지 않음: {', '.join(missing)}")
+        _unready(f"통합 스택이 준비되지 않음: {', '.join(missing)}")
     return status
 
 
@@ -105,7 +112,7 @@ def plain(stack):
     except httpx.HTTPError:
         ready = False
     if not ready:
-        pytest.skip("순정 LiteLLM(프로필 plain)이 떠 있지 않음")
+        _unready("순정 LiteLLM(프로필 plain)이 떠 있지 않음")
     return port
 
 
