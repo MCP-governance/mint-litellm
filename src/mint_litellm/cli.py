@@ -27,6 +27,7 @@ from mint_litellm.control import (
     litellm_config,
     operators,
     orgs,
+    policy_check,
     policy_versions,
     relations,
     secrets_file,
@@ -220,6 +221,9 @@ def _check(run: Run) -> None:
         _optional_litellm(run),
         replicas=run.cfg.replicas,
         registered_servers=registered,
+        policy_state=policy_check.verify_active_policy(
+            run.conn, ctx.instance_id, run.environ.get("MINT_OPA_URL")
+        ),
     )
     run.data.update(
         findings=[
@@ -243,6 +247,9 @@ def _status(run: Run) -> None:
         _optional_litellm(run),
         litellm_config.load_config(_config_path(run)),
         _gather_env(run),
+        policy_check.verify_active_policy(
+            run.conn, run.context().instance_id, run.environ.get("MINT_OPA_URL")
+        ),
     )
     run.data.update(info)
     run.say(status.render(info))

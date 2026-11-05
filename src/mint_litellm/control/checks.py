@@ -12,12 +12,17 @@ from typing import Any
 
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
 from mint_litellm.control.litellm_config import GUARDRAIL_MODES
+from mint_litellm.control.policy_check import PolicyState
 from mint_litellm.types.decision import normalize_auth_type, url_sha256
 from mint_litellm.types.settings import OBSERVATION_ITEMS, SETTINGS_TABLE, SettingGrade
 
 _DISCOVERY_AUTH = frozenset({"oauth2", "true_passthrough", "oauth_delegate"})
 _ROWS = {row.key: row for row in SETTINGS_TABLE}
 _OPTOUT_KEYS = ("opted_out_global_guardrails", "disable_global_guardrails")
+
+# 설정 표에는 없지만 필수로 취급하는 점검 항목
+POLICY_ITEM = "정책 번들 내용"
+EXTRA_REQUIRED = frozenset({POLICY_ITEM})
 
 # 호환 계층이 쓰는 LiteLLM 비공개 심볼: (모듈, 객체, 속성)
 COMPAT_SYMBOLS: tuple[tuple[str, str | None, str | None], ...] = (
@@ -60,8 +65,8 @@ class Report:
             f.item
             for f in self.findings
             if f.level is Level.SKIP
-            and f.item in _ROWS
-            and _ROWS[f.item].grade is SettingGrade.REQUIRED
+            and (f.item in EXTRA_REQUIRED
+                 or (f.item in _ROWS and _ROWS[f.item].grade is SettingGrade.REQUIRED))
         ]
 
     def render(self) -> str:
@@ -110,6 +115,7 @@ def run_checks(
     *,
     replicas: int = 1,
     registered_servers: list[dict] | None = None,
+    policy_state: PolicyState | None = None,
     compat_probe: Callable[[], list[str] | None] = probe_compat_symbols,
 ) -> Report:
     report = Report()
@@ -147,6 +153,8 @@ def run_checks(
             report.add("guardrails[MINT]", Level.SKIP,
                        "실행 중인 LiteLLM의 가드레일 등록을 확인하지 못했습니다(관리 API 없음).")
 
+    if policy_state is not None:
+        _policy_finding(report, policy_state)
     missing = compat_probe()
     if missing is None:
         report.add("호환 계층 비공개 심볼", Level.SKIP,
@@ -373,3 +381,14 @@ def _check_guardrail_registered(report, litellm: LiteLLMAdmin, config: Mapping[s
             problems.append(f"{name}: 실행 중인 모드·default_on이 설정 파일과 다릅니다")
     if problems:
         report.add("guardrails[MINT]", Level.FAIL, "; ".join(problems))
+
+
+def _policy_finding(report: Report, state: PolicyState) -> None:
+    if state.state == "match":
+        report.add(POLICY_ITEM, Level.OK, f"판본 {state.version}")
+    elif state.state == "none":
+        report.add(POLICY_ITEM, Level.WARN, state.detail)
+    elif state.state == "mismatch":
+        report.add(POLICY_ITEM, Level.FAIL, state.detail)
+    else:
+        report.add(POLICY_ITEM, Level.SKIP, state.detail)

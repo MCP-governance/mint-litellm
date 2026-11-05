@@ -8,6 +8,7 @@ from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
+from mint_litellm.control.policy_check import PolicyState
 from mint_litellm.types.events import AlertKind
 from mint_litellm.types.settings import OBSERVATION_ITEMS, Mode, effective_mode
 
@@ -20,6 +21,7 @@ def collect(
     litellm: LiteLLMAdmin | None,
     config: dict | None,
     env: dict[str, str],
+    policy_state: PolicyState | None = None,
 ) -> dict[str, Any]:
     stored = settings_store.load(ctx.conn, ctx.instance_id)
     active = fetchone(
@@ -46,6 +48,8 @@ def collect(
         for a in approvals.expiring_approvals(ctx, EXPIRY_WARNING)
     ]
     alerts.extend(_mismatch_alerts(ctx))
+    if policy_state is not None and policy_state.state == "mismatch":
+        alerts.append({"kind": "policy_bundle_mismatch", "version": policy_state.version})
     observations: dict[str, Any] = {}
     if litellm is not None:
         report = checks.run_checks(config, env, litellm, replicas=cfg.replicas,
@@ -71,6 +75,9 @@ def collect(
         },
         "default_org_id": stored["default_org_id"],
         "policy_version": None if active is None else active["id"],
+        "policy_bundle": None
+        if policy_state is None
+        else {"state": policy_state.state, "detail": policy_state.detail},
         "servers": servers,
         "alerts": alerts,
         "observations": {name: observations.get(name, "확인 불가") for name in OBSERVATION_ITEMS},
@@ -114,6 +121,11 @@ def render(info: dict[str, Any]) -> str:
     for alert in info["alerts"]:
         detail = {k: v for k, v in alert.items() if k != "kind"}
         lines.append(f"  {alert['kind']} {detail}")
+    bundle = info.get("policy_bundle")
+    if bundle and bundle["state"] != "none":
+        label = {"match": "일치", "mismatch": "불일치", "unverified": "확인 불가"}[bundle["state"]]
+        detail = f" ({bundle['detail']})" if bundle["detail"] else ""
+        lines.append(f"정책 번들 내용: {label}{detail}")
     lines.append("관측 항목")
     lines.extend(f"  {k}: {v}" for k, v in info["observations"].items())
     return "\n".join(lines)

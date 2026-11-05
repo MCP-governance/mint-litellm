@@ -116,7 +116,7 @@
 | --- | --- |
 | `init` | `migrations`(이번에 적용한 마이그레이션), `login_roles`(설정한 로그인 역할), `snippet_path`(설정 조각 파일) 또는 `snippet`(`--out -`일 때 본문) |
 | `check` | `incomplete`(확인하지 못한 필수 행), `findings`(각 항목 `item`, `level`=`OK`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
-| `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `servers`(상태별 개수), `alerts`, `observations` |
+| `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `policy_bundle`(`state`: `match`·`mismatch`·`unverified`·`none`, `detail`), `servers`(상태별 개수), `alerts`, `observations` |
 | `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`) |
 
 ## 종료 코드
@@ -130,6 +130,10 @@
 | 4 | 인증 실패: 토큰이 없거나 틀렸거나 만료됨, 역할 부족 |
 
 `check`는 필수 설정이 하나라도 어긋나면 1로 끝나고, 어긋남은 없지만 필수 행을 확인하지 못했으면 3으로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다. 변경 명령은 한 트랜잭션에서 상태와 사건을 함께 기록하므로, 0이 아닌 코드로 끝난 명령은 아무것도 바꾸지 않는다.
+
+## 정책 번들 내용 대조
+
+`check`와 `status`는 활성 정책 판본의 번들 해시를 정책 엔진(`MINT_OPA_URL`)이 실제로 적재한 규칙 원문과 정책 데이터에서 다시 계산해 등록된 값과 대조한다. 다르면 `check`는 필수 실패(종료 코드 1)로 끝나고 `status`는 경보를 표시한다. 정책 엔진에서 적재 내용을 읽지 못하면 필수 행을 확인하지 못한 것이므로 `check`는 종료 코드 3으로 끝난다. 활성 판본이 없으면 경고만 한다. 대조 시점 사이에 정책 엔진의 내용이 바뀌면 다음 대조까지 알 수 없다.
 
 ## 호출별 승인의 인자 지문
 
