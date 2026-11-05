@@ -989,6 +989,31 @@ class TestLoggerRegistration:
         )
         assert check.ok, check
 
+    def test_a_lookalike_internal_hook_or_a_string_callback_after_the_guardrail_fails(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        import litellm
+        from litellm.integrations.custom_logger import CustomLogger
+
+        from mint_litellm.compat import litellm_1_106 as compat
+        from mint_litellm.plugin.selfcheck import order_check
+
+        class ResponsesIDSecurity(CustomLogger):
+            async def async_pre_call_hook(self, *args, **kwargs):
+                return None
+
+        rig = ChainRunner().build_rig(tmp_path, monkeypatch, contract_snapshot)
+        for extra in (ResponsesIDSecurity(), "banned_keywords"):
+            litellm.callbacks.append(extra)
+            check = order_check(
+                litellm.callbacks,
+                compat.is_pre_call_hook,
+                logger=rig.logger,
+                guardrail=rig.guardrail,
+            )
+            assert not check.ok and check.offenders == (compat.class_name(extra),)
+            litellm.callbacks.remove(extra)
+
 
 class TestCallbacksAddedAfterStartup(ChainRunner):
     def test_a_guardrail_added_later_blocks_the_next_call_with_one_event(

@@ -284,7 +284,13 @@ LITELLM_INTERNAL_PRE_HOOKS: frozenset[str] = frozenset(
 
 
 def class_name(callback: Any) -> str:
-    return type(callback).__name__
+    return callback if isinstance(callback, str) else type(callback).__name__
+
+
+def is_internal_pre_hook(callback: Any) -> bool:
+    """LiteLLM 패키지에 정의된 고정 목록의 내부 훅인지(같은 이름의 사용자 클래스는 아니다)."""
+    cls = type(callback)
+    return cls.__name__ in LITELLM_INTERNAL_PRE_HOOKS and cls.__module__.startswith("litellm.")
 
 
 def is_pre_call_hook(callback: Any) -> bool:
@@ -298,6 +304,9 @@ def is_pre_call_hook(callback: Any) -> bool:
         from litellm.integrations.custom_logger import CustomLogger
     except ImportError:
         return False
+    if isinstance(callback, str):
+        # LiteLLM은 순회 때 문자열을 로거로 풀어 훅을 부른다. 무엇이 될지 모르므로 훅으로 본다.
+        return True
     if not isinstance(callback, CustomLogger):
         return False
     if isinstance(callback, CustomGuardrail):

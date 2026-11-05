@@ -129,12 +129,13 @@ def order_check(
         return OrderCheck(
             False, names, "the MINT logger must sit directly before the MINT guardrail"
         )
-    permitted = compat.LITELLM_INTERNAL_PRE_HOOKS | allowed
     names = tuple(
         dict.fromkeys(
             compat.class_name(cb)
             for cb in items[g_pos + 1 :]
-            if is_pre_hook(cb) and compat.class_name(cb) not in permitted
+            if is_pre_hook(cb)
+            and not compat.is_internal_pre_hook(cb)
+            and compat.class_name(cb) not in allowed
         )
     )
     if names:

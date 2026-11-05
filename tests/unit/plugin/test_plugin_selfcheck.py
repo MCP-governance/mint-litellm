@@ -64,7 +64,9 @@ class FakePassive:
 
 
 def hook(name):
-    return type(name, (FakeHook,), {})()
+    """이름이 내부 훅 목록에 있으면 LiteLLM 패키지에 정의된 것처럼 만든다."""
+    namespace = {"__module__": "litellm.proxy.hooks.stand_in"} if name in INTERNAL else {}
+    return type(name, (FakeHook,), namespace)()
 
 
 def guardrail(**override):
