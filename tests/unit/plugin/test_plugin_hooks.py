@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -288,6 +289,70 @@ class TestGuardrailJudgment:
         data = synthesized(logging_obj(), mcp_arguments=original)
         assert blocked(lambda: pre(runtime.guardrail, data)).code == "MINT-SCHEMA-ERROR"
         assert snapshots.queries == []
+
+    @staticmethod
+    def timing_lines(caplog):
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith("decision_ms=")]
+
+    def test_at_debug_level_a_call_leaves_one_timing_line_with_its_decision_ref(
+        self, tmp_path, contract_snapshot, caplog
+    ):
+        import re
+
+        runtime, store, _ = build_runtime(tmp_path, contract_snapshot)
+        with caplog.at_level(logging.DEBUG, logger="mint_litellm.guardrail"):
+            pre(runtime.guardrail, synthesized(logging_obj()))
+        (line,) = self.timing_lines(caplog)
+        found = re.fullmatch(r"decision_ms=(\d+\.\d{3}) ref=(\S+) allowed=true", line)
+        assert found and float(found[1]) >= 0
+        (event,) = store.of_kind("decision_evaluated")
+        assert found[2] == event.payload["decision_ref"]
+
+    def test_the_timing_covers_the_pre_record_and_the_blocked_calls_too(
+        self, tmp_path, contract_snapshot, caplog
+    ):
+        runtime, store, _ = build_runtime(tmp_path, contract_snapshot)
+        commit = store.insert_event
+
+        async def slow_insert(event, consume=None):
+            await asyncio.sleep(0.05)
+            return await commit(event, consume)
+
+        store.insert_event = slow_insert
+        master = UserAPIKeyAuth(api_key="litellm_proxy_master_key", user_id="default_user_id")
+        with caplog.at_level(logging.DEBUG, logger="mint_litellm.guardrail"):
+            blocked(lambda: pre(runtime.guardrail, synthesized(logging_obj()), user=master))
+        (line,) = self.timing_lines(caplog)
+        assert "allowed=false" in line and "ref=None" not in line
+        assert float(line.split()[0].split("=")[1]) >= 45
+
+    def test_an_internal_error_is_timed_without_a_reference(
+        self, tmp_path, contract_snapshot, caplog
+    ):
+        runtime, _, _ = build_runtime(tmp_path, contract_snapshot)
+
+        async def explode(data, auth):
+            raise RuntimeError("boom")
+
+        runtime.judge_call = explode
+        with caplog.at_level(logging.DEBUG, logger="mint_litellm.guardrail"):
+            blocked(lambda: pre(runtime.guardrail, synthesized(logging_obj())))
+        (line,) = self.timing_lines(caplog)
+        assert line.endswith("ref=None allowed=false")
+
+    def test_without_debug_nothing_is_timed_or_logged(
+        self, tmp_path, contract_snapshot, caplog, monkeypatch
+    ):
+        from mint_litellm.plugin import guardrail as guardrail_module
+
+        def forbidden():
+            raise AssertionError("the clock must not be read when DEBUG is off")
+
+        monkeypatch.setattr(guardrail_module.time, "perf_counter", forbidden)
+        runtime, _, _ = build_runtime(tmp_path, contract_snapshot)
+        with caplog.at_level(logging.INFO, logger="mint_litellm.guardrail"):
+            assert pre(runtime.guardrail, synthesized(logging_obj())) is None
+        assert self.timing_lines(caplog) == []
 
     def test_an_external_cancel_is_not_turned_into_a_block_and_leaves_one_cancelled_event(
         self, tmp_path, contract_snapshot

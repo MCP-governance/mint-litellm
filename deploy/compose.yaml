@@ -53,6 +53,7 @@ services:
       MINT_DECISION_BUDGET_MS: ${MINT_DECISION_BUDGET_MS:-300}
       MINT_READINESS_URL: http://localhost:4000/health/readiness
       MINT_SELFCHECK_GRACE_SECONDS: ${MINT_SELFCHECK_GRACE_SECONDS:-30}
+      MINT_LOG_LEVEL: ${MINT_LOG_LEVEL:-}
     ports:
       - "${MINT_LITELLM_PORT:-4000}:4000"
     volumes:
