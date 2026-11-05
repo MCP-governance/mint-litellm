@@ -713,16 +713,26 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
         user_id=principal.user_id,
         team_id=principal.team_id,
     )
-    try:
-        async with asyncio.timeout(run.deadline.remaining()):
-            snapshot = await deps.snapshots.read_snapshot(query)
-    except Exception as exc:
-        log.debug(
-            "스냅숏 조회 실패: %s sqlstate=%s", type(exc).__name__, getattr(exc, "sqlstate", None)
-        )
-        stages.dependency = Dependency.DB
-        stages.add(Stage.SNAPSHOT, StageResult.stop(Reason.DEPENDENCY_FAILURE))
-        return
+    snapshot: Snapshot | None = None
+    for attempt in (1, 2):
+        try:
+            async with asyncio.timeout(run.deadline.remaining()):
+                snapshot = await deps.snapshots.read_snapshot(query)
+            break
+        except Exception as exc:
+            log.debug(
+                "스냅숏 조회 실패(%d): %s sqlstate=%s",
+                attempt,
+                type(exc).__name__,
+                getattr(exc, "sqlstate", None),
+            )
+            # 조회는 읽기 전용이라 다시 읽어도 안전하다. 풀에서 나온 끊어진 연결 같은 일시 오류는
+            # 같은 예산 안에서 한 번 흡수한다. 시간 초과나 남은 예산이 없으면 다시 읽지 않는다.
+            if attempt == 2 or isinstance(exc, TimeoutError) or run.deadline.remaining() <= 0:
+                stages.dependency = Dependency.DB
+                stages.add(Stage.SNAPSHOT, StageResult.stop(Reason.DEPENDENCY_FAILURE))
+                return
+    assert snapshot is not None
     stages.add(Stage.SNAPSHOT, StageResult.passed())
     run.snapshot = snapshot
     run.evaluated_at = snapshot.now

@@ -862,3 +862,62 @@ def test_a_call_to_a_silent_database_is_blocked_as_a_dependency_failure_at_the_b
     assert warm.allowed
     assert not outcome.allowed and outcome.error.code == "MINT-DEPENDENCY-DB"
     assert outcome.error.retry_safe and seconds < 1.5, seconds
+
+
+def test_the_loser_of_a_concurrent_consumption_is_always_blocked_as_already_consumed(
+    scenario, plugin_dsn, tmp_path
+):
+    """복제본 둘이 같은 호출별 승인을 동시에 소비하면 진 쪽은 승인 요구로 막힌다(의존 장애가 아니다)."""
+    rounds = 20
+    approvals = [uuid.uuid4() for _ in range(rounds)]
+    for call_id in approvals:
+        scenario.add_call_approval(call_id)
+
+    def replica(name):
+        live = database(plugin_dsn, max_size=4, acquire_timeout=0.5)
+        recorder = EvidenceRecorder(
+            live,
+            LocalBuffer(tmp_path / name / "buffer", 1024 * 1024),
+            budget_seconds=0.5,
+            instance_id=scenario.iid,
+            stderr=io.StringIO(),
+        )
+        deps = PipelineDeps(
+            config=config(tmp_path / name, instance_id=scenario.iid, decision_budget_seconds=0.5),
+            snapshots=live,
+            recorder=recorder,
+            evaluate=evaluator(
+                "RequireApproval", policy_ids=("R2",), version="pv1", bundle="2" * 64
+            ),
+            verified=lambda: True,
+        )
+        return live, deps
+
+    async def go():
+        (first, deps_first), (second, deps_second) = replica("a"), replica("b")
+        principal = user_principal(instance_id=scenario.iid)
+        outcomes = []
+        try:
+            for _ in range(rounds):
+                outcomes.append(
+                    await asyncio.gather(
+                        evaluate_request(request(principal), deps_first),
+                        evaluate_request(request(principal), deps_second),
+                    )
+                )
+        finally:
+            await first.close()
+            await second.close()
+        return outcomes
+
+    outcomes = run(go())
+    for pair in outcomes:
+        assert sorted(o.allowed for o in pair) == [False, True]
+        (loser,) = [o for o in pair if not o.allowed]
+        assert loser.error.code == "MINT-CALL-APPROVAL-REQUIRED"
+        assert not loser.error.retry_safe
+    consumed = scenario.conn.execute(
+        "SELECT count(*) FROM mint.call_approvals WHERE instance_id = %s AND status = 'consumed'",
+        (scenario.iid,),
+    ).fetchone()
+    assert consumed == (rounds,)
