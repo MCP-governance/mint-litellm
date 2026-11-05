@@ -13,8 +13,6 @@ import yaml
 
 from mint_litellm.control.errors import ControlError
 
-LOADER_SYMBOL = "litellm.proxy.proxy_server.ProxyConfig._get_config_from_file"
-
 
 def _loader() -> Any | None:
     try:
@@ -22,10 +20,6 @@ def _loader() -> Any | None:
     except Exception:  # LiteLLM이 없거나 불러오지 못하면 로더가 없는 것이다.
         return None
     return getattr(ProxyConfig(), "_get_config_from_file", None)
-
-
-def loader_available() -> bool:
-    return _loader() is not None
 
 
 def load_effective_config(path: Path, *, require_loader: bool) -> dict[str, Any]:

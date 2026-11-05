@@ -57,6 +57,12 @@ def activate(
     async def publish(archive: bytes) -> None:
         policy_bundle.publish_bundle(source.bundle_path, archive)
 
+    async def keep(active_version: str, active_sha: str) -> None:
+        policy_bundle.keep_active_bundle(source.bundle_path, active_version, active_sha)
+
+    async def restore(active_version: str, active_sha: str) -> bool:
+        return policy_bundle.restore_bundle(source.bundle_path, active_version, active_sha)
+
     async def run() -> None:
         async with await psycopg.AsyncConnection.connect(database_url) as aconn:
             if row is None:
@@ -74,14 +80,41 @@ def activate(
                 publish=publish,
                 opa_url=source.opa_url,
                 timeout_seconds=source.timeout_seconds,
+                keep=keep,
+                restore=restore,
             )
 
     try:
         asyncio.run(run(), loop_factory=asyncio.SelectorEventLoop)
-    except TimeoutError:
-        raise ControlError(
+    except TimeoutError as error:
+        raise ActivationError(
             "정책 엔진이 시간 안에 새 번들을 적재하지 않았습니다. 판본은 활성화되지 않았으며 "
-            "같은 명령으로 다시 시도할 수 있습니다."
+            "같은 명령으로 다시 시도할 수 있습니다.",
+            restore_outcome(error),
         ) from None
-    except (ValueError, OSError, httpx.HTTPError) as error:
-        raise ControlError(f"정책 활성화에 실패했습니다: {error}") from None
+    except (
+        asyncio.CancelledError, ValueError, OSError, httpx.HTTPError, psycopg.Error
+    ) as error:
+        message = f"정책 활성화에 실패했습니다: {error}"
+        raise ActivationError(message, restore_outcome(error)) from None
+
+
+class ActivationError(ControlError):
+    """활성화 실패. ``restore_outcome``은 직전 번들을 되돌린 결과(알 수 없으면 None)이다."""
+
+    def __init__(self, message: str, outcome: str | None) -> None:
+        suffix = f" 직전 번들: {outcome}." if outcome else ""
+        super().__init__(message + suffix)
+        self.restore_outcome = outcome
+
+
+def restore_outcome(error: BaseException | None) -> str | None:
+    """복원 결과. 취소는 ``CancelledError.restore_outcome``, 바깥 제한은 ``__cause__``에 있다."""
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        outcome = getattr(error, "restore_outcome", None)
+        if outcome:
+            return str(outcome)
+        seen.add(id(error))
+        error = error.__cause__ or error.__context__
+    return None

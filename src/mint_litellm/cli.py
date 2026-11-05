@@ -380,9 +380,16 @@ def _policy_activate(run: Run) -> None:
     )
     if not source.opa_url:
         raise ControlError("--opa-url 또는 MINT_OPA_URL이 필요합니다.")
-    policy_versions.activate(
-        run.conn, run.cfg.require_database(), ctx.instance_id, ctx.operator.name, a.version, source
-    )
+    try:
+        policy_versions.activate(
+            run.conn, run.cfg.require_database(), ctx.instance_id, ctx.operator.name, a.version,
+            source,
+        )
+    except policy_versions.ActivationError as error:
+        run.data.update(id=a.version, restore_outcome=error.restore_outcome)
+        run.failure = str(error)
+        return
+    run.data["restore_outcome"] = None
     run.conn.commit()
     row = fetchone(
         run.conn,

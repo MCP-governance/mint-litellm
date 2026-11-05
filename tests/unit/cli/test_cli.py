@@ -657,3 +657,74 @@ def test_status_shows_the_latest_enforcement_state_per_worker(mint):
     states = {s["worker_id"]: s for s in json.loads(out)["enforcement"]}
     assert states["w1"]["passed"] is False and states["w1"]["hooks"] == ["Rogue"]
     assert states["w1"]["cause"] == "callbacks_changed"
+
+
+def test_policy_activate_reports_the_restore_outcome_when_it_fails(mint, monkeypatch):
+    from mint_litellm.control import policy_versions
+
+    boss = bootstrap(mint)
+
+    def failing(*args, **kwargs):
+        raise policy_versions.ActivationError("정책 활성화에 실패했습니다: x", "restored")
+
+    monkeypatch.setattr(policy_versions, "activate", failing)
+    mint.env["MINT_OPA_URL"] = "http://opa.test:8181"
+    code, out, err = mint.run("--json", "policy", "activate", "v9", token=boss)
+    result = json.loads(out)
+    assert code == 1 and result["ok"] is False and result["restore_outcome"] == "restored"
+    assert "직전 번들: restored" in err
+
+
+def test_policy_activate_success_reports_no_restore_outcome(mint, monkeypatch):
+    from mint_litellm.control import policy_versions
+
+    boss = bootstrap(mint)
+    monkeypatch.setattr(policy_versions, "activate", lambda *a, **k: None)
+    mint.env["MINT_OPA_URL"] = "http://opa.test:8181"
+    code, out, _ = mint.run("--json", "policy", "activate", "v9", token=boss)
+    result = json.loads(out)
+    assert code == 0 and result["ok"] is True and result["restore_outcome"] is None
+
+
+def test_status_keeps_every_worker_even_when_another_floods_the_log(mint):
+    boss = bootstrap(mint)
+    add_event(mint, "enforcement_verified", "selfcheck:old1:1:enforcement_verified",
+              {"worker_id": "quiet", "allowed_hooks_used": []}, 5000)
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        conn.execute(
+            "INSERT INTO mint.events (event_id, instance_id, kind, source_key, inserted_at,"
+            " payload) SELECT gen_random_uuid(), 'clitest', 'enforcement_unverified',"
+            " 'selfcheck:flood' || i || ':1:enforcement_unverified',"
+            " now() - make_interval(secs => i % 3000), '{\"worker_id\": \"noisy\"}'::jsonb"
+            " FROM generate_series(1, 1200) AS i"
+        )
+        conn.commit()
+    code, out, _ = mint.run("--json", "status", token=boss)
+    states = {s["worker_id"]: s for s in json.loads(out)["enforcement"]}
+    assert set(states) == {"quiet", "noisy"} and states["quiet"]["passed"] is True
+
+
+def test_status_survives_unexpected_failed_item_shapes_and_shows_run_and_time(mint):
+    boss = bootstrap(mint)
+    add_event(mint, "enforcement_unverified", "selfcheck:RUN-A:1:enforcement_unverified",
+              {"worker_id": "w1", "failed": ["MCP_ORDER", 7, {"name": "X", "detail": "d"}]})
+    add_event(mint, "enforcement_unverified", "selfcheck:RUN-B:1:enforcement_unverified",
+              {"worker_id": "w2", "failed": "not a list", "hooks": "oops"})
+    code, out, _ = mint.run("--json", "status", token=boss)
+    states = {s["worker_id"]: s for s in json.loads(out)["enforcement"]}
+    assert code == 0
+    assert [f["name"] for f in states["w1"]["failed"]] == ["MCP_ORDER", "7", "X"]
+    assert states["w2"]["failed"] == [] and states["w2"]["hooks"] == []
+    code, out, _ = mint.run("status", token=boss)
+    assert code == 0 and "실행 RUN-A" in out and "실행 RUN-B" in out
+
+
+def test_a_restart_with_the_same_worker_id_is_one_line_with_the_latest_run(mint):
+    boss = bootstrap(mint)
+    add_event(mint, "enforcement_verified", "selfcheck:FIRST:1:enforcement_verified",
+              {"worker_id": "host:1", "allowed_hooks_used": []}, 100)
+    add_event(mint, "enforcement_unverified", "selfcheck:SECOND:1:enforcement_unverified",
+              {"worker_id": "host:1", "cause": "callbacks_changed", "hooks": ["Rogue"]}, 10)
+    code, out, _ = mint.run("--json", "status", token=boss)
+    states = json.loads(out)["enforcement"]
+    assert len(states) == 1 and states[0]["run_id"] == "SECOND" and states[0]["passed"] is False

@@ -34,6 +34,8 @@ COMPAT_SYMBOLS: tuple[tuple[str, str | None, str | None], ...] = (
     ("litellm.proxy._experimental.mcp_server.mcp_server_manager", "global_mcp_server_manager",
      "_resolve_mcp_server_for_tool_call"),
     ("litellm.proxy._experimental.mcp_server.catalog", None, None),
+    # 기동 전 검사가 설정을 읽는 로더(compat/litellm_config_loader.py)
+    ("litellm.proxy.proxy_server", "ProxyConfig", "_get_config_from_file"),
 )
 
 
