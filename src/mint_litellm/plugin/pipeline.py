@@ -1,0 +1,939 @@
+"""도구 호출·도구 발견 판정 파이프라인.
+
+단계는 ``pass``·``finding``·``stop``을 돌려준다. 관측 모드로 전환될 수 있는 사유는
+``finding``으로 쌓으며 끝까지 진행하고, 전환 불가 사유만 ``stop``이 되어 남은 단계를 건너뛴다.
+모든 경로에서 종결자가 ``decision_evaluated`` 또는 ``discovery_evaluated``를 한 건 남긴다.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any, Protocol
+from uuid import UUID
+
+from mint_litellm.compat.litellm_1_106 import HookData, ServerResolutionError
+from mint_litellm.plugin.buffer import ConsumeRequest, EvidenceRecorder
+from mint_litellm.plugin.config import PluginConfig
+from mint_litellm.plugin.obligations import (
+    AlertObligation,
+    RequireCallApproval,
+    RequireConsent,
+    normalize_policy_output,
+)
+from mint_litellm.plugin.policy.input import policy_input as make_policy_input
+from mint_litellm.plugin.policy.opa_client import Evaluation
+from mint_litellm.plugin.snapshot import (
+    ApprovalRow,
+    CallApprovalRow,
+    Snapshot,
+    SnapshotQuery,
+)
+from mint_litellm.types.decision import (
+    UNSUPPORTED_STAGE,
+    Action,
+    Conclusion,
+    DecisionSnapshot,
+    MintContext,
+    OperationType,
+    PolicyDecision,
+    ResolvedServer,
+    SkippedStage,
+    Stage,
+    StageResult,
+    StageStatus,
+    apply_record_failure,
+    conclude,
+    entries_from_results,
+    relation_state_result,
+    server_state_result,
+)
+from mint_litellm.types.errors import Dependency, MintError, error_for_reason
+from mint_litellm.types.events import Evidence, decision_event
+from mint_litellm.types.fingerprint import argument_fingerprint
+from mint_litellm.types.identity import (
+    Principal,
+    PrincipalType,
+    derive_org,
+    with_org,
+)
+from mint_litellm.types.ids import new_uuid7
+from mint_litellm.types.reason_codes import Reason
+from mint_litellm.types.settings import Mode, ObservationSettings, effective_mode
+
+log = logging.getLogger("mint_litellm.pipeline")
+
+# 승인 범위는 좁은 쪽부터 본다.
+_SCOPE_ORDER = ("key", "user", "team", "org")
+
+
+PolicyEvaluate = Callable[..., Awaitable[Evaluation]]
+"""``evaluate(policy_input, *, policy_version_id, bundle_sha256, budget_seconds)``."""
+
+
+class Deadline:
+    """한 판정의 단일 시간 예산. DB와 정책 엔진 호출은 남은 시간만큼만 기다린다."""
+
+    def __init__(self, budget_seconds: float) -> None:
+        self._end = time.monotonic() + budget_seconds
+
+    def remaining(self) -> float:
+        return max(0.0, self._end - time.monotonic())
+
+
+class SnapshotSource(Protocol):
+    async def read_snapshot(self, query: SnapshotQuery) -> Snapshot: ...
+
+
+@dataclass
+class PipelineDeps:
+    config: PluginConfig
+    snapshots: SnapshotSource
+    recorder: EvidenceRecorder
+    evaluate: PolicyEvaluate | None
+    verified: Callable[[], bool]
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class CallRequest:
+    operation: OperationType
+    principal: Principal
+    hook: HookData
+    resolved: ResolvedServer | None
+    resolution_failure: StageResult | None
+    invocation_id: UUID = field(default_factory=new_uuid7)
+    attempt_id: int = 1
+    # 판정 전에 이미 정해진 차단. 안전망이 판정 뒤의 변경을 기록할 때 쓴다.
+    forced_stop: StageResult | None = None
+
+
+@dataclass(frozen=True)
+class Outcome:
+    allowed: bool
+    snapshot: DecisionSnapshot
+    error: MintError | None
+    evidence: Evidence
+    context: dict[str, Any]
+
+
+def arguments_digest(arguments: Mapping[str, Any], key: bytes | None) -> str | None:
+    """판정한 인자의 요약. 호출별 승인과 같은 키의 HMAC 지문이며 호출 컨텍스트에만 둔다.
+
+    키가 없거나 인자를 JSON 값으로 만들 수 없으면 None이다.
+    """
+    if key is None:
+        return None
+    try:
+        return argument_fingerprint(arguments, key)
+    except ValueError:
+        return None
+
+
+def scope_matches(scope_type: str, scope_id: str, principal: Principal, server_id: str) -> bool:
+    if scope_type == "key":
+        return principal.key_id == scope_id
+    if scope_type == "user":
+        return principal.user_id == scope_id
+    if scope_type == "team":
+        return principal.team_id == scope_id
+    if scope_type == "org":
+        return principal.org_id == scope_id
+    return scope_type == "server" and server_id == scope_id
+
+
+class _Stages:
+    """단계 결과 누적. stop이 나오면 이후 결과를 받지 않는다."""
+
+    def __init__(self) -> None:
+        self.items: list[tuple[Stage, StageResult | SkippedStage]] = []
+        self.stopped = False
+        self.dependency: Dependency | None = None
+
+    def add(self, stage: Stage, result: StageResult | SkippedStage) -> None:
+        if self.stopped:
+            return
+        self.items.append((stage, result))
+        if isinstance(result, StageResult) and result.status is StageStatus.STOP:
+            self.stopped = True
+
+    def results(self) -> list[StageResult]:
+        return [r for _, r in self.items if isinstance(r, StageResult)]
+
+
+def context_result(req: CallRequest, verified: bool) -> StageResult | None:
+    if not verified:
+        return StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED)
+    if req.principal.principal_type is PrincipalType.MASTER_KEY:
+        return StageResult.stop(Reason.MASTER_KEY_FORBIDDEN)
+    if req.forced_stop is not None:
+        return req.forced_stop
+    if req.resolution_failure is not None:
+        return req.resolution_failure
+    resolved = req.resolved
+    if resolved is not None and resolved.candidates_with_same_name >= 2:
+        return StageResult.stop(Reason.SERVER_IDENTITY_AMBIGUOUS)
+    return None
+
+
+def derive_principal(snapshot: Snapshot, principal: Principal) -> Principal:
+    derivation = derive_org(
+        team_id=principal.team_id,
+        user_id=principal.user_id,
+        bindings=snapshot.bindings,
+        default_org_id=snapshot.settings.default_org_id if snapshot.settings else None,
+        org_status=snapshot.org_status,
+    )
+    return with_org(principal, derivation)
+
+
+def state_results(
+    snapshot: Snapshot, principal: Principal, resolved: ResolvedServer
+) -> list[StageResult]:
+    if principal.principal_type is PrincipalType.ANONYMOUS:
+        return [StageResult.stop(Reason.ANONYMOUS)]
+    if principal.org_id is None:
+        return [StageResult.stop(Reason.ORG_BOUNDARY)]
+    server = snapshot.server
+    results = []
+    state = server_state_result(server.status if server is not None else None)
+    if state.status is not StageStatus.PASS:
+        results.append(state)
+    if server is not None and state.status is not StageStatus.STOP:
+        if not resolved.matches_contract(
+            url_sha256=server.url_sha256, transport=server.transport, auth_type=server.auth_type
+        ):
+            results.append(StageResult.stop(Reason.SERVER_IDENTITY_MISMATCH))
+    return results
+
+
+@dataclass(frozen=True)
+class ApprovalSelection:
+    results: list[StageResult]
+    selected: ApprovalRow | None
+
+
+def _approval_expired(approval: ApprovalRow, now: datetime) -> bool:
+    return approval.status == "expired" or (
+        approval.status == "active" and approval.valid_until <= now
+    )
+
+
+def denial_and_approval(
+    snapshot: Snapshot, principal: Principal, resolved: ResolvedServer, tool: str
+) -> ApprovalSelection:
+    now = snapshot.now
+    for denial in snapshot.denials:
+        applies = (
+            scope_matches(denial.scope_type, denial.scope_id, principal, resolved.server_id)
+            and (denial.server_id is None or denial.server_id == resolved.server_id)
+            and (denial.tools is None or tool in denial.tools)
+            and (denial.org_id is None or denial.org_id == principal.org_id)
+        )
+        if applies:
+            return ApprovalSelection([StageResult.stop(Reason.DENIED)], None)
+
+    matched = [
+        a
+        for a in snapshot.approvals
+        if scope_matches(a.scope_type, a.scope_id, principal, resolved.server_id)
+    ]
+    in_org = [a for a in matched if a.org_id == principal.org_id]
+    relation_status = {
+        a.id: snapshot.relations[a.relation_id].status
+        if a.relation_id in snapshot.relations
+        else None
+        for a in in_org
+    }
+    for approval in in_org:
+        status = relation_status[approval.id]
+        if status != "active" and status is not None:
+            return ApprovalSelection([relation_state_result(status)], None)
+
+    server = snapshot.server
+    if server is not None:
+        for allowlist_id in server.basis_allowlist_ids:
+            entry = snapshot.allowlists.get(allowlist_id)
+            if (
+                entry is None
+                or entry.status != "active"
+                or not (entry.valid_from <= now < entry.valid_until)
+            ):
+                return ApprovalSelection([StageResult.stop(Reason.ALLOWLIST_EXPIRED)], None)
+
+    valid = [
+        a
+        for a in in_org
+        if a.status == "active"
+        and a.valid_from <= now < a.valid_until
+        and relation_status[a.id] == "active"
+    ]
+    # 유효 승인이 하나라도 있는 가장 좁은 범위 하나만 본다. 그 범위에 도구가 든 승인이 없으면
+    # 더 넓은 범위에 있어도 선택하지 않는다.
+    for scope in _SCOPE_ORDER:
+        in_scope = [a for a in valid if a.scope_type == scope]
+        if not in_scope:
+            continue
+        containing = [a for a in in_scope if tool in a.tools]
+        if not containing:
+            return ApprovalSelection([StageResult.finding(Reason.TOOL_NOT_IN_APPROVAL)], None)
+        ordered = sorted(containing, key=lambda a: a.id)
+        ordered.sort(key=lambda a: a.valid_from, reverse=True)
+        return ApprovalSelection([], ordered[0])
+    if not in_org:
+        if matched:
+            return ApprovalSelection([StageResult.stop(Reason.ORG_BOUNDARY)], None)
+        return ApprovalSelection([StageResult.finding(Reason.APPROVAL_ABSENT)], None)
+    if any(a.status == "revoked" for a in in_org):
+        return ApprovalSelection([StageResult.stop(Reason.APPROVAL_REVOKED)], None)
+    if any(_approval_expired(a, now) for a in in_org):
+        return ApprovalSelection([StageResult.stop(Reason.APPROVAL_EXPIRED)], None)
+    return ApprovalSelection([StageResult.finding(Reason.APPROVAL_ABSENT)], None)
+
+
+def consent_state(snapshot: Snapshot, principal: Principal, purpose: str) -> tuple[str, str | None]:
+    """목적에 대한 동의 상태와 출처. 동의는 사람 사용자에게만 있다."""
+    if principal.principal_type is not PrincipalType.USER:
+        return "absent", None
+    rows = [c for c in snapshot.consents if c.purpose == purpose and c.org_id == principal.org_id]
+    if not rows:
+        return "absent", None
+    now = snapshot.now
+    live = [c for c in rows if c.revoked_at is None and c.granted_at <= now < c.valid_until]
+    if live:
+        return "granted", max(live, key=lambda c: c.granted_at).source
+    latest = max(rows, key=lambda c: c.granted_at)
+    return ("revoked" if latest.revoked_at is not None else "expired"), None
+
+
+class InputError(Exception):
+    """정책 입력으로 만들 수 없는 승인 조건."""
+
+
+def _argument_sizes(arguments: Mapping[str, Any]) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    for key, value in arguments.items():
+        raw = (
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        )
+        sizes[str(key)] = len(raw.encode("utf-8"))
+    return sizes
+
+
+def build_policy_input(
+    *,
+    snapshot: Snapshot,
+    principal: Principal,
+    resolved: ResolvedServer,
+    tool: str,
+    arguments: Mapping[str, Any],
+    selected: ApprovalRow | None,
+    mode: Mode,
+    operation: OperationType,
+    high_risk_tools: frozenset[str],
+) -> dict[str, Any]:
+    """정책 입력. 인자 원문은 넣지 않고, 1단계에 없는 값은 키를 만들지 않는다."""
+    now = snapshot.now
+    server = snapshot.server
+    allowed_kinds = (
+        {
+            snapshot.allowlists[i].kind
+            for i in server.basis_allowlist_ids
+            if i in snapshot.allowlists and snapshot.allowlists[i].status == "active"
+        }
+        if server is not None
+        else set()
+    )
+    # 서버 행이 없어도 server 객체를 빼지 않는다. 정책의 필수 입력 검사가 누락을 전환 불가 오류로
+    # 바꾸면 관측 모드에서 미등록 서버를 허용으로 전환할 수 없다.
+    server_doc: dict[str, Any] = {
+        "id": resolved.server_id,
+        "status": server.status if server is not None else "unregistered",
+        "transport": resolved.transport,
+        "auth_type": resolved.auth_type,
+        "provider_allowed": "provider" in allowed_kinds,
+        "auth_server_allowed": "auth_server" in allowed_kinds,
+    }
+
+    if selected is None:
+        approval: dict[str, Any] = {"present": False}
+        consent: dict[str, Any] = {"status": "not_applicable", "source": None}
+    else:
+        approval = {
+            "present": True,
+            "id": selected.id,
+            "class": selected.approval_class,
+            "scope_type": selected.scope_type,
+            "expires_in_days": max(0, (selected.valid_until - now).days),
+            "conditions": dict(selected.conditions),
+        }
+        purpose = selected.conditions.get("require_consent")
+        if purpose is None:
+            consent = {"status": "not_applicable", "source": None}
+        elif isinstance(purpose, str) and purpose:
+            status, source = consent_state(snapshot, principal, purpose)
+            consent = {"status": status, "source": source}
+        else:
+            raise InputError("require_consent must be a purpose string")
+
+    return make_policy_input(
+        principal=principal,
+        server=server_doc,
+        tool={"name": tool},
+        argument_keys=sorted(str(k) for k in arguments),
+        argument_sizes=_argument_sizes(arguments),
+        approval=approval,
+        consent=consent,
+        now=now,
+        high_risk_tools=sorted(high_risk_tools),
+        mode=mode.value,
+        operation=operation.value,
+    )
+
+
+@dataclass(frozen=True)
+class PolicyStageResult:
+    results: list[tuple[Stage, StageResult | SkippedStage]]
+    observable: bool
+    decision: PolicyDecision | None
+    policy_ids: tuple[str, ...]
+    obligations: tuple[Any, ...]
+    version_id: str | None
+    bundle_sha256: str | None
+    dependency: Dependency | None = None
+
+
+async def policy_stage(
+    deps: PipelineDeps,
+    snapshot: Snapshot,
+    policy_input: dict[str, Any],
+    timeout: float,
+) -> PolicyStageResult:
+    def stopped(result: StageResult, dependency: Dependency | None = None) -> PolicyStageResult:
+        # 정책 엔진이 의무를 지원하지 못한다고 답한 경우는 의무 확인 단계의 중단이다.
+        stage = Stage.OBLIGATIONS if result.reason_code == Reason.UNSUPPORTED else Stage.POLICY
+        return PolicyStageResult([(stage, result)], False, None, (), (), None, None, dependency)
+
+    version = snapshot.policy_version
+    if version is None:
+        return stopped(StageResult.stop(Reason.POLICY_VERSION_MISMATCH, detail="no active policy"))
+    if deps.evaluate is None:
+        return stopped(
+            StageResult.stop(Reason.DEPENDENCY_FAILURE, detail="no policy engine"), Dependency.OPA
+        )
+    try:
+        async with asyncio.timeout(timeout):
+            evaluation = await deps.evaluate(
+                policy_input,
+                policy_version_id=version.id,
+                bundle_sha256=version.bundle_sha256,
+                budget_seconds=timeout,
+            )
+    except Exception:
+        return stopped(StageResult.stop(Reason.DEPENDENCY_FAILURE), Dependency.OPA)
+    if evaluation.failure is not None:
+        dependency = (
+            Dependency.OPA if evaluation.failure.reason_code == Reason.DEPENDENCY_FAILURE else None
+        )
+        return stopped(evaluation.failure, dependency)
+    output = evaluation.output
+    if output is None or output.missing_inputs:
+        return stopped(StageResult.stop(Reason.SCHEMA_ERROR, detail="missing policy inputs"))
+    if (output.policy_version_id, output.bundle_sha256) != (version.id, version.bundle_sha256):
+        return stopped(StageResult.stop(Reason.POLICY_VERSION_MISMATCH))
+    normalized = normalize_policy_output(output.decision, output.policy_ids, output.obligations)
+    if normalized.failure is not None:
+        stage = (
+            Stage.POLICY
+            if normalized.failure.reason_code == Reason.SCHEMA_ERROR
+            else Stage.OBLIGATIONS
+        )
+        return PolicyStageResult(
+            [(stage, normalized.failure)],
+            False,
+            None,
+            (),
+            (),
+            version.id,
+            version.bundle_sha256,
+        )
+    results: list[tuple[Stage, StageResult | SkippedStage]] = []
+    for finding in normalized.findings:
+        results.append((Stage.POLICY, finding))
+    if not normalized.findings:
+        results.append((Stage.POLICY, StageResult.passed()))
+    return PolicyStageResult(
+        results,
+        bool(output.observable),
+        normalized.decision,
+        tuple(output.policy_ids),
+        normalized.obligations,
+        version.id,
+        version.bundle_sha256,
+    )
+
+
+@dataclass(frozen=True)
+class ObligationCheck:
+    results: list[StageResult]
+    consume: ConsumeRequest | None
+
+
+def match_call_approval(
+    snapshot: Snapshot,
+    principal: Principal,
+    resolved: ResolvedServer,
+    tool: str,
+    arguments: Mapping[str, Any],
+    config: PluginConfig,
+    invocation_id: UUID,
+) -> tuple[StageResult | None, ConsumeRequest | None]:
+    if config.fingerprint_key is None:
+        return StageResult.stop(
+            Reason.CALL_APPROVAL_REQUIRED, detail="fingerprint key not set"
+        ), None
+    version = snapshot.policy_version
+    try:
+        fingerprint = argument_fingerprint(arguments, config.fingerprint_key)
+    except ValueError:
+        return StageResult.stop(
+            Reason.CALL_APPROVAL_REQUIRED, detail="arguments cannot be fingerprinted"
+        ), None
+
+    def same_call(row: CallApprovalRow) -> bool:
+        return (
+            row.org_id == principal.org_id
+            and row.principal_type == principal.principal_type.value
+            and row.principal_id == principal.principal_id
+            and row.server_id == resolved.server_id
+            and row.tool == tool
+            and row.args_fp == fingerprint
+            and row.fp_key_version == config.fingerprint_key_version
+            and row.contract_version is None
+            and row.expires_at > snapshot.now
+        )
+
+    candidates = [row for row in snapshot.call_approvals if same_call(row)]
+    exact = sorted(
+        (r for r in candidates if version is not None and r.policy_version_id == version.id),
+        key=lambda r: str(r.id),
+    )
+    if exact:
+        row = exact[0]
+        return None, ConsumeRequest(
+            call_approval_id=row.id,
+            invocation_id=invocation_id,
+            principal_type=row.principal_type,
+            principal_id=row.principal_id,
+            server_id=row.server_id,
+            tool=row.tool,
+            args_fp=row.args_fp,
+            policy_version_id=row.policy_version_id,
+            state_version=row.state_version,
+        )
+    if candidates:
+        return StageResult.stop(Reason.CALL_APPROVAL_STALE), None
+    return StageResult.stop(Reason.CALL_APPROVAL_REQUIRED), None
+
+
+def obligation_check(
+    snapshot: Snapshot,
+    principal: Principal,
+    resolved: ResolvedServer,
+    tool: str,
+    arguments: Mapping[str, Any],
+    obligations: Sequence[Any],
+    config: PluginConfig,
+    invocation_id: UUID,
+) -> ObligationCheck:
+    consume: ConsumeRequest | None = None
+    for obligation in obligations:
+        if isinstance(obligation, RequireCallApproval):
+            failure, consume = match_call_approval(
+                snapshot, principal, resolved, tool, arguments, config, invocation_id
+            )
+            if failure is not None:
+                return ObligationCheck([failure], None)
+        elif isinstance(obligation, RequireConsent):
+            status, _ = consent_state(snapshot, principal, obligation.purpose)
+            if status != "granted":
+                reason = {
+                    "absent": Reason.CONSENT_REQUIRED,
+                    "expired": Reason.CONSENT_EXPIRED,
+                    "revoked": Reason.CONSENT_REVOKED,
+                }[status]
+                return ObligationCheck([StageResult.stop(reason)], None)
+    return ObligationCheck([], consume)
+
+
+_MISSING = {
+    "litellm_call_id": "not_provided",
+    "requested_server_name": "not_provided",
+    "tool": "not_provided",
+    "state_epoch": "snapshot_unavailable",
+    "settings_version": "snapshot_unavailable",
+    "policy_version_id": "policy_not_evaluated",
+    "bundle_sha256": "policy_not_evaluated",
+    "policy_decision": "policy_not_evaluated",
+    "resolved_server_id": "server_unresolved",
+    "resolved_url_sha256": "server_unresolved",
+    "resolved_transport": "server_unresolved",
+    "resolved_auth_type": "server_unresolved",
+    "candidates_with_same_name": "server_unresolved",
+    "selected_approval_id": "no_selected_approval",
+    "consumed_call_approval_id": "not_consumed",
+    "revoked_after_snapshot": "pending_response",
+    "revocation_check": "pending_response",
+}
+
+_OBLIGATION_CLASSES = (AlertObligation, RequireCallApproval, RequireConsent)
+
+
+@dataclass
+class _Run:
+    req: CallRequest
+    stages: _Stages
+    principal: Principal
+    mode: Mode
+    evaluated_at: datetime
+    deadline: Deadline
+    current: Stage = Stage.CONTEXT
+    snapshot: Snapshot | None = None
+    selected: ApprovalRow | None = None
+    consume: ConsumeRequest | None = None
+    policy: PolicyStageResult | None = None
+    observation: ObservationSettings = field(default_factory=ObservationSettings)
+
+
+def _decision_snapshot(
+    run: _Run, conclusion: Conclusion, consumed: ConsumeRequest | None
+) -> DecisionSnapshot:
+    req, snap, policy = run.req, run.snapshot, run.policy
+    resolved = req.resolved
+    values: dict[str, Any] = {
+        "litellm_call_id": req.hook.litellm_call_id,
+        "requested_server_name": req.hook.server_name,
+        "tool": req.hook.tool_name,
+        "state_epoch": snap.epoch if snap else None,
+        "settings_version": snap.settings.settings_version if snap and snap.settings else None,
+        "policy_version_id": policy.version_id if policy else None,
+        "bundle_sha256": policy.bundle_sha256 if policy else None,
+        "policy_decision": policy.decision if policy else None,
+        "resolved_server_id": resolved.server_id if resolved else None,
+        "resolved_url_sha256": resolved.url_sha256 if resolved else None,
+        "resolved_transport": resolved.transport if resolved else None,
+        "resolved_auth_type": resolved.auth_type if resolved else None,
+        "candidates_with_same_name": resolved.candidates_with_same_name if resolved else None,
+        "selected_approval_id": run.selected.id if run.selected else None,
+        "consumed_call_approval_id": str(consumed.call_approval_id) if consumed else None,
+    }
+    reasons = {k: _MISSING[k] for k, v in values.items() if v is None}
+    reasons["revoked_after_snapshot"] = _MISSING["revoked_after_snapshot"]
+    reasons["revocation_check"] = _MISSING["revocation_check"]
+    if snap is not None:
+        if snap.settings is None:
+            reasons["settings_version"] = "no_settings_row"
+        if snap.epoch is None:
+            reasons["state_epoch"] = "no_epoch_row"
+    if policy is not None:
+        for name in ("policy_version_id", "bundle_sha256", "policy_decision"):
+            if name in reasons:
+                reasons[name] = "policy_stopped"
+    ref = MintContext(invocation_id=req.invocation_id, attempt_id=req.attempt_id)
+    return DecisionSnapshot(
+        invocation_id=req.invocation_id,
+        attempt_id=req.attempt_id,
+        decision_ref=ref.decision_ref,
+        operation=req.operation,
+        evaluated_at=run.evaluated_at,
+        principal=run.principal,
+        mode=run.mode,
+        policy_ids=policy.policy_ids if policy else (),
+        obligation_types=tuple(
+            o.type
+            for o in (policy.obligations if policy else ())
+            if isinstance(o, _OBLIGATION_CLASSES)
+        ),
+        stages=entries_from_results(run.stages.items),
+        findings=conclusion.findings,
+        stop=conclusion.stop,
+        evaluated_decision=conclusion.evaluated_decision,
+        enforced_action=conclusion.enforced_action,
+        missing_reasons=reasons,
+        **{k: v for k, v in values.items() if v is not None},
+    )
+
+
+def blocking_reason(
+    conclusion: Conclusion,
+    *,
+    mode: Mode,
+    observation: ObservationSettings,
+    policy_observable: bool,
+) -> str:
+    """차단 응답의 오류 코드가 될 사유.
+
+    stop이 있으면 그 사유이고, 없으면 관측 모드로 전환되지 않은 finding 중 파이프라인 순서상
+    첫 사유이다.
+    """
+    if conclusion.stop is not None:
+        assert conclusion.stop.reason_code is not None
+        return conclusion.stop.reason_code
+    for finding in conclusion.findings:
+        single = conclude(
+            [finding], mode=mode, observation=observation, policy_observable=policy_observable
+        )
+        if single.enforced_action is Action.BLOCK:
+            assert finding.reason_code is not None
+            return finding.reason_code
+    raise ValueError("conclusion does not block")
+
+
+async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
+    req, stages, config = run.req, run.stages, deps.config
+    hook, principal = req.hook, req.principal
+    run.current = Stage.CONTEXT
+    early = context_result(req, deps.verified())
+    if early is not None:
+        stages.add(Stage.CONTEXT, early)
+        return
+    stages.add(Stage.CONTEXT, StageResult.passed())
+    resolved = req.resolved
+    tool = hook.tool_name
+    assert resolved is not None and tool is not None
+
+    run.current = Stage.SNAPSHOT
+    query = SnapshotQuery(
+        instance_id=config.instance_id,
+        server_id=resolved.server_id,
+        tool=tool,
+        principal_id=principal.principal_id,
+        key_id=principal.key_id,
+        user_id=principal.user_id,
+        team_id=principal.team_id,
+    )
+    try:
+        async with asyncio.timeout(run.deadline.remaining()):
+            snapshot = await deps.snapshots.read_snapshot(query)
+    except Exception:
+        stages.dependency = Dependency.DB
+        stages.add(Stage.SNAPSHOT, StageResult.stop(Reason.DEPENDENCY_FAILURE))
+        return
+    stages.add(Stage.SNAPSHOT, StageResult.passed())
+    run.snapshot = snapshot
+    run.evaluated_at = snapshot.now
+    settings = snapshot.settings
+    run.mode = effective_mode(config.mode_ceiling, settings.mode if settings else Mode.ENFORCE)
+    if settings is not None:
+        run.observation = ObservationSettings(
+            observable_reasons=settings.observable_reasons,
+            observable_policy_ids=settings.observable_policy_ids,
+        )
+
+    run.current = Stage.STATE
+    run.principal = derive_principal(snapshot, principal)
+    state = state_results(snapshot, run.principal, resolved)
+    for result in state:
+        stages.add(Stage.STATE, result)
+    if not state:
+        stages.add(Stage.STATE, StageResult.passed())
+    if stages.stopped:
+        return
+
+    run.current = Stage.DENIAL_APPROVAL
+    selection = denial_and_approval(snapshot, run.principal, resolved, tool)
+    for result in selection.results:
+        stages.add(Stage.DENIAL_APPROVAL, result)
+    if not selection.results:
+        stages.add(Stage.DENIAL_APPROVAL, StageResult.passed())
+    run.selected = selection.selected
+    if stages.stopped or req.operation is OperationType.RUNTIME_DISCOVERY:
+        return
+
+    stages.add(Stage.CONTRACT, UNSUPPORTED_STAGE)
+    run.current = Stage.POLICY
+    try:
+        policy_input = build_policy_input(
+            snapshot=snapshot,
+            principal=run.principal,
+            resolved=resolved,
+            tool=tool,
+            arguments=hook.arguments,
+            selected=run.selected,
+            mode=run.mode,
+            operation=req.operation,
+            high_risk_tools=config.high_risk_tools,
+        )
+    except InputError as exc:
+        stages.add(Stage.POLICY, StageResult.stop(Reason.SCHEMA_ERROR, detail=str(exc)[:200]))
+        return
+    run.policy = await policy_stage(deps, snapshot, policy_input, run.deadline.remaining())
+    stages.dependency = run.policy.dependency
+    for stage, result in run.policy.results:
+        stages.add(stage, result)
+    if stages.stopped:
+        return
+
+    run.current = Stage.OBLIGATIONS
+    check = obligation_check(
+        snapshot,
+        run.principal,
+        resolved,
+        tool,
+        hook.arguments,
+        run.policy.obligations,
+        config,
+        req.invocation_id,
+    )
+    for result in check.results:
+        stages.add(Stage.OBLIGATIONS, result)
+    if not check.results:
+        stages.add(Stage.OBLIGATIONS, StageResult.passed())
+    run.consume = check.consume
+
+
+def _block_with(conclusion: Conclusion, stop: StageResult) -> Conclusion:
+    return Conclusion(
+        evaluated_decision=Action.BLOCK,
+        enforced_action=Action.BLOCK,
+        findings=conclusion.findings,
+        stop=stop,
+    )
+
+
+async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
+    """한 호출(또는 목록의 도구 하나)을 판정하고 증거를 남긴다.
+
+    허용 경로에서 DB 선기록이 실패하면 호출은 ``AUDIT_FAILURE``로 차단된다. 차단 경로의 기록
+    실패는 결과를 바꾸지 않고 버퍼(안 되면 표준 오류)에 남긴다.
+    """
+    run = _Run(
+        req=req,
+        stages=_Stages(),
+        principal=req.principal,
+        mode=effective_mode(deps.config.mode_ceiling, Mode.ENFORCE),
+        evaluated_at=deps.clock(),
+        deadline=Deadline(deps.config.decision_budget_seconds),
+    )
+    try:
+        await _run_stages(run, deps)
+    except Exception as exc:
+        log.error("판정 중 예기치 않은 오류: %s", type(exc).__name__)
+        run.stages.add(
+            run.current,
+            StageResult.stop(Reason.SCHEMA_ERROR, detail=f"internal {type(exc).__name__}"[:200]),
+        )
+
+    observable = run.policy.observable if run.policy else False
+    conclusion = conclude(
+        run.stages.results(),
+        mode=run.mode,
+        observation=run.observation,
+        policy_observable=observable,
+    )
+    consume = run.consume if conclusion.enforced_action is Action.ALLOW else None
+    event = decision_event(_decision_snapshot(run, conclusion, consume))
+    stored = await deps.recorder.try_database(event, consume, timeout=run.deadline.remaining())
+    evidence = Evidence.DB
+    if not stored.stored:
+        if stored.consumption_lost:
+            conclusion = _block_with(conclusion, StageResult.stop(Reason.CALL_APPROVAL_REQUIRED))
+            consume = None
+            event = decision_event(_decision_snapshot(run, conclusion, None))
+            retry = await deps.recorder.try_database(event, timeout=run.deadline.remaining())
+            if not retry.stored:
+                evidence = await deps.recorder.fallback(event)
+        else:
+            if conclusion.enforced_action is Action.ALLOW:
+                conclusion = apply_record_failure(conclusion)
+                consume = None
+                event = decision_event(_decision_snapshot(run, conclusion, None))
+            evidence = await deps.recorder.fallback(event)
+
+    snapshot_doc = _decision_snapshot(run, conclusion, consume)
+    allowed = conclusion.enforced_action is Action.ALLOW
+    error: MintError | None = None
+    if not allowed:
+        reason = blocking_reason(
+            conclusion, mode=run.mode, observation=run.observation, policy_observable=observable
+        )
+        error = error_for_reason(
+            reason,
+            snapshot_doc.decision_ref,
+            run.stages.dependency or Dependency.DB,
+        )
+    return Outcome(
+        allowed=allowed,
+        snapshot=snapshot_doc,
+        error=error,
+        evidence=evidence,
+        context=_context_document(run, snapshot_doc, allowed, deps.config.fingerprint_key, consume),
+    )
+
+
+def _context_document(
+    run: _Run,
+    snapshot: DecisionSnapshot,
+    allowed: bool,
+    key: bytes | None,
+    consumed: ConsumeRequest | None,
+) -> dict[str, Any]:
+    """응답·실패 이벤트가 읽는 호출 컨텍스트. JSON 값만 담고 인자·결과는 담지 않는다."""
+    principal = run.principal
+    return {
+        "invocation_id": str(snapshot.invocation_id),
+        "attempt_id": snapshot.attempt_id,
+        "decision_ref": snapshot.decision_ref,
+        "arguments_digest": arguments_digest(run.req.hook.arguments, key),
+        "consumed_call_approval": (
+            {"id": str(consumed.call_approval_id), "state_version": consumed.state_version}
+            if allowed and consumed is not None
+            else None
+        ),
+        "allowed": allowed,
+        "state_epoch": snapshot.state_epoch,
+        "server_id": snapshot.resolved_server_id,
+        "tool": snapshot.tool,
+        "approval_id": snapshot.selected_approval_id,
+        "relation_id": run.selected.relation_id if run.selected else None,
+        "key_id": principal.key_id,
+        "user_id": principal.user_id,
+        "team_id": principal.team_id,
+        "org_id": principal.org_id,
+    }
+
+
+def build_request(
+    data: Mapping[str, Any],
+    user_api_key_dict: Any,
+    *,
+    operation: OperationType,
+    instance_id: str,
+    hook_parser: Callable[[Mapping[str, Any]], HookData],
+    resolver: Callable[[HookData], ResolvedServer],
+    principal_factory: Callable[..., Principal],
+) -> CallRequest:
+    """사전 훅 ``data``와 인증 객체로 판정 요청을 만든다. LiteLLM 접점은 인자로 받는다."""
+    hook = hook_parser(data)
+    principal = principal_factory(user_api_key_dict, instance_id=instance_id)
+    resolved: ResolvedServer | None = None
+    failure: StageResult | None = None
+    if hook.tool_name is None:
+        failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="hook data has no tool")
+    else:
+        try:
+            resolved = resolver(hook)
+        except ServerResolutionError as exc:
+            failure = StageResult.stop(exc.reason, detail=exc.detail[:200])
+    return CallRequest(
+        operation=operation,
+        principal=principal,
+        hook=hook,
+        resolved=resolved,
+        resolution_failure=failure,
+    )
