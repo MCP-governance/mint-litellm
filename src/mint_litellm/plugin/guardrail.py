@@ -69,8 +69,7 @@ class MintGuardrail(CustomGuardrail):
         assert outcome.error is not None
         raise HTTPException(status_code=403, detail=outcome.error.detail())
 
-    @staticmethod
-    def _ref_is_current(data: dict, ref: str) -> bool:
+    def _ref_is_current(self, data: dict, ref: str) -> bool:
         """표식이 이 호출의 로거 컨텍스트와 같은 판정을 가리키는지."""
         details = compat.logging_details(data.get("litellm_logging_obj"))
         if details is None:
@@ -82,7 +81,8 @@ class MintGuardrail(CustomGuardrail):
             return False
         # 로거가 판정한 뒤 앞선 훅이 인자를 바꿨으면 그 판정과 승인은 전송될 인자의 것이 아니다.
         digest = ctx.get("arguments_digest")
-        current = arguments_digest(compat.parse_hook_data(data).arguments)
+        key = self._runtime.config.fingerprint_key
+        current = arguments_digest(compat.parse_hook_data(data).arguments, key)
         if isinstance(digest, str) and digest == current:
             return True
         details[MINT_CTX_KEY] = {**ctx, "allowed": False}

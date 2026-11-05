@@ -111,7 +111,8 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         source=SettingSource.ENV,
         rule=(
             "호출별 승인 인자 지문의 키(32바이트 이상 무작위 값의 base64url). `init`이 만들어 "
-            "저장소 밖 비밀 파일(권한 0600)에 기록한다. 없으면 호출별 승인을 충족할 수 없다."
+            "저장소 밖 비밀 파일(권한 0600)에 기록한다. 호출별 승인과 모든 호출의 판정 인자 대조에 "
+            "쓰이므로 필수이며, 없으면 자가 점검이 실패해 기동을 중단한다."
         ),
     ),
     MintSettingRow(

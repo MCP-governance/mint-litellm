@@ -107,6 +107,7 @@ def check_items(
     logger: Any,
     guardrail: Any,
     controlled: Sequence[RegisteredServer] | None,
+    fingerprint_key_set: bool = True,
 ) -> list[CheckResult]:
     """8개 항목을 확인한다. ``controlled``가 ``None``이면 MINT DB를 읽지 못한 것이다."""
     results: list[CheckResult] = []
@@ -196,6 +197,8 @@ def check_items(
     )
 
     problems = []
+    if not fingerprint_key_set:
+        problems.append("MINT_FINGERPRINT_KEY is not set")
     if not view.strict_guardrail_modes:
         problems.append("LITELLM_STRICT_GUARDRAIL_MODES=false")
     if view.store_prompts_in_spend_logs:
@@ -322,7 +325,11 @@ class PluginRuntime:
             controlled = None
         view = self.view_collector()
         results = check_items(
-            view, logger=self.logger, guardrail=self.guardrail, controlled=controlled
+            view,
+            logger=self.logger,
+            guardrail=self.guardrail,
+            controlled=controlled,
+            fingerprint_key_set=self.config.fingerprint_key is not None,
         )
         self.last_results = results
         self.last_mismatches = contract_mismatches(view, controlled or [])

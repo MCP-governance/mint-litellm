@@ -242,6 +242,28 @@ def test_item_8_required_settings(override):
     assert failed(run_checks(view(**override))) == {SelfCheckItem.REQUIRED_SETTINGS}
 
 
+def test_item_8_requires_the_fingerprint_key():
+    results = check_items(
+        view(),
+        logger=LOGGER,
+        guardrail=GUARDRAIL,
+        controlled=[registered()],
+        fingerprint_key_set=False,
+    )
+    assert failed(results) == {SelfCheckItem.REQUIRED_SETTINGS}
+    (detail,) = [r.detail for r in results if not r.ok]
+    assert "MINT_FINGERPRINT_KEY" in detail
+
+
+def test_a_runtime_without_the_fingerprint_key_does_not_start(tmp_path):
+    runtime, store, stopped, _ = make_runtime(tmp_path)
+    runtime.config = replace(runtime.config, fingerprint_key=None)
+    asyncio.run(runtime._startup())
+    assert stopped == [1] and not runtime.verified
+    (event,) = store.of_kind("enforcement_unverified")
+    assert [f["name"] for f in event.payload["failed"]] == [SelfCheckItem.REQUIRED_SETTINGS.name]
+
+
 def test_item_8_accepts_a_supported_db_objects_list_with_mcp():
     settings = {"require_key_mcp_access_defined": True, "supported_db_objects": ["models", "mcp"]}
     assert failed(run_checks(view(general_settings=settings))) == set()
