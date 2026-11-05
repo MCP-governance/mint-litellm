@@ -15,6 +15,7 @@ from mint_litellm.plugin.policy.bundle import (
     parse_data_json,
     prepare_bundle,
     publish_bundle,
+    restore_bundle,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -121,7 +122,33 @@ def test_invalid_business_hours_rejected():
 
 def test_publish_replaces_complete_archive(tmp_path):
     path = tmp_path / "bundle.tar.gz"
+    assert not restore_bundle(path)
     publish_bundle(path, b"first")
+    assert not restore_bundle(path)
     publish_bundle(path, b"second")
     assert path.read_bytes() == b"second"
-    assert len(list(tmp_path.iterdir())) == 1
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bundle.tar.gz", "bundle.tar.gz.previous"]
+
+
+def test_restore_returns_the_previously_published_archive(tmp_path):
+    path = tmp_path / "bundle.tar.gz"
+    publish_bundle(path, b"first")
+    publish_bundle(path, b"second")
+    assert restore_bundle(path)
+    assert path.read_bytes() == b"first"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bundle.tar.gz", "bundle.tar.gz.previous"]
+
+
+def test_rules_reference_only_policy_data_under_mint():
+    """판정 규칙은 ``data.mint`` 밖(특히 ``data.system``)과 ``data`` 전체 순회를 쓰지 않는다."""
+    import re
+
+    sources = sorted((ROOT / "policy" / "bundle").rglob("*.rego"))
+    assert sources
+    for source in sources:
+        text = re.sub(r"#[^\n]*", "", source.read_text(encoding="utf-8"))
+        for match in re.finditer(r"(?<![\w.])data\b", text):
+            rest = text[match.end():]
+            assert re.match(r"\s*(?:\.\s*mint\b|\[\s*\"mint\"\s*\])", rest), (
+                f"{source.name}: data reference outside data.mint near {rest[:30]!r}"
+            )
