@@ -1135,8 +1135,8 @@ class TestConstructors:
         marker = tmp_path / "exit-code"
         monkeypatch.setenv("MINT_EXIT_CODE_FILE", str(marker))
         monkeypatch.setenv("MINT_INSTANCE_ID", "inst")
-        monkeypatch.setenv("MINT_DATABASE_URL", "postgresql://nobody@127.0.0.1:1/mint")
-        monkeypatch.setenv("MINT_OPA_URL", "http://127.0.0.1:1")
+        monkeypatch.setenv("MINT_DATABASE_URL", "postgresql://nobody@db.invalid:1/mint")
+        monkeypatch.setenv("MINT_OPA_URL", "http://opa.invalid:1")
         monkeypatch.setenv("MINT_FINGERPRINT_KEY", "")
         monkeypatch.setattr("mint_litellm.plugin.selfcheck._runtime", None)
         return marker
