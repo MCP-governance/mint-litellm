@@ -1,0 +1,458 @@
+"""배포 점검. 설정 표(``SETTINGS_TABLE``)의 모든 행을 설정 파일·환경·관리 API로 검사한다.
+
+필수 행의 위반은 실패, 권장 행의 위반은 경고이고, 관측 항목은 값만 보고한다. 보고의 항목 이름은
+설정 표의 ``key``와 같다.
+"""
+
+import importlib
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
+
+from mint_litellm.control import secrets_file
+from mint_litellm.control.errors import ControlError
+from mint_litellm.control.litellm_admin import LiteLLMAdmin
+from mint_litellm.control.litellm_config import GUARDRAIL_MODES, LOGGER_SUFFIXES
+from mint_litellm.control.policy_check import PolicyState
+from mint_litellm.types import fingerprint
+from mint_litellm.types.decision import normalize_auth_type, url_sha256
+from mint_litellm.types.settings import OBSERVATION_ITEMS, SETTINGS_TABLE, SettingGrade
+
+_DISCOVERY_AUTH = frozenset({"oauth2", "true_passthrough", "oauth_delegate"})
+_ROWS = {row.key: row for row in SETTINGS_TABLE}
+_OPTOUT_KEYS = ("opted_out_global_guardrails", "disable_global_guardrails")
+
+# 설정 표에는 없지만 필수로 취급하는 점검 항목
+POLICY_ITEM = "정책 번들 내용"
+FINGERPRINT_ITEM = "MINT_FINGERPRINT_KEY"
+KEY_NAME_IN_FILE = "MINT_FINGERPRINT_KEY"
+EXTRA_REQUIRED = frozenset({POLICY_ITEM, FINGERPRINT_ITEM})
+
+# 호환 계층이 쓰는 LiteLLM 비공개 심볼: (모듈, 객체, 속성)
+COMPAT_SYMBOLS: tuple[tuple[str, str | None, str | None], ...] = (
+    ("litellm.proxy._experimental.mcp_server.mcp_server_manager", "global_mcp_server_manager",
+     "_resolve_mcp_server_for_tool_call"),
+    ("litellm.proxy._experimental.mcp_server.catalog", None, None),
+    # 기동 전 검사가 설정을 읽는 로더(compat/litellm_config_loader.py)
+    ("litellm.proxy.proxy_server", "ProxyConfig", "_get_config_from_file"),
+)
+
+
+class Level(StrEnum):
+    OK = "통과"
+    WARN = "경고"
+    FAIL = "실패"
+    SKIP = "확인 불가"
+
+
+@dataclass(frozen=True)
+class Finding:
+    item: str
+    level: Level
+    message: str
+
+
+@dataclass
+class Report:
+    findings: list[Finding] = field(default_factory=list)
+    observations: dict[str, Any] = field(default_factory=dict)
+
+    def add(self, item: str, level: Level, message: str = "") -> None:
+        self.findings.append(Finding(item, level, message))
+
+    @property
+    def failed(self) -> bool:
+        return any(f.level is Level.FAIL for f in self.findings)
+
+    @property
+    def incomplete(self) -> list[str]:
+        """확인하지 못한 필수 행. 실패는 아니지만 점검이 끝났다고 말할 수 없다."""
+        return [
+            f.item
+            for f in self.findings
+            if f.level is Level.SKIP
+            and (f.item in EXTRA_REQUIRED
+                 or (f.item in _ROWS and _ROWS[f.item].grade is SettingGrade.REQUIRED))
+        ]
+
+    def render(self) -> str:
+        lines = [f"[{f.level.value}] {f.item}" + (f": {f.message}" if f.message else "")
+                 for f in self.findings]
+        lines.append("관측 항목")
+        lines.extend(f"  {name}: {self.observations.get(name, '확인 불가')}"
+                     for name in OBSERVATION_ITEMS)
+        return "\n".join(lines)
+
+
+def probe_compat_symbols() -> list[str] | None:
+    """없는 심볼 이름 목록. LiteLLM을 불러올 수 없으면 None."""
+    missing: list[str] = []
+    for module_name, obj_name, attr in COMPAT_SYMBOLS:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            if _litellm_absent():
+                return None
+            missing.append(module_name)
+            continue
+        if obj_name is not None:
+            target = getattr(module, obj_name, None)
+            if target is None or not hasattr(target, attr or ""):
+                missing.append(f"{module_name}.{obj_name}.{attr}")
+    return missing
+
+
+def _litellm_absent() -> bool:
+    try:
+        importlib.import_module("litellm")
+    except ImportError:
+        return True
+    return False
+
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def run_checks(
+    config: Mapping[str, Any] | None,
+    env: Mapping[str, str],
+    litellm: LiteLLMAdmin | None,
+    *,
+    replicas: int = 1,
+    registered_servers: list[dict] | None = None,
+    policy_state: PolicyState | None = None,
+    check_fingerprint: bool = False,
+    env_file_keys: frozenset[str] = frozenset(),
+    compat_probe: Callable[[], list[str] | None] = probe_compat_symbols,
+) -> Report:
+    report = Report()
+    grade_fail = {SettingGrade.REQUIRED: Level.FAIL, SettingGrade.RECOMMENDED: Level.WARN}
+
+    def judge(key: str, ok: bool, message: str) -> None:
+        if ok:
+            report.add(key, Level.OK)
+        else:
+            report.add(key, grade_fail[_ROWS[key].grade], message)
+
+    file_missing = config is None
+    if config is None:
+        report.add("LiteLLM 설정 파일", Level.FAIL,
+                   "MINT_LITELLM_CONFIG(또는 --config)로 설정 파일을 지정해야 검사할 수 있습니다.")
+        config = {}
+    general = config.get("general_settings") or {}
+    lsettings = config.get("litellm_settings") or {}
+    servers_cfg: dict[str, dict] = config.get("mcp_servers") or {}
+
+    if not file_missing:
+        _check_file_rows(judge, config, general, lsettings, servers_cfg, env, replicas)
+        _check_env_rows(judge, general, env)
+
+    # 관리 API 기반 행
+    if litellm is not None:
+        _check_registry_rows(report, judge, litellm, registered_servers or [], config)
+        _check_keys_and_teams(report, judge, litellm, _mint_guardrail_names(config))
+        if not file_missing:
+            _check_guardrail_registered(report, litellm, config)
+    else:
+        for key in ("서버 이름·별칭 유일성", "사용자·팀에 결속되지 않은 키"):
+            report.add(key, Level.SKIP, "LiteLLM 관리 API가 설정되어 있지 않습니다.")
+        if not file_missing:
+            report.add("guardrails[MINT]", Level.SKIP,
+                       "실행 중인 LiteLLM의 가드레일 등록을 확인하지 못했습니다(관리 API 없음).")
+
+    if policy_state is not None:
+        _policy_finding(report, policy_state)
+    if check_fingerprint:
+        _fingerprint_finding(report, env, env_file_keys)
+    missing = compat_probe()
+    if missing is None:
+        report.add("호환 계층 비공개 심볼", Level.SKIP,
+                   "이 환경에 LiteLLM이 설치되어 있지 않습니다(플러그인 기동 점검이 확인합니다).")
+    else:
+        judge("호환 계층 비공개 심볼", not missing, "없는 심볼: " + ", ".join(missing))
+
+    report.observations["spend_log_arguments_stored"] = (
+        "확인 불가" if file_missing else str(not _truthy(general.get("disable_spend_logs"))).lower()
+    )
+    report.observations["auth_cache_shared"] = str(
+        _truthy(lsettings.get("enable_redis_auth_cache"))
+    ).lower()
+    return report
+
+
+def _check_file_rows(judge, config, general, lsettings, servers_cfg, env, replicas) -> None:
+    # 가드레일 항목
+    guardrails = config.get("guardrails") or []
+    mint_index = next(
+        (i for i, g in enumerate(guardrails)
+         if str((g.get("litellm_params") or {}).get("guardrail", "")).endswith(".MintGuardrail")),
+        None,
+    )
+    if mint_index is None:
+        judge("guardrails[MINT]", False, "MINT 가드레일 항목이 없습니다.")
+    else:
+        params = guardrails[mint_index].get("litellm_params") or {}
+        modes = params.get("mode")
+        modes = [modes] if isinstance(modes, str) else list(modes or [])
+        problems = []
+        if not set(GUARDRAIL_MODES) <= set(modes):
+            problems.append("mode에 pre_mcp_call과 post_mcp_call이 모두 필요합니다")
+        if params.get("default_on") is not True:
+            problems.append("default_on이 true가 아닙니다")
+        judge("guardrails[MINT]", not problems, "; ".join(problems))
+
+    callbacks = lsettings.get("callbacks") or []
+    callbacks = [callbacks] if isinstance(callbacks, str) else callbacks
+    logged = [
+        c for c in callbacks
+        if isinstance(c, str) and c.endswith(LOGGER_SUFFIXES)
+    ]
+    judge("callbacks", not logged,
+          "MINT 로거는 가드레일이 등록하므로 litellm_settings.callbacks에 적으면 안 됩니다: "
+          + ", ".join(logged))
+
+    open_servers = [n for n, s in servers_cfg.items() if _truthy((s or {}).get("allow_all_keys"))]
+    judge("mcp_servers.<이름>.allow_all_keys", not open_servers,
+          "allow_all_keys가 true인 서버: " + ", ".join(open_servers))
+    unnamed = [n for n, s in servers_cfg.items() if not (s or {}).get("server_id")]
+    judge("mcp_servers.<이름>.server_id", not unnamed,
+          "server_id가 없는 설정 서버: " + ", ".join(unnamed))
+
+    judge("require_key_mcp_access_defined", general.get("require_key_mcp_access_defined") is True,
+          "general_settings.require_key_mcp_access_defined가 true가 아닙니다.")
+    judge("store_prompts_in_spend_logs",
+          not _truthy(general.get("store_prompts_in_spend_logs"))
+          and not _truthy(env.get("STORE_PROMPTS_IN_SPEND_LOGS", "false")),
+          "도구 결과 본문이 지출 로그에 저장됩니다.")
+    judge("user_url_validation", lsettings.get("user_url_validation", True) is not False,
+          "litellm_settings.user_url_validation이 false입니다.")
+    objects = general.get("supported_db_objects")
+    judge("supported_db_objects", objects is None or "mcp" in objects,
+          "supported_db_objects에 mcp가 없습니다.")
+
+    roles = (((lsettings.get("key_generation_settings") or {}).get("personal_key_generation")
+              or {}).get("allowed_user_roles"))
+    judge("key_generation_settings.personal_key_generation.allowed_user_roles",
+          roles == ["proxy_admin"], 'allowed_user_roles를 ["proxy_admin"]으로 제한하십시오.')
+    judge("mcp_allow_all_keys_respects_mcp_scope",
+          general.get("mcp_allow_all_keys_respects_mcp_scope") is True,
+          "general_settings.mcp_allow_all_keys_respects_mcp_scope를 true로 설정하십시오.")
+    no_issuer = [n for n, s in servers_cfg.items()
+                 if str((s or {}).get("auth_type", "")).lower() in _DISCOVERY_AUTH
+                 and not (s or {}).get("issuer")]
+    judge("mcp_servers.<이름>.issuer", not no_issuer,
+          "issuer가 없는 발견형 인증 서버: " + ", ".join(no_issuer))
+    judge("enable_redis_auth_cache",
+          replicas < 2 or _truthy(lsettings.get("enable_redis_auth_cache")),
+          "복제본이 둘 이상이면 enable_redis_auth_cache와 공유 Redis를 설정하십시오.")
+    not_enforced = [n for n, s in servers_cfg.items()
+                    if str((s or {}).get("auth_type", "")).lower() in _DISCOVERY_AUTH
+                    and ((s or {}).get("oauth_identity_binding") or {}).get("mode") != "enforce"]
+    judge("mcp_servers.<이름>.oauth_identity_binding.mode", not not_enforced,
+          "enforce가 아닌 OAuth 서버: " + ", ".join(not_enforced))
+
+
+def _check_env_rows(judge, general, env) -> None:
+    judge("LITELLM_STRICT_GUARDRAIL_MODES",
+          str(env.get("LITELLM_STRICT_GUARDRAIL_MODES", "true")).lower() != "false",
+          "LITELLM_STRICT_GUARDRAIL_MODES=false는 허용되지 않습니다.")
+    judge("PROXY_BASE_URL", bool(env.get("PROXY_BASE_URL")), "PROXY_BASE_URL을 설정하십시오.")
+    judge("MCP_TRUSTED_REDIRECT_ORIGINS", bool(env.get("MCP_TRUSTED_REDIRECT_ORIGINS")),
+          "MCP_TRUSTED_REDIRECT_ORIGINS를 배치에 맞게 설정하십시오.")
+    forwarded = _truthy(general.get("use_x_forwarded_for"))
+    ranges = bool(general.get("mcp_trusted_proxy_ranges"))
+    judge("use_x_forwarded_for, mcp_trusted_proxy_ranges", forwarded == ranges,
+          "use_x_forwarded_for와 mcp_trusted_proxy_ranges는 함께 설정해야 합니다.")
+    judge("LEGACY_MULTI_INSTANCE_RATE_LIMITING",
+          not _truthy(env.get("LEGACY_MULTI_INSTANCE_RATE_LIMITING", "false")),
+          "true이면 MCP 분당 호출 한도가 집행되지 않습니다.")
+
+
+def _check_registry_rows(
+    report, judge, litellm: LiteLLMAdmin, registered: list[dict], config: Mapping[str, Any]
+) -> None:
+    listing = litellm.list_servers()
+    names: dict[str, int] = {}
+    for entry in listing:
+        for label in {entry.get("server_name"), entry.get("alias")} - {None, ""}:
+            names[label] = names.get(label, 0) + 1
+    duplicated = sorted(n for n, c in names.items() if c > 1)
+    judge("서버 이름·별칭 유일성", not duplicated, "중복된 이름·별칭: " + ", ".join(duplicated))
+    by_id = {e["server_id"]: e for e in listing}
+    problems: list[str] = []
+    unverified: list[str] = []
+    open_servers: list[str] = []
+    for row in registered:
+        entry = by_id.get(row["server_id"])
+        if entry is None:
+            problems.append(f"{row['server_id']}: 레지스트리에 없음")
+            continue
+        if _truthy(entry.get("allow_all_keys")):
+            open_servers.append(row["server_id"])
+        if (entry.get("transport"), normalize_auth_type(entry.get("auth_type"))) != (
+            row["transport"], row["auth_type"]
+        ):
+            problems.append(f"{row['server_id']}: 전송·인증 방식 불일치")
+            continue
+        # 제어 평면 키에는 레지스트리 URL이 응답되지 않으므로 설정 파일의 URL로 대신 확인한다.
+        url = entry.get("url") or _config_server_url(config, row["server_id"])
+        if not url:
+            unverified.append(row["server_id"])
+        elif url_sha256(url) != row["url_sha256"]:
+            problems.append(f"{row['server_id']}: URL 해시 불일치")
+    if open_servers:
+        report.add("mcp_servers.<이름>.allow_all_keys", Level.FAIL,
+                   "allow_all_keys가 true인 등록 서버: " + ", ".join(open_servers))
+    if not registered:
+        return
+    if problems:
+        report.add("등록 서버의 계약 값", Level.FAIL, "; ".join(problems))
+    elif unverified:
+        report.add("등록 서버의 계약 값", Level.SKIP,
+                   "URL을 확인하지 못했습니다(제어 평면 키에는 레지스트리 URL이 응답되지 않고 설정 "
+                   "파일에도 없음): " + ", ".join(unverified))
+    else:
+        report.add("등록 서버의 계약 값", Level.OK)
+
+
+def _config_server_url(config: Mapping[str, Any], server_id: str) -> str | None:
+    for server in (config.get("mcp_servers") or {}).values():
+        if isinstance(server, Mapping) and server.get("server_id") == server_id:
+            return server.get("url") or None
+    return None
+
+
+def _permission_of(litellm: LiteLLMAdmin, kind: str, obj: Mapping[str, Any]) -> Mapping[str, Any]:
+    """목록 응답에 권한 객체가 생략된 키·팀은 상세 조회로 보충한다."""
+    permission = obj.get("object_permission")
+    if permission or not obj.get("object_permission_id"):
+        return permission or {}
+    detail = (
+        litellm.get_team(obj["team_id"]) if kind == "team" else litellm.get_key(obj["token"])
+    )
+    return (detail or {}).get("object_permission") or {}
+
+
+def _mint_guardrail_names(config: Mapping[str, Any]) -> frozenset[str]:
+    """설정 파일에서 MINT 가드레일의 이름. 설정이 없거나 정의가 없으면 기본 이름을 쓴다."""
+    names = {
+        g.get("guardrail_name")
+        for g in config.get("guardrails") or []
+        if str((g.get("litellm_params") or {}).get("guardrail", "")).endswith(".MintGuardrail")
+    } - {None}
+    return frozenset(names or {"mint"})
+
+
+def _check_keys_and_teams(
+    report, judge, litellm: LiteLLMAdmin, mint_names: frozenset[str]
+) -> None:
+    keys = litellm.list_keys()
+    teams = litellm.list_teams()
+    registry_ids = {s["server_id"] for s in litellm.list_servers()}
+    unbound = sum(1 for k in keys if not k.get("user_id") and not k.get("team_id"))
+    judge("사용자·팀에 결속되지 않은 키", unbound == 0,
+          f"사용자도 팀도 없는 키가 {unbound}개 있습니다.")
+    report.observations["unbound_keys"] = unbound
+
+    def optout(meta: Mapping[str, Any] | None) -> bool:
+        """LiteLLM 판정과 같은 기준: 제외는 목록일 때만, 전체 비활성은 ``True``일 때만 센다."""
+        meta = meta or {}
+        excluded = meta.get("opted_out_global_guardrails")
+        if meta.get("disable_global_guardrails") is True:
+            return True
+        return isinstance(excluded, list) and any(name in excluded for name in mint_names)
+
+    subjects = sum(1 for k in keys if optout(k.get("metadata"))) + sum(
+        1 for t in teams if optout(t.get("metadata"))
+    )
+    report.observations["guardrail_optout_subjects"] = subjects
+    if subjects:
+        report.add("가드레일 제외 대상", Level.WARN,
+                   f"키·팀 metadata로 가드레일을 끈 키·팀이 {subjects}개 있습니다. "
+                   "MINT 판정과 도구 목록 숨김은 그대로 적용되고, "
+                   "꺼지는 것은 다른 가드레일뿐입니다.")
+    bad: list[str] = []
+    for owner, kind, objects in (("키", "key", keys), ("팀", "team", teams)):
+        for obj in objects:
+            for entry in _permission_of(litellm, kind, obj).get("mcp_servers") or []:
+                if entry not in registry_ids:
+                    label = obj.get("key_alias") or obj.get("team_alias") or obj.get("token") or ""
+                    bad.append(f"{owner} {label}: {entry}")
+    if bad:
+        report.add("object_permission 서버 식별자 형식", Level.FAIL,
+                   "서버 식별자가 아닌 항목(별칭·이름은 server_id로 교정): " + "; ".join(bad))
+    else:
+        report.add("object_permission 서버 식별자 형식", Level.OK)
+
+
+def _check_guardrail_registered(report, litellm: LiteLLMAdmin, config: Mapping[str, Any]) -> None:
+    """설정 파일의 MINT 가드레일이 실행 중인 LiteLLM에 같은 값으로 올라와 있는지 다시 확인한다."""
+    declared = [
+        g.get("guardrail_name")
+        for g in config.get("guardrails") or []
+        if str((g.get("litellm_params") or {}).get("guardrail", "")).endswith(".MintGuardrail")
+    ]
+    live = {
+        g.get("guardrail_name"): g.get("litellm_params") or {} for g in litellm.list_guardrails()
+    }
+    problems: list[str] = []
+    for name in declared:
+        params = live.get(name)
+        if params is None:
+            problems.append(f"{name}: 실행 중인 LiteLLM에 등록되지 않았습니다")
+            continue
+        modes = params.get("mode")
+        modes = [modes] if isinstance(modes, str) else list(modes or [])
+        if not str(params.get("guardrail", "")).endswith(".MintGuardrail"):
+            problems.append(f"{name}: 등록된 클래스가 MINT 가드레일이 아닙니다")
+        if not set(GUARDRAIL_MODES) <= set(modes) or params.get("default_on") is not True:
+            problems.append(f"{name}: 실행 중인 모드·default_on이 설정 파일과 다릅니다")
+    if problems:
+        report.add("guardrails[MINT]", Level.FAIL, "; ".join(problems))
+
+
+def _policy_finding(report: Report, state: PolicyState) -> None:
+    if state.state == "match":
+        report.add(POLICY_ITEM, Level.OK, f"판본 {state.version}")
+    elif state.state == "none":
+        report.add(POLICY_ITEM, Level.WARN, state.detail)
+    elif state.state == "mismatch":
+        report.add(POLICY_ITEM, Level.FAIL, state.detail)
+    else:
+        report.add(POLICY_ITEM, Level.SKIP, state.detail)
+
+
+def _fingerprint_finding(
+    report: Report, env: Mapping[str, str], env_file_keys: frozenset[str]
+) -> None:
+    """검사에 쓰인 인자 지문 키와 키 판본이 있고 형식이 맞는지 본다.
+
+    환경 변수에 없으면 서비스에 같은 값을 주는 비밀 파일을 본다. 읽을 수 없으면 확인 못한 것이다.
+    출처를 함께 적는다: 실행 중인 LiteLLM 서비스가 실제로 받은 값과 대조하지는 않는다.
+    """
+    try:
+        key, version, source = secrets_file.load_fingerprint_key_with_source(env)
+    except ControlError as error:
+        # 키가 없다는 것과 파일을 읽을 수 없다는 것을 구분한다.
+        wrong = "찾을 수 없습니다" in str(error) or "정수가 아닙니다" in str(error)
+        level = Level.FAIL if wrong else Level.SKIP
+        report.add(FINGERPRINT_ITEM, level, str(error))
+        return
+    if source != "environment":
+        origin = f"비밀 파일 {source}"
+    elif KEY_NAME_IN_FILE in env_file_keys:
+        origin = "--env-file"
+    else:
+        origin = "이 프로세스의 환경 변수"
+    note = f" (검사 출처: {origin}; 실행 중인 LiteLLM 서비스가 받은 값과는 대조하지 않음)"
+    try:
+        fingerprint.decode_fingerprint_key(key)
+    except ValueError as error:
+        report.add(FINGERPRINT_ITEM, Level.FAIL, f"키 형식이 올바르지 않습니다: {error}{note}")
+        return
+    if version < 1:
+        report.add(FINGERPRINT_ITEM, Level.FAIL, f"키 판본은 1 이상이어야 합니다.{note}")
+        return
+    report.add(FINGERPRINT_ITEM, Level.OK, f"키 판본 {version}{note}")

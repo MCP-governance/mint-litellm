@@ -1,0 +1,103 @@
+name: mint
+
+services:
+  # PostgreSQL 16.15
+  postgres:
+    image: postgres:16@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD를 .env에 설정하십시오}
+      POSTGRES_DB: litellm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -U postgres || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # 번들 모드(--bundle)로 띄우고 번들 파일을 감시한다. --bundle 없이 타르볼을 감시하면 재적재 때
+  # 이전 파일과 새 파일이 함께 남아 적재가 실패한다. 번들 디렉터리는 제어 평면 컨테이너와 공유하는
+  # 명명 볼륨이어야 하며, 호스트 디렉터리 바인드 마운트는 파일 변경 알림이 전달되지 않는다.
+  opa:
+    image: openpolicyagent/opa:1.21.4@sha256:12420358d3f22a0cd2424ddc44a16e292ecb42825d3dfbca779986006822a3f6
+    command: ["run", "--server", "--addr", ":8181", "--bundle", "--watch", "/bundles/mint.tar.gz"]
+    volumes:
+      - bundles:/bundles:ro
+    restart: unless-stopped
+
+  litellm:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.litellm
+    image: mint-litellm:local
+    command: ["--config", "/app/config/litellm.config.yaml", "--port", "4000"]
+    # 인자 지문 키(MINT_FINGERPRINT_KEY, MINT_FINGERPRINT_KEY_VERSION)는 저장소 밖 비밀 파일에서 읽는다.
+    env_file:
+      - path: ${MINT_SECRETS_DIR:?MINT_SECRETS_DIR를 .env에 설정하십시오}/secrets.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY를 .env에 설정하십시오}
+      STORE_MODEL_IN_DB: "True"
+      PROXY_BASE_URL: ${PROXY_BASE_URL:-}
+      MCP_TRUSTED_REDIRECT_ORIGINS: ${MCP_TRUSTED_REDIRECT_ORIGINS:-}
+      MINT_INSTANCE_ID: ${MINT_INSTANCE_ID:-default}
+      MINT_MODE: ${MINT_MODE:-enforce}
+      MINT_DATABASE_URL: postgresql://mint_plugin_app:${MINT_PLUGIN_DB_PASSWORD}@postgres:5432/mint
+      MINT_OPA_URL: http://opa:8181
+      MINT_BUFFER_DIR: /var/lib/mint/buffer
+      MINT_BUFFER_MAX_BYTES: ${MINT_BUFFER_MAX_BYTES:-52428800}
+      MINT_DB_POOL_SIZE: ${MINT_DB_POOL_SIZE:-8}
+      MINT_DECISION_BUDGET_MS: ${MINT_DECISION_BUDGET_MS:-300}
+      MINT_READINESS_URL: http://localhost:4000/health/readiness
+      MINT_SELFCHECK_GRACE_SECONDS: ${MINT_SELFCHECK_GRACE_SECONDS:-30}
+    ports:
+      - "${MINT_LITELLM_PORT:-4000}:4000"
+    volumes:
+      - ./config:/app/config:ro
+      - buffer:/var/lib/mint/buffer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opa:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:4000/health/liveliness', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+
+  # 운영자 명령줄 도구. 예: docker compose run --rm control status
+  control:
+    image: mint-litellm:local
+    profiles: ["tools"]
+    entrypoint: ["mint-litellm"]
+    env_file:
+      - .env
+      - path: ${MINT_SECRETS_DIR:?MINT_SECRETS_DIR를 .env에 설정하십시오}/secrets.env
+        required: false
+    environment:
+      MINT_SECRETS_FILE: /run/mint-secrets/secrets.env
+      MINT_DATABASE_URL: postgresql://mint_control_app:${MINT_CONTROL_DB_PASSWORD}@postgres:5432/mint
+      MINT_LITELLM_URL: http://litellm:4000
+      MINT_LITELLM_CONFIG: /app/config/litellm.config.yaml
+      MINT_OPERATOR_TOKEN: ${MINT_OPERATOR_TOKEN:-}
+      MINT_OPA_URL: http://opa:8181
+      MINT_POLICY_ROOT: /opt/mint
+      MINT_OPA_BUNDLE_PATH: /bundles/mint.tar.gz
+    volumes:
+      - ./config:/app/config
+      - bundles:/bundles
+      - ${MINT_SECRETS_DIR}:/run/mint-secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  bundles:
+  buffer:

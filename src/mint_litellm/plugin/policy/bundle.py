@@ -293,6 +293,8 @@ def _write_atomic(path: Path, data: bytes) -> None:
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
+        # 임시 파일은 소유자만 읽을 수 있어, 다른 사용자로 실행되는 정책 엔진이 읽도록 연다.
+        os.chmod(temp_name, 0o644)
         os.replace(temp_name, path)
     finally:
         if os.path.exists(temp_name):
