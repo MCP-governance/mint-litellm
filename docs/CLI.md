@@ -121,7 +121,7 @@
 | `init` | `migrations`(이번에 적용한 마이그레이션), `login_roles`(설정한 로그인 역할), `snippet_path`(설정 조각 파일) 또는 `snippet`(`--out -`일 때 본문) |
 | `check` | `incomplete`(확인하지 못한 필수 행), `findings`(각 항목 `item`, `level`=`OK`·`INFO`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
 | `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `policy_bundle`(`state`: `match`·`mismatch`·`unverified`·`none`, `detail`), `servers`(상태별 개수), `enforcement`(워커별 최근 집행 점검 전환: `worker_id`, `passed`, `failed`, `last_transition_at`, `run_id`), `alerts`, `observations` |
-| `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`) |
+| `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`, `final`) |
 
 ## 종료 코드
 
@@ -150,7 +150,7 @@
 
 ## 원장 조회
 
-`ledger list`는 `--kind`, `--since`, `--until`, `--invocation-id`로 사건을 거른다. 호출이 차단되었을 때 오류 본문의 `reference`(`<호출 식별자>:<시도 번호>`)는 `--decision-ref`에 그대로 넣으면 그 판정 사건 하나를 찾는다. `--decision-ref`와 `--invocation-id`는 함께 쓸 수 없다. 한 호출의 판정 사건이 시도 번호별로 여럿이면(감사 기록 결과가 불명이어서 호출을 막은 경우 등) 시도 번호가 가장 큰 사건이 최종 집행이다.
+`ledger list`는 `--kind`, `--since`, `--until`, `--invocation-id`로 사건을 거른다. 호출이 차단되었을 때 오류 본문의 `reference`(`<호출 식별자>:<시도 번호>`)는 `--decision-ref`에 그대로 넣으면 그 판정 사건 하나를 찾는다. `--decision-ref`와 `--invocation-id`는 함께 쓸 수 없다. 한 호출의 판정 사건이 시도 번호별로 여럿이면(감사 기록 결과가 불명이어서 호출을 막은 경우 등) 시도 번호가 가장 큰 사건이 최종 집행이다. 사람이 읽는 출력에는 그 줄 끝에 `최종`이 붙고, 판정 사유(`사유 CANCELLED` 등)와 이전 시도 참조(`이전 시도 <호출 식별자>:<시도 번호>`, 사건 `payload`의 `original_decision_ref`)도 나온다. `--json`에서는 사건마다 `final`이 `true`(그 호출의 시도 중 번호가 가장 큰 사건) 또는 `false`이며, 호출 식별자가 없는 사건은 `false`이다. 목록 판정(발견) 사건도 같은 규칙이다. 호출이 어떻게 끝났는지는 `final`이 `true`인 사건의 집행 결과와 사유로 읽고, 이전 시도의 사건은 최종 집행에 이르기 전의 기록으로 본다. `--kind`나 `--limit`으로 걸러도 `final`은 걸러지지 않은 전체 시도를 기준으로 정해진다.
 
 ## 지문 키 점검
 

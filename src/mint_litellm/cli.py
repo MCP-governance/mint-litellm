@@ -344,6 +344,24 @@ def _decision_ref(text: str) -> tuple[UUID, int]:
     return parsed
 
 
+def _ledger_line(row: dict) -> str:
+    """같은 호출의 시도 중 번호가 가장 큰 사건에는 「최종」을, 이전 시도 참조와 사유를 덧붙인다."""
+    line = (
+        f"{row['inserted_at'].isoformat()}\t{row['kind']}\t{row['actor'] or '-'}\t"
+        f"{row['source_key']}"
+    )
+    payload = row["payload"] if isinstance(row["payload"], dict) else {}
+    reasons = [payload.get("stop"), *(payload.get("findings") or [])]
+    codes = [r["reason_code"] for r in reasons if isinstance(r, dict) and r.get("reason_code")]
+    if codes:
+        line += "\t사유 " + ",".join(codes)
+    if payload.get("original_decision_ref"):
+        line += f"\t이전 시도 {payload['original_decision_ref']}"
+    if row["final"] and row["attempt_id"] is not None:
+        line += "\t최종"
+    return line
+
+
 def _ledger_list(run: Run) -> None:
     a = run.args
     invocation_id, attempt_id = a.invocation_id, None
@@ -363,10 +381,7 @@ def _ledger_list(run: Run) -> None:
     )
     run.data["events"] = [json.loads(json.dumps(row, default=str)) for row in rows]
     for row in rows:
-        run.say(
-            f"{row['inserted_at'].isoformat()}\t{row['kind']}\t{row['actor'] or '-'}\t"
-            f"{row['source_key']}"
-        )
+        run.say(_ledger_line(row))
 
 
 def _policy_activate(run: Run) -> None:
