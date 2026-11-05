@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import errno
 import io
 import json
 import os
 import threading
+import time
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -170,8 +172,19 @@ class TestLocalBuffer:
         assert len(closed_files(buffer)) > 8
 
     def test_buffers_sharing_a_directory_trim_it_without_failing(self, tmp_path):
-        first, second = LocalBuffer(tmp_path, 16 * 1024), LocalBuffer(tmp_path, 16 * 1024)
+        cap = 16 * 1024
+        sizes = self.fill_shared_directory(tmp_path, cap)
+        assert sizes["errors"] == []
+        if fcntl is not None:
+            assert sizes["largest"] <= cap and sizes["final"] <= cap
+
+    @staticmethod
+    def fill_shared_directory(tmp_path, cap):
+        """한 디렉터리를 쓰는 버퍼 넷이 상한을 넘겨 쓰는 동안 디렉터리 크기를 잰다."""
+        buffers = [LocalBuffer(tmp_path, cap) for _ in range(4)]
         errors: list[Exception] = []
+        largest = [0]
+        done = threading.Event()
 
         def work(buffer: LocalBuffer, worker: int) -> None:
             for i in range(60):
@@ -182,16 +195,24 @@ class TestLocalBuffer:
                 except Exception as exc:
                     errors.append(exc)
 
-        threads = [
-            threading.Thread(target=work, args=(buffer, w))
-            for w, buffer in enumerate((first, second, first, second))
-        ]
+        def watch() -> None:
+            while not done.is_set():
+                with contextlib.suppress(OSError):
+                    total = sum(p.stat().st_size for p in tmp_path.iterdir() if p.is_file())
+                    largest[0] = max(largest[0], total)
+                time.sleep(0.002)
+
+        threads = [threading.Thread(target=work, args=(b, w)) for w, b in enumerate(buffers)]
+        watcher = threading.Thread(target=watch)
+        watcher.start()
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
-        assert errors == []
-        assert sum(p.stat().st_size for p in tmp_path.iterdir()) <= 16 * 1024 + 2048
+        done.set()
+        watcher.join()
+        final = sum(p.stat().st_size for p in tmp_path.iterdir() if p.is_file())
+        return {"errors": errors, "largest": largest[0], "final": final}
 
     @pytest.mark.skipif(os.name != "posix", reason="needs directory fsync")
     def test_a_failed_directory_fsync_is_a_write_failure(self, tmp_path, monkeypatch):

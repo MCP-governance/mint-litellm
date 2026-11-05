@@ -113,17 +113,19 @@ class LocalBuffer:
         data = (line + "\n").encode("utf-8")
         # 용량 확인, 회전, 쓰기, fsync, 크기 갱신을 한 잠금으로 묶는다. 다른 스레드의 회전이 끼면
         # 쓴 줄이 이미 닫힌 파일이나 다른 파일에 대한 fsync로 성공 처리될 수 있다.
+        # 같은 디렉터리를 쓰는 다른 프로세스도 용량 확인과 쓰기 사이에 끼지 못해야 상한이 지켜진다.
         with self._lock:
             try:
                 self._dir.mkdir(parents=True, exist_ok=True)
-                self._make_room(len(data))
-                if self._handle is None or self._size + len(data) > self._segment_bytes:
-                    self._rotate()
-                assert self._handle is not None
-                self._handle.write(data)
-                self._handle.flush()
-                os.fsync(self._handle.fileno())
-                self._size += len(data)
+                with self._directory_lock():
+                    self._make_room(len(data))
+                    if self._handle is None or self._size + len(data) > self._segment_bytes:
+                        self._rotate()
+                    assert self._handle is not None
+                    self._handle.write(data)
+                    self._handle.flush()
+                    os.fsync(self._handle.fileno())
+                    self._size += len(data)
             except BufferWriteError:
                 raise
             except (OSError, ValueError) as exc:
@@ -327,22 +329,22 @@ class LocalBuffer:
         return total
 
     def _make_room(self, incoming: int) -> None:
-        with self._directory_lock():
-            while self._total_bytes() + incoming > self._max_bytes:
-                closed = sorted(p for p in self._dir.iterdir() if p.name.endswith(_CLOSED))
-                if not closed:
-                    if self._handle is not None and self._size > 0:
-                        self._close_current()
-                        continue
-                    raise BufferWriteError("buffer is full")
-                victim = closed[0]
-                try:
-                    events, unreadable = self.read(victim)
-                    victim.unlink()
-                except FileNotFoundError:
+        """호출하는 쪽이 디렉터리 잠금을 쥐고 있어야 한다."""
+        while self._total_bytes() + incoming > self._max_bytes:
+            closed = sorted(p for p in self._dir.iterdir() if p.name.endswith(_CLOSED))
+            if not closed:
+                if self._handle is not None and self._size > 0:
+                    self._close_current()
                     continue
-                self._dropped_events += len(events) + unreadable
-                self._dropped_files += 1
+                raise BufferWriteError("buffer is full")
+            victim = closed[0]
+            try:
+                events, unreadable = self.read(victim)
+                victim.unlink()
+            except FileNotFoundError:
+                continue
+            self._dropped_events += len(events) + unreadable
+            self._dropped_files += 1
 
 
 class Recorded(Protocol):
