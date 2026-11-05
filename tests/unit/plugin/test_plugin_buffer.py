@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import io
 import json
 import os
@@ -57,6 +58,11 @@ def recorder(tmp_path, store, *, stderr=None, max_bytes=1024 * 1024, interval=0.
     return rec, buffer
 
 
+def files(directory):
+    """버퍼 디렉터리의 데이터 파일(프로세스 사이 잠금 파일은 제외)."""
+    return sorted(p.name for p in directory.iterdir() if p.name != ".lock")
+
+
 def closed_files(buffer: LocalBuffer):
     buffer.close()
     return sorted(buffer._dir.glob("*.jsonl"))
@@ -106,14 +112,14 @@ class TestLocalBuffer:
         assert buffer.has_pending()
         (claimed,) = buffer.claim()
         buffer.discard(claimed)
-        assert not any(tmp_path.iterdir())
+        assert files(tmp_path) == []
 
     def test_the_size_cap_deletes_the_oldest_closed_files_and_counts_what_was_lost(self, tmp_path):
         buffer = LocalBuffer(tmp_path, 8 * 1024)
         big = "x" * 900
         for i in range(30):
             buffer.append(make_event(i, payload={"pad": big}))
-        total = sum(p.stat().st_size for p in tmp_path.iterdir())
+        total = sum(p.stat().st_size for p in tmp_path.iterdir() if p.name != ".lock")
         assert total <= 8 * 1024
         overflow = buffer.take_overflow()
         assert overflow is not None and overflow.dropped_files >= 1
@@ -184,6 +190,32 @@ class TestLocalBuffer:
             thread.join()
         assert errors == []
         assert sum(p.stat().st_size for p in tmp_path.iterdir()) <= 16 * 1024 + 2048
+
+    @pytest.mark.skipif(os.name != "posix", reason="needs directory fsync")
+    def test_a_failed_directory_fsync_is_a_write_failure(self, tmp_path, monkeypatch):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+
+        def failing(fd):
+            raise OSError(errno.EIO, "input/output error")
+
+        monkeypatch.setattr(os, "fsync", failing)
+        with pytest.raises(BufferWriteError):
+            buffer.append(make_event(1))
+
+    @pytest.mark.skipif(os.name != "posix", reason="needs directory fsync")
+    def test_a_filesystem_without_directory_fsync_still_buffers(self, tmp_path, monkeypatch):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        real = os.fsync
+
+        def unsupported_for_directories(fd):
+            if os.path.isdir(f"/proc/self/fd/{fd}"):
+                raise OSError(errno.EINVAL, "invalid argument")
+            real(fd)
+
+        monkeypatch.setattr(os, "fsync", unsupported_for_directories)
+        buffer.append(make_event(1))
+        (path,) = closed_files(buffer)
+        assert len(LocalBuffer.read(path)[0]) == 1
 
     def test_the_segment_size_counts_bytes_not_characters(self, tmp_path):
         buffer = LocalBuffer(tmp_path, 1024 * 1024)

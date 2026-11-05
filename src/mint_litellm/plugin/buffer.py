@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import itertools
 import os
 import sys
@@ -32,6 +33,8 @@ _OPEN = ".open"
 _CLOSED = ".jsonl"
 _REPLAYING = ".replaying"
 _LOCKFILE = ".lock"
+# 디렉터리 fsync를 지원하지 않는 파일 시스템이 돌려주는 오류. 그 밖의 오류는 실제 입출력 실패다.
+_DIRECTORY_FSYNC_UNSUPPORTED = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EBADF})
 _SYSTEM_KINDS = frozenset({EventKind.BUFFER_OVERFLOW, EventKind.BUFFER_REPLAYED})
 
 
@@ -224,7 +227,7 @@ class LocalBuffer:
         if fcntl is not None:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self._handle, self._path, self._size = handle, path, 0
-        self._fsync_directory()
+        self._fsync_directory(strict=True)
 
     def _close_current(self) -> None:
         handle, path = self._handle, self._path
@@ -247,15 +250,23 @@ class LocalBuffer:
             with contextlib.suppress(OSError):
                 handle.close()
 
-    def _fsync_directory(self) -> None:
+    def _fsync_directory(self, *, strict: bool = False) -> None:
+        """디렉터리 항목을 디스크에 남긴다. ``strict``이면 실제 입출력 실패를 올린다."""
         if os.name != "posix":
             return
-        with contextlib.suppress(OSError):
+        try:
             fd = os.open(self._dir, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        except OSError:
+            if strict:
+                raise
+            return
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if strict and exc.errno not in _DIRECTORY_FSYNC_UNSUPPORTED:
+                raise
+        finally:
+            os.close(fd)
 
     @contextlib.contextmanager
     def _directory_lock(self):
