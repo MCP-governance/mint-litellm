@@ -12,21 +12,21 @@ jobs:
   static:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: pip install -e ".[dev]"
-      - run: ruff check src tests
-      - run: pyflakes src tests
+          enable-cache: true
+      - run: uv lock --check
+      - run: uv sync --locked --extra dev
+      - run: uv run --no-sync ruff check src tests
+      - run: uv run --no-sync pyflakes src tests
 
   unit:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a
         env:
           POSTGRES_PASSWORD: ci-only-password
         ports:
@@ -39,11 +39,11 @@ jobs:
     env:
       MINT_TEST_DATABASE_URL: postgresql://postgres:ci-only-password@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: pip install -e ".[dev]"
-      - run: pytest tests/unit
+          enable-cache: true
+      - run: uv lock --check
+      - run: uv sync --locked --extra dev --extra litellm
+      - run: uv run --no-sync pytest tests/unit
