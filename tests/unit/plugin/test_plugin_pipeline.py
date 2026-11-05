@@ -430,6 +430,54 @@ class TestDenialAndApproval:
         absent = snapshot(approvals=(), settings=observe)
         assert decide(harness(tmp_path, absent, cfg=cfg)).allowed
 
+    @pytest.mark.parametrize("mode", [Mode.ENFORCE, Mode.OBSERVE])
+    def test_a_revocation_is_not_hidden_by_a_not_started_approval(self, tmp_path, mode):
+        snap = snapshot(
+            approvals=(
+                approval(id="a1", status="revoked"),
+                approval(id="a2", valid_from=NOW + timedelta(hours=1)),
+            ),
+            settings=SettingsRow(mode=mode),
+        )
+        h = harness(tmp_path, snap, cfg=config(tmp_path, mode_ceiling=mode))
+        outcome = decide(h)
+        assert code(outcome) == "MINT-APPROVAL-REVOKED" and not outcome.allowed
+        assert outcome.snapshot.stop is not None
+
+    def test_not_started_and_pending_approvals_alone_are_only_an_absence(self, tmp_path):
+        snap = snapshot(
+            approvals=(
+                approval(id="a1", valid_from=NOW + timedelta(hours=1)),
+                approval(id="a2", status="pending"),
+            )
+        )
+        outcome = decide(harness(tmp_path, snap))
+        assert code(outcome) == "MINT-APPROVAL-ABSENT" and outcome.snapshot.stop is None
+
+    @pytest.mark.parametrize("mode", [Mode.ENFORCE, Mode.OBSERVE])
+    def test_an_expiry_is_not_hidden_by_a_pending_approval(self, tmp_path, mode):
+        snap = snapshot(
+            approvals=(
+                approval(id="a1", valid_until=NOW - timedelta(seconds=1)),
+                approval(id="a2", status="pending"),
+            ),
+            settings=SettingsRow(mode=mode),
+        )
+        h = harness(tmp_path, snap, cfg=config(tmp_path, mode_ceiling=mode))
+        outcome = decide(h)
+        assert code(outcome) == "MINT-APPROVAL-EXPIRED" and outcome.snapshot.stop is not None
+
+    def test_revocation_outranks_expiry_next_to_not_started_and_pending_approvals(self, tmp_path):
+        snap = snapshot(
+            approvals=(
+                approval(id="a1", valid_until=NOW - timedelta(days=1)),
+                approval(id="a2", status="revoked"),
+                approval(id="a3", valid_from=NOW + timedelta(days=1)),
+                approval(id="a4", status="pending"),
+            )
+        )
+        assert code(decide(harness(tmp_path, snap))) == "MINT-APPROVAL-REVOKED"
+
     def test_a_tool_outside_every_valid_approval_is_a_finding(self, tmp_path):
         snap = snapshot(approvals=(approval(tools=("other",)),))
         outcome = decide(harness(tmp_path, snap))
