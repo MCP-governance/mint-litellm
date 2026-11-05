@@ -198,3 +198,45 @@ def test_every_connection_stale_ends_with_an_operational_error():
             await db._run(work)
 
     run(go())
+
+
+def test_giving_up_after_a_stale_connection_cancels_the_work_before_it_starts(monkeypatch):
+    from psycopg import OperationalError
+
+    severed = []
+    monkeypatch.setattr(snapshot_module, "_sever", lambda conn: severed.append(conn))
+
+    class Stale(FakeConnection):
+        async def execute(self, sql):
+            raise OperationalError("closed")
+
+    acquiring = asyncio.Event()
+    calls = []
+
+    @contextlib.asynccontextmanager
+    async def connection():
+        if not calls:
+            calls.append("stale")
+            yield Stale()
+            return
+        acquiring.set()
+        await asyncio.sleep(3600)
+        yield FakeConnection()
+
+    db = database_with(connection)
+    ran = []
+
+    async def go():
+        async def work(conn):
+            ran.append(conn)
+
+        task = asyncio.ensure_future(db._run(work))
+        await acquiring.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+
+    run(go())
+    assert severed == []
+    assert ran == []

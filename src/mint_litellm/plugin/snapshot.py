@@ -489,18 +489,22 @@ class PluginDatabase:
             for _ in range(self.max_size + 1):
                 try:
                     async with await self._connection() as conn:
+                        # 쥔 동안에만 끊을 대상이다. 풀로 돌아간 연결은 다른 호출이 쓴다.
                         held[:] = [conn]
-                        idle = time.monotonic() - getattr(conn, "_mint_used", 0.0)
-                        if idle > _IDLE_CHECK_SECONDS:
-                            try:
-                                await conn.execute("")
-                            except OperationalError:
-                                # 나가면 풀이 끊어진 연결을 버리고, 다음에는 다른 연결을 받는다.
-                                raise _StaleConnection from None
                         try:
-                            return await work(conn)
+                            idle = time.monotonic() - getattr(conn, "_mint_used", 0.0)
+                            if idle > _IDLE_CHECK_SECONDS:
+                                try:
+                                    await conn.execute("")
+                                except OperationalError:
+                                    # 나가면 풀이 끊어진 연결을 버리고, 다음에는 다른 연결을 받는다.
+                                    raise _StaleConnection from None
+                            try:
+                                return await work(conn)
+                            finally:
+                                conn._mint_used = time.monotonic()
                         finally:
-                            conn._mint_used = time.monotonic()
+                            held.clear()
                 except _StaleConnection:
                     continue
             raise OperationalError("no usable database connection")
