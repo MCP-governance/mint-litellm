@@ -469,6 +469,148 @@ class TestGuardrail:
         ).code == ("MINT-SCHEMA-ERROR")
 
 
+class ArgumentsRewriter(CustomGuardrail):
+    """도구 호출 인자를 바꿔 돌려주는 가드레일."""
+
+    def __init__(self, replacement, **kwargs):
+        super().__init__(**kwargs)
+        self.replacement = replacement
+
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        return {**data, "modified_arguments": self.replacement}
+
+
+class TestCallbackChain:
+    """LiteLLM의 사전 훅 순회를 그대로 거쳐, 판정한 인자와 전송될 인자를 대조한다."""
+
+    SENT = {"q": "x"}
+    OTHER = {"q": "y"}
+
+    def run_chain(self, tmp_path, monkeypatch, order, snap, evaluate="allow"):
+        """``order``의 문자열은 MINT 로거·가드레일, 딕셔너리는 인자를 그 값으로 바꾸는 가드레일."""
+        import litellm
+        from litellm.caching.caching import DualCache
+        from litellm.proxy.utils import ProxyLogging
+
+        runtime, store, _ = build_runtime(tmp_path, snap, evaluate=evaluate)
+        logger = make_logger(runtime)
+        guardrail = MintGuardrail(
+            runtime=runtime,
+            guardrail_name="mint",
+            event_hook=["pre_mcp_call", "post_mcp_call"],
+            default_on=True,
+        )
+        chain = []
+        for index, item in enumerate(order):
+            if item == "logger":
+                chain.append(logger)
+            elif item == "guardrail":
+                chain.append(guardrail)
+            else:
+                chain.append(
+                    ArgumentsRewriter(
+                        item,
+                        guardrail_name=f"rewriter{index}",
+                        event_hook="pre_mcp_call",
+                        default_on=True,
+                    )
+                )
+        monkeypatch.setattr(litellm, "callbacks", chain)
+        proxy = ProxyLogging(user_api_key_cache=DualCache())
+        obj = logging_obj()
+        data = synthesized(obj, mcp_arguments=dict(self.SENT))
+        result = SimpleNamespace(error=None, sent=None, obj=obj, store=store, logger=logger)
+        try:
+            data = run(
+                proxy.pre_call_hook(user_api_key_dict=auth(), data=data, call_type="call_mcp_tool")
+            )
+        except HTTPException as exc:
+            result.error = MintError.from_detail(exc.detail)
+            return result
+        kwargs = proxy.convert_mcp_hook_response_to_kwargs(data, {"arguments": dict(self.SENT)})
+        result.sent = kwargs["arguments"]
+        return result
+
+    def test_the_unchanged_arguments_pass_the_whole_chain(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        result = self.run_chain(tmp_path, monkeypatch, ["logger", "guardrail"], contract_snapshot)
+        assert result.error is None and result.sent == self.SENT
+
+    def test_arguments_changed_after_the_judgment_are_not_sent(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        order = ["logger", self.OTHER, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
+        assert result.sent is None
+        assert result.error.code == "MINT-ENFORCEMENT-UNVERIFIED"
+        assert result.error.dispatch_state.value == "not_dispatched"
+        assert result.obj.model_call_details[MINT_CTX_KEY]["allowed"] is False
+        actions = [e.payload["enforced_action"] for e in result.store.of_kind("decision_evaluated")]
+        assert sorted(actions) == ["allow", "block"]
+
+    def test_a_change_that_was_blocked_leaves_no_unknown_outcome_event(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        order = ["logger", self.OTHER, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
+        ctx = result.obj.model_call_details[MINT_CTX_KEY]
+        failure = {MINT_CTX_KEY: ctx, "exception": ValueError()}
+        run(result.logger.async_log_failure_event(failure, None, None, None))
+        assert result.store.of_kind("call_outcome_unknown") == []
+
+    @pytest.mark.parametrize("replacement", [{"q": "x"}, {}], ids=["same", "empty"])
+    def test_a_replacement_that_changes_nothing_is_not_a_change(
+        self, tmp_path, monkeypatch, contract_snapshot, replacement
+    ):
+        order = ["logger", replacement, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
+        assert result.error is None and result.sent == self.SENT
+
+    @pytest.mark.parametrize(
+        ("approved", "expected"),
+        [({"q": "x"}, "MINT-CALL-APPROVAL-REQUIRED"), ({"q": "y"}, None)],
+        ids=["old-arguments-approved", "new-arguments-approved"],
+    )
+    def test_a_change_before_the_logger_is_what_gets_judged_and_sent(
+        self, tmp_path, monkeypatch, contract_snapshot, approved, expected
+    ):
+        from plugin_helpers import FP_KEY, call_approval
+
+        from mint_litellm.types.fingerprint import argument_fingerprint
+
+        snap = snapshot(
+            server=contract_snapshot.server,
+            approvals=contract_snapshot.approvals,
+            call_approvals=(call_approval(args_fp=argument_fingerprint(approved, FP_KEY)),),
+        )
+        evaluate = evaluator("RequireApproval", policy_ids=("R2",))
+        order = [self.OTHER, "logger", "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, snap, evaluate)
+        assert (result.error.code if result.error else None) == expected
+        assert result.sent == (self.OTHER if expected is None else None)
+
+    def test_an_approval_for_the_old_arguments_does_not_cover_the_new_ones(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        from plugin_helpers import FP_KEY, call_approval
+
+        from mint_litellm.types.fingerprint import argument_fingerprint
+
+        snap = snapshot(
+            server=contract_snapshot.server,
+            approvals=contract_snapshot.approvals,
+            call_approvals=(call_approval(args_fp=argument_fingerprint(self.SENT, FP_KEY)),),
+        )
+        evaluate = evaluator("RequireApproval", policy_ids=("R2",))
+        order = ["logger", self.OTHER, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, snap, evaluate)
+        assert result.sent is None and result.error.code == "MINT-ENFORCEMENT-UNVERIFIED"
+        assert (
+            len(result.store.consumed) == 1 and len(result.store.of_kind("decision_evaluated")) == 2
+        )
+
+
 class TestConstructors:
     def test_a_missing_configuration_raises_runtime_error_only(self, monkeypatch):
         for name in ("MINT_INSTANCE_ID", "MINT_DATABASE_URL"):

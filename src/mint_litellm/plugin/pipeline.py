@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -118,6 +119,19 @@ class Outcome:
     error: MintError | None
     evidence: Evidence
     context: dict[str, Any]
+
+
+# 컨텍스트에 싣는 인자 요약의 키. 같은 프로세스 안에서 판정 뒤 인자가 바뀌었는지만 가르므로
+# 프로세스마다 새로 만들고, 요약은 다른 곳으로 나가지 않는다.
+_ARGUMENTS_DIGEST_KEY = secrets.token_bytes(32)
+
+
+def arguments_digest(arguments: Mapping[str, Any]) -> str | None:
+    """판정한 인자의 요약. JSON 값으로 만들 수 없는 인자는 None이다."""
+    try:
+        return argument_fingerprint(arguments, _ARGUMENTS_DIGEST_KEY)
+    except ValueError:
+        return None
 
 
 def scope_matches(scope_type: str, scope_id: str, principal: Principal, server_id: str) -> bool:
@@ -863,6 +877,7 @@ def _context_document(run: _Run, snapshot: DecisionSnapshot, allowed: bool) -> d
         "invocation_id": str(snapshot.invocation_id),
         "attempt_id": snapshot.attempt_id,
         "decision_ref": snapshot.decision_ref,
+        "arguments_digest": arguments_digest(run.req.hook.arguments),
         "allowed": allowed,
         "state_epoch": snapshot.state_epoch,
         "server_id": snapshot.resolved_server_id,

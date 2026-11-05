@@ -16,6 +16,7 @@ from litellm.types.guardrails import GuardrailEventHooks
 
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.plugin.logger import internal_block
+from mint_litellm.plugin.pipeline import arguments_digest
 from mint_litellm.plugin.selfcheck import PluginRuntime, get_runtime
 from mint_litellm.types.decision import MINT_CTX_KEY, MINT_DECISION_REF_KEY
 
@@ -75,6 +76,14 @@ class MintGuardrail(CustomGuardrail):
         if details is None:
             return True
         ctx = details.get(MINT_CTX_KEY)
-        return (
+        if not (
             isinstance(ctx, dict) and ctx.get("decision_ref") == ref and ctx.get("allowed") is True
-        )
+        ):
+            return False
+        # 로거가 판정한 뒤 앞선 훅이 인자를 바꿨으면 그 판정과 승인은 전송될 인자의 것이 아니다.
+        digest = ctx.get("arguments_digest")
+        current = arguments_digest(compat.parse_hook_data(data).arguments)
+        if isinstance(digest, str) and digest == current:
+            return True
+        details[MINT_CTX_KEY] = {**ctx, "allowed": False}
+        return False
