@@ -132,13 +132,23 @@ class LocalBuffer:
                 self._abandon()
                 raise BufferWriteError(f"{type(exc).__name__}") from exc
 
-    def take_overflow(self) -> Overflow | None:
+    def peek_overflow(self) -> Overflow | None:
+        """아직 보고하지 않은 삭제 건수. 보고를 마친 뒤 ``settle_overflow``로 덜어낸다."""
         with self._lock:
             if not self._dropped_files:
                 return None
-            report = Overflow(self._dropped_events, self._dropped_files)
-            self._dropped_events = self._dropped_files = 0
-            return report
+            return Overflow(self._dropped_events, self._dropped_files)
+
+    def settle_overflow(self, report: Overflow) -> None:
+        with self._lock:
+            self._dropped_events = max(0, self._dropped_events - report.dropped_events)
+            self._dropped_files = max(0, self._dropped_files - report.dropped_files)
+
+    def take_overflow(self) -> Overflow | None:
+        report = self.peek_overflow()
+        if report is not None:
+            self.settle_overflow(report)
+        return report
 
     def close(self) -> None:
         with self._lock:
@@ -172,17 +182,29 @@ class LocalBuffer:
         한 번에 한 파일만 인수해야 재적재가 중간에 끝나도 남는 파일이 하나뿐이다.
         """
         with self._lock, self._directory_lock():
-            base = path.name.split(_REPLAYING)[0]
+            # 후보를 모은 뒤에 다른 프로세스가 가져가 잠갔을 수 있다. 닫힌 파일이 아니면 잠금이
+            # 풀려 있는지 다시 확인한 뒤에만 이름을 바꾼다.
+            name = path.name
+            if not name.endswith(_CLOSED) and (
+                name.endswith(f"{_REPLAYING}.{self._owner}") or not self._orphaned(path)
+            ):
+                return None
+            base = name.split(_REPLAYING)[0]
             target = path.with_name(f"{base}{_REPLAYING}.{self._owner}")
             try:
                 os.rename(path, target)
             except OSError:
                 return None
             if fcntl is not None:
+                handle: TextIO | None = None
                 try:
                     handle = target.open("r")
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:
+                    if handle is not None:
+                        handle.close()
+                    with contextlib.suppress(OSError):
+                        os.rename(target, path)
                     return None
                 self._held[target] = handle
             return target
@@ -242,7 +264,11 @@ class LocalBuffer:
 
     @staticmethod
     def _orphaned(path: Path) -> bool:
-        """쓰거나 재적재하는 프로세스가 없는 파일. 배타 잠금을 얻을 수 있으면 주인이 없다."""
+        """쓰거나 재적재하는 프로세스가 없는 파일. 배타 잠금을 얻을 수 있으면 주인이 없다.
+
+        잠금을 쓸 수 없는 플랫폼(Windows)에서는 판별할 수 없어 항상 거짓이다. 그 플랫폼에서는
+        종료한 프로세스가 남긴 열린 파일과 재적재 중인 파일을 자동으로 복구하지 않는다.
+        """
         if fcntl is None:
             return False
         try:
@@ -379,6 +405,7 @@ class EvidenceRecorder:
         self._last_replay = 0.0
         self._replaying: asyncio.Task[None] | None = None
         self._keys = SystemEventKeys()
+        self._overflow_lock = asyncio.Lock()
 
     async def try_database(
         self,
@@ -406,15 +433,18 @@ class EvidenceRecorder:
         """DB에 쓰지 못한 사건을 버퍼에, 그것도 안 되면 표준 오류에 남긴다."""
         evidence = await self._write_local(event)
         if evidence is Evidence.BUFFER:
-            overflow = self._buffer.take_overflow()
-            if overflow is not None:
-                await self._append_system(
-                    EventKind.BUFFER_OVERFLOW,
-                    {
-                        "dropped_events": overflow.dropped_events,
-                        "dropped_files": overflow.dropped_files,
-                    },
-                )
+            # 건수는 보고를 마칠 때까지 남겨 둔다. 보고하다 취소되면 다음 기록이 다시 보고한다.
+            async with self._overflow_lock:
+                overflow = self._buffer.peek_overflow()
+                if overflow is not None:
+                    await self._append_system(
+                        EventKind.BUFFER_OVERFLOW,
+                        {
+                            "dropped_events": overflow.dropped_events,
+                            "dropped_files": overflow.dropped_files,
+                        },
+                    )
+                    self._buffer.settle_overflow(overflow)
         return evidence
 
     async def _write_local(self, event: Event) -> Evidence:
@@ -443,7 +473,7 @@ class EvidenceRecorder:
         held: Path | None = None
         try:
             for candidate in await asyncio.to_thread(self._buffer.pending):
-                held = await asyncio.to_thread(self._buffer.take, candidate)
+                held = await self._take(candidate)
                 if held is None:
                     continue
                 events, bad = await asyncio.to_thread(self._buffer.read, held)
@@ -469,6 +499,22 @@ class EvidenceRecorder:
                 EventKind.BUFFER_REPLAYED,
                 {"replayed": replayed, "duplicates": duplicates, "unreadable": unreadable},
             )
+
+    async def _take(self, candidate: Path) -> Path | None:
+        """파일을 인수한다. 기다리다 취소돼도 스레드가 인수한 파일은 돌려놓는다."""
+        task = asyncio.ensure_future(asyncio.to_thread(self._buffer.take, candidate))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(self._give_back)
+            raise
+
+    def _give_back(self, task: asyncio.Future[Path | None]) -> None:
+        if task.cancelled() or task.exception() is not None:
+            return
+        taken = task.result()
+        if taken is not None:
+            self._buffer.release(taken)
 
     def _schedule_replay(self) -> None:
         now = time.monotonic()

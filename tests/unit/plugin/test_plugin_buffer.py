@@ -12,12 +12,14 @@ from uuid import UUID
 import pytest
 from plugin_helpers import FakeStore
 
+from mint_litellm.plugin import buffer as buffer_module
 from mint_litellm.plugin.buffer import (
     BufferWriteError,
     ConsumeRequest,
     ConsumptionLost,
     EvidenceRecorder,
     LocalBuffer,
+    Overflow,
 )
 from mint_litellm.types.events import (
     Event,
@@ -293,6 +295,39 @@ class TestLocalBuffer:
         assert [p.name.endswith(".jsonl") for p in other.pending()] == [True]
 
     @pytest.mark.skipif(fcntl is None, reason="needs flock")
+    def test_a_file_a_live_replayer_has_just_renamed_is_not_taken_over(self, tmp_path):
+        first = LocalBuffer(tmp_path, 1024 * 1024)
+        first.append(make_event(1))
+        (path,) = first.pending()
+        # 이름만 바꾸고 아직 잠그지 않은 파일은 다른 프로세스에 주인 없는 파일로 보인다.
+        renamed = path.with_name(f"{path.name}.replaying.{first._owner}")
+        os.rename(path, renamed)
+        second = LocalBuffer(tmp_path, 1024 * 1024)
+        (candidate,) = second.pending()
+        assert candidate == renamed
+        with renamed.open("r") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert second.take(candidate) is None
+            assert renamed.exists() and files(tmp_path) == [renamed.name]
+
+    def test_a_take_that_loses_the_lock_race_puts_the_name_back(self, tmp_path, monkeypatch):
+        buffer = LocalBuffer(tmp_path, 1024 * 1024)
+        buffer.append(make_event(1))
+        (path,) = buffer.pending()
+
+        class Contended:
+            LOCK_EX, LOCK_NB, LOCK_UN = 2, 4, 8
+
+            @staticmethod
+            def flock(handle, operation):
+                if operation == 2 | 4:
+                    raise BlockingIOError("held elsewhere")
+
+        monkeypatch.setattr(buffer_module, "fcntl", Contended)
+        assert buffer.take(path) is None
+        assert files(tmp_path) == [path.name]
+
+    @pytest.mark.skipif(fcntl is None, reason="needs flock")
     def test_a_file_held_by_a_live_writer_is_not_adopted(self, tmp_path):
         writer = LocalBuffer(tmp_path, 1024 * 1024)
         writer.append(make_event(1))
@@ -549,6 +584,78 @@ class TestEvidenceRecorder:
         asyncio.run(scenario())
         names = files(buffer._dir)
         assert len(names) == 3 and all(n.endswith(".jsonl") for n in names)
+
+    def test_cancelling_while_a_file_is_being_taken_gives_it_back(self, tmp_path):
+        store = FakeStore()
+        rec, buffer = self.three_segments(tmp_path, store)
+        real_take, started = buffer.take, threading.Event()
+
+        def slow_take(path):
+            started.set()
+            time.sleep(0.3)
+            return real_take(path)
+
+        buffer.take = slow_take
+
+        async def scenario():
+            task = asyncio.create_task(rec.replay())
+            await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.6)
+
+        asyncio.run(scenario())
+        names = files(buffer._dir)
+        assert len(names) == 3 and all(n.endswith(".jsonl") for n in names)
+        assert buffer._held == {}
+
+    def test_an_overflow_report_cancelled_midway_is_reported_by_the_next_record(self, tmp_path):
+        class Hangs(FakeStore):
+            hang = True
+
+            def __init__(self):
+                super().__init__()
+                self.entered = asyncio.Event()
+
+            async def insert_event(self, event, consume=None):
+                if self.hang and event.kind is EventKind.BUFFER_OVERFLOW:
+                    self.entered.set()
+                    await asyncio.sleep(60)
+                return await super().insert_event(event, consume)
+
+        store = Hangs()
+        rec, buffer = recorder(tmp_path, store)
+        buffer._dropped_events, buffer._dropped_files = 5, 2
+
+        async def cancelled_report():
+            task = asyncio.create_task(rec.fallback(make_event(1)))
+            await store.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(cancelled_report())
+        assert buffer.peek_overflow() == Overflow(5, 2)
+        store.hang = False
+        asyncio.run(rec.fallback(make_event(2)))
+        (report,) = store.of_kind("buffer_overflow")
+        assert report.payload == {"dropped_events": 5, "dropped_files": 2}
+        assert buffer.peek_overflow() is None
+
+    def test_drops_counted_while_a_report_is_written_wait_for_the_next_one(self, tmp_path):
+        class DropsMeanwhile(FakeStore):
+            async def insert_event(self, event, consume=None):
+                if event.kind is EventKind.BUFFER_OVERFLOW:
+                    buffer._dropped_events += 3
+                    buffer._dropped_files += 1
+                return await super().insert_event(event, consume)
+
+        store = DropsMeanwhile()
+        rec, buffer = recorder(tmp_path, store)
+        buffer._dropped_events, buffer._dropped_files = 5, 2
+        asyncio.run(rec.fallback(make_event(1)))
+        assert buffer.peek_overflow() == Overflow(3, 1)
 
     @pytest.mark.skipif(fcntl is None, reason="needs flock")
     def test_a_restarted_process_replays_what_a_dead_one_had_taken(self, tmp_path):
