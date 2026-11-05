@@ -35,7 +35,12 @@ def run(tmp_path: Path, env_text: str, *args: str):
         "FAKE_DOCKER_LOG": str(tmp_path / "docker.log"),
     }
     result = subprocess.run(
-        [BASH, "mint.sh", *args], cwd=deploy, env=env, capture_output=True, text=True, encoding="utf-8"
+        [BASH, "mint.sh", *args],
+        cwd=deploy,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
     )
     return result, deploy / ".env", home
 
