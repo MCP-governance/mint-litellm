@@ -116,16 +116,6 @@ MINT_SETTINGS: tuple[MintSettingRow, ...] = (
         ),
     ),
     MintSettingRow(
-        key="MINT_ALLOWED_PRE_HOOKS",
-        source=SettingSource.ENV,
-        rule=(
-            "MINT 가드레일 뒤에 둘 수 있는 사전 훅의 클래스 이름(쉼표로 구분, 기본은 비어 있음). "
-            "LiteLLM 내부 훅은 항상 허용한다. 이 밖의 사전 훅이 뒤에 있으면 자가 점검 3번이 "
-            "실패해 기동을 중단한다. 목록에 올린 훅이 MINT 대조 뒤에 인자를 바꾸지 않는 것은 "
-            "운영자의 책임이다."
-        ),
-    ),
-    MintSettingRow(
         key="MINT_FINGERPRINT_KEY_VERSION",
         source=SettingSource.ENV,
         rule=(
@@ -151,7 +141,7 @@ SELF_CHECK_DESCRIPTIONS: dict[SelfCheckItem, str] = {
     SelfCheckItem.CALLBACK_REGISTERED: "MINT 로거가 정확히 하나 등록되어 있다.",
     SelfCheckItem.GUARDRAIL_MODES: "MINT 가드레일이 두 모드로 등록되어 있고 `default_on`이다.",
     SelfCheckItem.GUARDRAIL_ORDER: (
-        "MINT 로거가 MINT 가드레일 바로 앞에 있고, 가드레일 뒤에는 허용된 사전 훅만 있다."
+        "MINT 가드레일이 하나이고, 병렬 실행·원문 검사 끔·판정 재정의가 그대로이다."
     ),
     SelfCheckItem.KEY_ACCESS_STRICT: (
         "통제 서버가 `allow_all_keys: false`이고 `require_key_mcp_access_defined`가 true이다."
@@ -201,10 +191,10 @@ SETTINGS_TABLE: tuple[SettingRow, ...] = (
     SettingRow(
         key="guardrails[MINT]",
         location=SettingLocation.GUARDRAILS,
-        value="mode: [pre_mcp_call, post_mcp_call], default_on: true, 뒤에는 허용된 사전 훅만",
+        value="mode: [pre_mcp_call, post_mcp_call], default_on: true",
         grade=SettingGrade.REQUIRED,
         self_checks=(SelfCheckItem.GUARDRAIL_MODES, SelfCheckItem.GUARDRAIL_ORDER),
-        reason="가드레일이 없거나 뒤에 다른 사전 훅이 있으면 목록 필터와 인자 대조가 사라진다.",
+        reason="가드레일이 없으면 도구 호출 판정과 도구 목록 필터가 사라진다.",
     ),
     SettingRow(
         key="callbacks",
@@ -213,7 +203,7 @@ SETTINGS_TABLE: tuple[SettingRow, ...] = (
         grade=SettingGrade.REQUIRED,
         self_checks=(SelfCheckItem.CALLBACK_REGISTERED,),
         reason=(
-            "도구 호출 판정은 로거의 사전 훅이 수행하며 로거는 MINT 가드레일이 등록한다. "
+            "도구 호출 판정은 MINT 가드레일이 하고 응답·실패 관측용 로거는 가드레일이 등록한다. "
             "설정에 따로 적으면 두 번 등록되므로 기동을 거부한다."
         ),
     ),
@@ -376,7 +366,7 @@ SETTINGS_TABLE: tuple[SettingRow, ...] = (
 )
 
 # check·status가 출력하는 관측 항목. 실패 조건이 아니다.
-# guardrail_optout_subjects는 MINT 가드레일을 제외해 MCP를 호출할 수 없게 되는 키·팀의 수이고,
+# guardrail_optout_subjects는 다른 가드레일을 끈 키·팀의 수이고,
 # unbound_keys는 사용자와 팀 어디에도 결속되지 않은 키의 수이다(0이 아니면 경고).
 OBSERVATION_ITEMS: tuple[str, ...] = (
     "spend_log_arguments_stored",
