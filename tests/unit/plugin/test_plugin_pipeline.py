@@ -7,6 +7,7 @@ import pytest
 from plugin_helpers import (
     BUNDLE,
     FP_KEY,
+    KEY,
     NOW,
     allowlist,
     approval,
@@ -86,6 +87,32 @@ def test_context_document_carries_only_plain_values(tmp_path):
     assert ctx["approval_id"] == "00000000-0000-0000-0000-0000000000a1"
     assert ctx["relation_id"] == "r1" and ctx["org_id"] == "org1"
     assert "q" not in json.dumps(ctx)
+
+
+class TestErrorReference:
+    def blocked(self, tmp_path, attempt_id=1):
+        h = harness(tmp_path, snapshot(approvals=()))
+        req = replace(request(), attempt_id=attempt_id)
+        return h, decide(h, req), req
+
+    @pytest.mark.parametrize("attempt_id", [1, 3])
+    def test_the_reference_is_the_invocation_and_attempt_of_the_recorded_decision(
+        self, tmp_path, attempt_id
+    ):
+        h, outcome, req = self.blocked(tmp_path, attempt_id)
+        reference = f"{req.invocation_id}:{attempt_id}"
+        assert outcome.error.reference == reference == outcome.snapshot.decision_ref
+        assert outcome.context["decision_ref"] == reference
+        (event,) = h.store.of_kind("decision_evaluated")
+        assert event.source_key == f"call:{reference}:decision_evaluated"
+
+    def test_the_error_body_names_no_user_server_tool_or_argument(self, tmp_path):
+        _, outcome, req = self.blocked(tmp_path)
+        body = json.loads(outcome.error.detail())
+        assert set(body) == {"code", "dispatch_state", "retry_safe", "reference"}
+        text = outcome.error.detail()
+        for secret in ("u1", "t1", "org1", "srv-1", "search", "mslearn", KEY):
+            assert secret not in text.replace(str(req.invocation_id), "")
 
 
 class TestContextStage:

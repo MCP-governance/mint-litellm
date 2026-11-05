@@ -215,6 +215,12 @@ class TestLogger:
         assert isinstance(detail, str)
         assert set(json.loads(detail)) == {"code", "dispatch_state", "retry_safe", "reference"}
 
+    def test_an_internal_block_uses_the_same_reference_form(self):
+        from mint_litellm.plugin.logger import internal_block
+
+        invocation, attempt = json.loads(internal_block().detail)["reference"].rsplit(":", 1)
+        assert attempt == "1" and len(invocation) == 36
+
     def test_a_marker_cannot_be_set_by_the_caller_data(self, tmp_path, contract_snapshot):
         runtime, _, _ = build_runtime(
             tmp_path, snapshot(server=contract_snapshot.server, approvals=())
