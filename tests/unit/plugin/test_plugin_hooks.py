@@ -543,11 +543,24 @@ class TestCallbackChain:
         order = ["logger", self.OTHER, "guardrail"]
         result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
         assert result.sent is None
-        assert result.error.code == "MINT-ENFORCEMENT-UNVERIFIED"
+        assert result.error.code == "MINT-ARGUMENTS-CHANGED"
         assert result.error.dispatch_state.value == "not_dispatched"
+        assert result.error.retry_safe is False
         assert result.obj.model_call_details[MINT_CTX_KEY]["allowed"] is False
-        actions = [e.payload["enforced_action"] for e in result.store.of_kind("decision_evaluated")]
-        assert sorted(actions) == ["allow", "block"]
+
+    def test_the_block_leaves_one_new_event_that_points_back_to_the_decision(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        order = ["logger", self.OTHER, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
+        original = result.obj.model_call_details[MINT_CTX_KEY]["decision_ref"]
+        decisions = result.store.of_kind("decision_evaluated")
+        assert sorted(e.payload["enforced_action"] for e in decisions) == ["allow", "block"]
+        (blocked_event,) = [e for e in decisions if e.payload["enforced_action"] == "block"]
+        assert blocked_event.payload["stop"]["reason_code"] == "ARGUMENTS_CHANGED"
+        assert blocked_event.payload["stop"]["detail"] == f"decision_ref={original}"
+        assert len(result.store.events) == 2
+        assert result.error.reference == f"{blocked_event.invocation_id}:{blocked_event.attempt_id}"
 
     def test_a_change_that_was_blocked_leaves_no_unknown_outcome_event(
         self, tmp_path, monkeypatch, contract_snapshot
@@ -605,10 +618,48 @@ class TestCallbackChain:
         evaluate = evaluator("RequireApproval", policy_ids=("R2",))
         order = ["logger", self.OTHER, "guardrail"]
         result = self.run_chain(tmp_path, monkeypatch, order, snap, evaluate)
-        assert result.sent is None and result.error.code == "MINT-ENFORCEMENT-UNVERIFIED"
-        assert (
-            len(result.store.consumed) == 1 and len(result.store.of_kind("decision_evaluated")) == 2
+        assert result.sent is None and result.error.code == "MINT-ARGUMENTS-CHANGED"
+        assert len(result.store.consumed) == 1
+
+    def test_a_consumed_call_approval_is_recorded_as_consumed_without_dispatch(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        from plugin_helpers import FP_KEY, call_approval
+
+        from mint_litellm.types.fingerprint import argument_fingerprint
+
+        approval = call_approval(args_fp=argument_fingerprint(self.SENT, FP_KEY))
+        snap = snapshot(
+            server=contract_snapshot.server,
+            approvals=contract_snapshot.approvals,
+            call_approvals=(approval,),
         )
+        evaluate = evaluator("RequireApproval", policy_ids=("R2",))
+        order = ["logger", self.OTHER, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, snap, evaluate)
+        assert result.error.code == "MINT-ARGUMENTS-CHANGED" and result.sent is None
+        (event,) = result.store.of_kind("call_approval_consumed_without_dispatch")
+        decision_ref = result.obj.model_call_details[MINT_CTX_KEY]["decision_ref"]
+        assert event.payload == {
+            "reason": "ARGUMENTS_CHANGED",
+            "decision_ref": decision_ref,
+            "call_approval_id": str(approval.id),
+        }
+        assert event.source_key == (
+            f"call_approval:{approval.id}:{approval.state_version}"
+            ":call_approval_consumed_without_dispatch"
+        )
+        assert event.actor == "mint-plugin"
+        text = event.to_json_line()
+        assert approval.args_fp not in text and "arguments_digest" not in text
+        assert len(result.store.events) == 3
+
+    def test_without_a_consumed_call_approval_no_consumption_event_is_written(
+        self, tmp_path, monkeypatch, contract_snapshot
+    ):
+        order = ["logger", self.OTHER, "guardrail"]
+        result = self.run_chain(tmp_path, monkeypatch, order, contract_snapshot)
+        assert result.store.of_kind("call_approval_consumed_without_dispatch") == []
 
 
 class TestConstructors:

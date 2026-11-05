@@ -109,6 +109,8 @@ class CallRequest:
     resolution_failure: StageResult | None
     invocation_id: UUID = field(default_factory=new_uuid7)
     attempt_id: int = 1
+    # 판정 전에 이미 정해진 차단. 안전망이 판정 뒤의 변경을 기록할 때 쓴다.
+    forced_stop: StageResult | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +167,8 @@ class _Stages:
 
 
 def context_result(req: CallRequest, verified: bool) -> StageResult | None:
+    if req.forced_stop is not None:
+        return req.forced_stop
     if not verified:
         return StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED)
     if req.principal.principal_type is PrincipalType.MASTER_KEY:
@@ -865,12 +869,16 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
         snapshot=snapshot_doc,
         error=error,
         evidence=evidence,
-        context=_context_document(run, snapshot_doc, allowed, deps.config.fingerprint_key),
+        context=_context_document(run, snapshot_doc, allowed, deps.config.fingerprint_key, consume),
     )
 
 
 def _context_document(
-    run: _Run, snapshot: DecisionSnapshot, allowed: bool, key: bytes | None
+    run: _Run,
+    snapshot: DecisionSnapshot,
+    allowed: bool,
+    key: bytes | None,
+    consumed: ConsumeRequest | None,
 ) -> dict[str, Any]:
     """응답·실패 이벤트가 읽는 호출 컨텍스트. JSON 값만 담고 인자·결과는 담지 않는다."""
     principal = run.principal
@@ -879,6 +887,11 @@ def _context_document(
         "attempt_id": snapshot.attempt_id,
         "decision_ref": snapshot.decision_ref,
         "arguments_digest": arguments_digest(run.req.hook.arguments, key),
+        "consumed_call_approval": (
+            {"id": str(consumed.call_approval_id), "state_version": consumed.state_version}
+            if allowed and consumed is not None
+            else None
+        ),
         "allowed": allowed,
         "state_epoch": snapshot.state_epoch,
         "server_id": snapshot.resolved_server_id,

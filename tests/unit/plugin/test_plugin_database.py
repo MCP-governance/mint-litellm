@@ -29,7 +29,13 @@ from mint_litellm.plugin.snapshot import (  # noqa: E402
     SnapshotQuery,
 )
 from mint_litellm.types.decision import url_sha256  # noqa: E402
-from mint_litellm.types.events import Event, EventKind, Evidence, call_source_key  # noqa: E402
+from mint_litellm.types.events import (  # noqa: E402
+    Event,
+    EventKind,
+    Evidence,
+    call_source_key,
+    control_source_key,
+)
 from mint_litellm.types.fingerprint import argument_fingerprint  # noqa: E402
 from mint_litellm.types.identity import OrgStatus, SubjectType  # noqa: E402
 from mint_litellm.types.ids import new_uuid7  # noqa: E402
@@ -337,6 +343,39 @@ def test_inserting_the_same_event_twice_keeps_one_row(scenario, plugin_dsn):
         "SELECT count(*) FROM mint.events WHERE instance_id = %s", (scenario.iid,)
     ).fetchone()
     assert count == 1
+
+
+def test_the_plugin_can_append_a_consumed_without_dispatch_event(scenario, plugin_dsn):
+    db = database(plugin_dsn)
+    approval_id = new_uuid7()
+    kind = EventKind.CALL_APPROVAL_CONSUMED_WITHOUT_DISPATCH
+    invocation = new_uuid7()
+    event = Event(
+        instance_id=scenario.iid,
+        inserted_at=snapshot().now,
+        kind=kind,
+        source_key=control_source_key(kind, str(approval_id), 2),
+        invocation_id=invocation,
+        attempt_id=1,
+        actor="mint-plugin",
+        payload={
+            "reason": "ARGUMENTS_CHANGED",
+            "decision_ref": f"{invocation}:1",
+            "call_approval_id": str(approval_id),
+        },
+    )
+
+    async def insert():
+        stored = await db.insert_event(event)
+        await db.close()
+        return stored
+
+    assert run(insert()) is True
+    (payload,) = scenario.conn.execute(
+        "SELECT payload FROM mint.events WHERE instance_id = %s AND kind = %s",
+        (scenario.iid, kind.value),
+    ).fetchone()
+    assert payload["reason"] == "ARGUMENTS_CHANGED"
 
 
 def consume(scenario, call_id, event, **override):

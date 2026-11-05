@@ -17,8 +17,10 @@ from litellm.types.guardrails import GuardrailEventHooks
 from mint_litellm.compat import litellm_1_106 as compat
 from mint_litellm.plugin.logger import internal_block
 from mint_litellm.plugin.pipeline import arguments_digest
+from mint_litellm.plugin.result import record_consumed_without_dispatch
 from mint_litellm.plugin.selfcheck import PluginRuntime, get_runtime
-from mint_litellm.types.decision import MINT_CTX_KEY, MINT_DECISION_REF_KEY
+from mint_litellm.types.decision import MINT_CTX_KEY, MINT_DECISION_REF_KEY, StageResult
+from mint_litellm.types.reason_codes import Reason
 
 log = logging.getLogger("mint_litellm.guardrail")
 
@@ -59,31 +61,59 @@ class MintGuardrail(CustomGuardrail):
 
     async def _backstop(self, user_api_key_dict, data):
         ref = data.get(MINT_DECISION_REF_KEY)
-        if isinstance(ref, str) and self._ref_is_current(data, ref):
+        state, ctx = self._judged_state(data, ref)
+        if state == "current":
             return None
+        stop = None
+        if state == "changed":
+            stop = self._changed_stop(ctx)
         try:
-            outcome = await self._runtime.judge_call(data, user_api_key_dict, unverified=True)
+            outcome = await self._runtime.judge_call(
+                data, user_api_key_dict, unverified=stop is None, stop=stop
+            )
         except Exception as exc:
             log.error("안전망 판정 오류: %s", type(exc).__name__)
             raise internal_block() from exc
+        if state == "changed":
+            await self._record_consumption(ctx)
         assert outcome.error is not None
         raise HTTPException(status_code=403, detail=outcome.error.detail())
 
-    def _ref_is_current(self, data: dict, ref: str) -> bool:
-        """표식이 이 호출의 로거 컨텍스트와 같은 판정을 가리키는지."""
+    @staticmethod
+    def _changed_stop(ctx: dict) -> StageResult:
+        detail = f"decision_ref={ctx.get('decision_ref')}"
+        consumed = ctx.get("consumed_call_approval")
+        if isinstance(consumed, dict):
+            detail += f"; call_approval_id={consumed.get('id')}"
+        return StageResult.stop(Reason.ARGUMENTS_CHANGED, detail=detail[:200])
+
+    async def _record_consumption(self, ctx: dict) -> None:
+        try:
+            await record_consumed_without_dispatch(ctx, self._runtime.result_deps)
+        except Exception as exc:
+            log.error("승인 소비 기록 오류: %s", type(exc).__name__)
+
+    def _judged_state(self, data: dict, ref: Any) -> tuple[str, dict]:
+        """표식이 이 호출의 로거 컨텍스트와 같은 판정을 가리키는지, 그 뒤 인자가 바뀌었는지.
+
+        ``current``는 판정과 같은 인자, ``unjudged``는 판정 표식이 없거나 다른 판정,
+        ``changed``는 판정한 뒤 인자가 바뀐 경우이다.
+        """
+        if not isinstance(ref, str):
+            return "unjudged", {}
         details = compat.logging_details(data.get("litellm_logging_obj"))
         if details is None:
-            return True
+            return "current", {}
         ctx = details.get(MINT_CTX_KEY)
         if not (
             isinstance(ctx, dict) and ctx.get("decision_ref") == ref and ctx.get("allowed") is True
         ):
-            return False
+            return "unjudged", {}
         # 로거가 판정한 뒤 앞선 훅이 인자를 바꿨으면 그 판정과 승인은 전송될 인자의 것이 아니다.
         digest = ctx.get("arguments_digest")
         key = self._runtime.config.fingerprint_key
         current = arguments_digest(compat.parse_hook_data(data).arguments, key)
         if isinstance(digest, str) and digest == current:
-            return True
+            return "current", ctx
         details[MINT_CTX_KEY] = {**ctx, "allowed": False}
-        return False
+        return "changed", ctx

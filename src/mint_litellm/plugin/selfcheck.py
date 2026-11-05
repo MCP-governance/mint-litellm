@@ -17,7 +17,7 @@ import signal
 import time
 import urllib.request
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -36,7 +36,7 @@ from mint_litellm.plugin.pipeline import (
 from mint_litellm.plugin.policy.opa_client import OPAClient
 from mint_litellm.plugin.result import ResultDeps
 from mint_litellm.plugin.snapshot import PluginDatabase, RegisteredServer
-from mint_litellm.types.decision import OperationType
+from mint_litellm.types.decision import OperationType, StageResult
 from mint_litellm.types.events import Event, EventKind
 from mint_litellm.types.settings import SELF_CHECK_DESCRIPTIONS, SelfCheckItem
 
@@ -291,7 +291,14 @@ class PluginRuntime:
     def result_deps(self) -> ResultDeps:
         return ResultDeps(config=self.config, database=self.database, recorder=self.recorder)
 
-    async def judge_call(self, data: Mapping[str, Any], auth: Any, *, unverified: bool = False):
+    async def judge_call(
+        self,
+        data: Mapping[str, Any],
+        auth: Any,
+        *,
+        unverified: bool = False,
+        stop: StageResult | None = None,
+    ):
         deps = self.deps if not unverified else _unverified(self.deps)
         request = build_request(
             data,
@@ -302,6 +309,8 @@ class PluginRuntime:
             resolver=compat.resolve_server,
             principal_factory=compat.principal_from_auth,
         )
+        if stop is not None:
+            request = replace(request, forced_stop=stop)
         outcome: Outcome = await evaluate_request(request, deps)
         return outcome
 
