@@ -71,3 +71,19 @@ def test_the_loader_reads_with_utf8_only_while_it_runs(monkeypatch, tmp_path):
     assert compat._run_loader(module.loader, config) == {"text": "# 한국어 설명\n"}
     assert seen  # 로더의 open이 UTF-8 고정 함수로 바뀌어 호출되었다
     assert "open" not in vars(module)
+
+
+def test_the_loader_patch_is_removed_when_the_loader_fails(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    import pytest
+
+    from mint_litellm.compat import litellm_config_loader as compat
+
+    module = types.ModuleType("failing_loader_module")
+    exec("async def loader(config_file_path):\n    raise RuntimeError('boom')\n", module.__dict__)
+    monkeypatch.setitem(sys.modules, "failing_loader_module", module)
+    with pytest.raises(RuntimeError):
+        compat._run_loader(module.loader, tmp_path / "c.yaml")
+    assert "open" not in vars(module)
