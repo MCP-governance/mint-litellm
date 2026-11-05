@@ -9,7 +9,7 @@ from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
 from mint_litellm.control.policy_check import PolicyState
-from mint_litellm.types.events import AlertKind
+from mint_litellm.types.events import AlertKind, EventKind
 from mint_litellm.types.settings import OBSERVATION_ITEMS, Mode, effective_mode
 
 EXPIRY_WARNING = timedelta(days=7)
@@ -110,14 +110,18 @@ def enforcement_states(ctx: Context) -> list[dict[str, Any]]:
         ctx.conn,
         "SELECT DISTINCT ON (payload->>'worker_id') kind, inserted_at, source_key, payload"
         " FROM mint.events WHERE instance_id = %s"
-        " AND kind IN ('enforcement_verified', 'enforcement_unverified')"
+        " AND kind IN (%s, %s)"
         " ORDER BY payload->>'worker_id', inserted_at DESC, event_id DESC",
-        (ctx.instance_id,),
+        (
+            ctx.instance_id,
+            EventKind.ENFORCEMENT_VERIFIED.value,
+            EventKind.ENFORCEMENT_UNVERIFIED.value,
+        ),
     )
     states = []
     for row in rows:
         payload = row["payload"] if isinstance(row["payload"], dict) else {}
-        passed = row["kind"] == "enforcement_verified"
+        passed = row["kind"] == EventKind.ENFORCEMENT_VERIFIED.value
         failed = _failed_items(payload.get("failed"))
         parts = str(row["source_key"]).split(":")
         states.append(
