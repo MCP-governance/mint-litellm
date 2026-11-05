@@ -13,6 +13,7 @@ import zlib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -389,8 +390,19 @@ def _attach(exc: BaseException, outcome: str) -> None:
     exc.add_note(f"previous bundle: {outcome}")
 
 
+async def _abandon(conn) -> None:
+    """응답하지 않는 연결을 정리한다: 진행 중인 문장을 취소하고 닫아 서버 쪽 잠금을 푼다."""
+    try:
+        if not conn.closed and conn.info.transaction_status != 0:  # 0 = IDLE
+            conn.cancel()
+        await asyncio.wait_for(conn.close(), 2.0)
+    except Exception:  # noqa: BLE001 - 정리 실패는 복원 판정에 영향을 주지 않는다
+        pass
+
+
 async def _recover(
     conn,
+    connect: Callable[[], Awaitable[Any]] | None,
     instance_id: str,
     bundle: "PreparedBundle",
     restore: Callable[[str, str], Awaitable[bool]],
@@ -399,17 +411,26 @@ async def _recover(
 ) -> str:
     """실패 뒤 잠금 안에서 DB의 활성 판본을 다시 읽고, 그 판본의 번들로 되돌려 확인한다.
 
+    ``connect``가 있으면 원래 연결은 정리하고 새 연결로 읽는다(문장 도중 취소·연결 소실에도
+    판정할 수 있다). 없으면 원래 연결을 쓰며, 그 연결이 끊겼으면 판정하지 않는다.
     커밋 결과가 불명인 경우에도 DB가 새 판본을 활성으로 보이면 되돌리지 않는다.
     """
     loop = asyncio.get_running_loop()
+    own = None
     try:
-        if conn.closed or conn.broken:
-            return NOT_RESTORED_UNKNOWN
-        async with asyncio.timeout_at(deadline), conn.transaction():
-            await conn.execute(
+        if connect is None:
+            if conn.closed or conn.broken:
+                return NOT_RESTORED_UNKNOWN
+            reader = conn
+        else:
+            await _abandon(conn)
+            async with asyncio.timeout_at(deadline):
+                reader = own = await connect()
+        async with asyncio.timeout_at(deadline), reader.transaction():
+            await reader.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (instance_id,)
             )
-            cursor = await conn.execute(
+            cursor = await reader.execute(
                 "SELECT id, bundle_sha256 FROM mint.policy_versions "
                 "WHERE instance_id = %s AND status = 'active'", (instance_id,)
             )
@@ -430,6 +451,9 @@ async def _recover(
             return RESTORED
     except Exception as exc:
         return f"restore failed: {type(exc).__name__}: {exc}"
+    finally:
+        if own is not None:
+            await _abandon(own)
 
 
 async def _wait_until_loaded(
@@ -473,6 +497,7 @@ async def activate_bundle(
     timeout_seconds: float,
     keep: Callable[[str, str], Awaitable[None]] | None = None,
     restore: Callable[[str, str], Awaitable[bool]] | None = None,
+    connect: Callable[[], Awaitable[Any]] | None = None,
 ) -> None:
     """번들을 게시하고 활성화한다.
 
@@ -483,6 +508,17 @@ async def activate_bundle(
     같은 보관본이 없거나, 연결이 끊겨 커밋 결과를 알 수 없거나, DB가 이미 새 판본을 활성으로
     보이면 되돌리지 않는다. 복원 시간은 전체 제한(``timeout_seconds``)에서 먼저 떼어 두며,
     남은 몫이 1초보다 작으면 복원에 최대 1초를 더 쓴다.
+
+    마감은 하나다. 잠금 대기, 검증, 게시와 적재 확인, DB 전환, 커밋이 모두 ``timeout_seconds``
+    안에 끝나야 하며 DB가 응답하지 않으면 마감에서 ``TimeoutError``로 끝난다.
+
+    ``publish``는 취소되면 쓰기를 남기지 않아야 한다(원자적 교체이거나 완료·미시작 중 하나).
+    취소된 ``publish``가 반쯤 쓴 파일을 남기면 복원이 활성 판본의 보관본으로 덮어쓸 뿐
+    그 밖의 정리는 하지 않는다.
+
+    ``connect``는 새 DB 연결을 돌려주는 코루틴이다. 주면 실패 뒤 원래 연결(문장 도중 취소되었거나
+    끊겼을 수 있음)은 취소·종료하고 새 연결로 활성 판본을 다시 읽어 복원 여부를 판정한다.
+    새 연결은 판정 뒤 이 함수가 닫는다. 주지 않으면 원래 연결을 쓰며 끊겼으면 복원하지 않는다.
     """
     if timeout_seconds <= 0 or not actor:
         raise ValueError("invalid activation parameters")
@@ -492,44 +528,44 @@ async def activate_bundle(
     reserve = max(tail, timeout_seconds * 0.3) if restore else tail
     published = False
     try:
-        async with conn.transaction():
-            async with asyncio.timeout_at(deadline):
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (instance_id,)
-                )
-                cursor = await conn.execute(
-                    "SELECT catalog_sha256, bundle_sha256, status FROM mint.policy_versions "
-                    "WHERE instance_id = %s AND id = %s FOR UPDATE",
-                    (instance_id, bundle.policy_version_id),
-                )
-                row = await cursor.fetchone()
-                if row != (bundle.catalog_sha256, bundle.bundle_sha256, "validated"):
-                    raise ValueError("policy version does not match validated bundle")
-                await conn.execute(
-                    "UPDATE mint.policy_versions SET status = 'staged' "
-                    "WHERE instance_id = %s AND id = %s",
-                    (instance_id, bundle.policy_version_id),
-                )
-                cursor = await conn.execute(
-                    "SELECT id, bundle_sha256 FROM mint.policy_versions "
-                    "WHERE instance_id = %s AND status = 'active'", (instance_id,)
-                )
-                active = await cursor.fetchone()
-                if keep is not None and active is not None:
-                    await keep(*active)
+        async with asyncio.timeout_at(deadline), conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (instance_id,)
+            )
+            cursor = await conn.execute(
+                "SELECT catalog_sha256, bundle_sha256, status FROM mint.policy_versions "
+                "WHERE instance_id = %s AND id = %s FOR UPDATE",
+                (instance_id, bundle.policy_version_id),
+            )
+            row = await cursor.fetchone()
+            if row != (bundle.catalog_sha256, bundle.bundle_sha256, "validated"):
+                raise ValueError("policy version does not match validated bundle")
+            await conn.execute(
+                "UPDATE mint.policy_versions SET status = 'staged' "
+                "WHERE instance_id = %s AND id = %s",
+                (instance_id, bundle.policy_version_id),
+            )
+            cursor = await conn.execute(
+                "SELECT id, bundle_sha256 FROM mint.policy_versions "
+                "WHERE instance_id = %s AND status = 'active'", (instance_id,)
+            )
+            active = await cursor.fetchone()
+            if keep is not None and active is not None:
+                await keep(*active)
             published = True
             async with asyncio.timeout_at(deadline - reserve):
                 await publish(bundle.archive)
                 async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
                     await _wait_until_loaded(
-                        client, opa_url, bundle, max(deadline - reserve - loop.time() - 0.1, 0.001)
+                        client, opa_url, bundle,
+                        max(deadline - reserve - loop.time() - 0.1, 0.001),
                     )
             await _switch_active(conn, instance_id, actor, bundle)
     except BaseException as exc:
         if restore is not None and published:
             try:
                 outcome = await _recover(
-                    conn, instance_id, bundle, restore, opa_url,
+                    conn, connect, instance_id, bundle, restore, opa_url,
                     max(deadline, loop.time() + 1.0),
                 )
             except asyncio.CancelledError as cancelled:
@@ -581,6 +617,7 @@ async def retry_activation(
     timeout_seconds: float,
     keep: Callable[[str, str], Awaitable[None]] | None = None,
     restore: Callable[[str, str], Awaitable[bool]] | None = None,
+    connect: Callable[[], Awaitable[Any]] | None = None,
 ) -> None:
     """게시 후 DB 전환이 실패한 validated 판본을 다시 게시하고 활성화한다."""
     await activate_bundle(
@@ -593,4 +630,5 @@ async def retry_activation(
         timeout_seconds=timeout_seconds,
         keep=keep,
         restore=restore,
+        connect=connect,
     )
