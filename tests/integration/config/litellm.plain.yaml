@@ -1,0 +1,23 @@
+model_list: []
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  require_key_mcp_access_defined: true
+
+litellm_settings:
+  telemetry: false
+
+mcp_servers:
+  mcp_a:
+    server_id: e1000000000000000000000000000001
+    url: http://counting-proxy:8080/a/mcp
+    transport: http
+    allow_all_keys: false
+    description: Integration test upstream A
+  mcp_b:
+    server_id: e1000000000000000000000000000002
+    url: http://counting-proxy:8080/b/mcp
+    transport: http
+    allow_all_keys: false
+    description: Integration test upstream B

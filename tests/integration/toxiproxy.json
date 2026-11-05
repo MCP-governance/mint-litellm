@@ -1,0 +1,4 @@
+[
+  {"name": "a", "listen": ":8666", "upstream": "testserver-a:9000", "enabled": true},
+  {"name": "b", "listen": ":8667", "upstream": "testserver-b:9000", "enabled": true}
+]
