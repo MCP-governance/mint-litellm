@@ -41,6 +41,7 @@ COMPAT_SYMBOLS: tuple[tuple[str, str | None, str | None], ...] = (
 
 class Level(StrEnum):
     OK = "통과"
+    INFO = "정보"
     WARN = "경고"
     FAIL = "실패"
     SKIP = "확인 불가"
@@ -369,7 +370,7 @@ def _check_keys_and_teams(
     )
     report.observations["guardrail_optout_subjects"] = subjects
     if subjects:
-        report.add("가드레일 제외 대상", Level.WARN,
+        report.add("가드레일 제외 대상", Level.INFO,
                    f"키·팀 metadata로 가드레일을 끈 키·팀이 {subjects}개 있습니다. "
                    "MINT 판정과 도구 목록 숨김은 그대로 적용되고, "
                    "꺼지는 것은 다른 가드레일뿐입니다.")

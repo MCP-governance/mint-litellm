@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,25 @@ def _loader() -> Any | None:
     return getattr(ProxyConfig(), "_get_config_from_file", None)
 
 
+def _utf8_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+    if "b" not in mode:
+        kwargs.setdefault("encoding", "utf-8")
+    return open(file, mode, *args, **kwargs)  # noqa: SIM115
+
+
+def _run_loader(loader: Any, path: Path) -> Any:
+    """LiteLLM의 로더는 인코딩 없이 파일을 열어 기본 인코딩이 UTF-8이 아닌 환경(Windows)에서
+    한국어 설정을 읽지 못한다. 로더가 속한 모듈에서만 ``open``을 UTF-8로 고정해 호출한다."""
+    module = sys.modules.get(getattr(loader, "__module__", ""))
+    if module is None or "open" in vars(module):
+        return asyncio.run(loader(config_file_path=str(path)))
+    module.open = _utf8_open  # type: ignore[attr-defined]
+    try:
+        return asyncio.run(loader(config_file_path=str(path)))
+    finally:
+        del module.open  # type: ignore[attr-defined]
+
+
 def load_effective_config(path: Path, *, require_loader: bool) -> dict[str, Any]:
     """LiteLLM이 적재할 병합된 설정.
 
@@ -31,7 +51,7 @@ def load_effective_config(path: Path, *, require_loader: bool) -> dict[str, Any]
     loader = _loader()
     if loader is not None:
         try:
-            config = asyncio.run(loader(config_file_path=str(path)))
+            config = _run_loader(loader, path)
         except Exception as error:
             raise ControlError(f"LiteLLM 설정 로더가 설정을 읽지 못했습니다: {error}") from None
         if not isinstance(config, dict):
