@@ -2,6 +2,8 @@ import asyncio
 import json
 import time
 
+import pytest
+
 from mint_litellm.plugin.policy.opa_client import OPAClient
 from mint_litellm.types.reason_codes import Reason
 
@@ -100,3 +102,40 @@ def test_each_call_uses_its_own_remaining_budget():
     assert long.output is not None
     assert exhausted.failure.reason_code == Reason.DEPENDENCY_FAILURE
 
+
+def test_client_cannot_be_reused_on_another_event_loop():
+    async def first(client):
+        return await client.evaluate(INPUT, policy_version_id="active", bundle_sha256=HASH)
+
+    async def run():
+        server, url, _ = await keepalive_server()
+        return server, OPAClient(url, 2)
+
+    loop = asyncio.new_event_loop()
+    try:
+        server, client = loop.run_until_complete(run())
+        assert loop.run_until_complete(first(client)).output is not None
+        with pytest.raises(RuntimeError):
+            asyncio.run(first(client))
+        loop.run_until_complete(client.aclose())
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+    finally:
+        loop.close()
+
+
+def test_client_cannot_be_reused_after_fork(monkeypatch):
+    async def run():
+        server, url, _ = await keepalive_server()
+        client = OPAClient(url, 2)
+        try:
+            await client.evaluate(INPUT, policy_version_id="active", bundle_sha256=HASH)
+            monkeypatch.setattr("os.getpid", lambda: -1)
+            with pytest.raises(RuntimeError):
+                await client.evaluate(INPUT, policy_version_id="active", bundle_sha256=HASH)
+            monkeypatch.undo()
+        finally:
+            await client.aclose()
+            server.close()
+
+    asyncio.run(run())
