@@ -32,44 +32,74 @@ class Evaluation:
 
 
 class OPAClient:
+    """OPA 판정 클라이언트. 연결을 재사용하고 시간 제한은 호출마다 받는다.
+
+    연결이 끊기거나 OPA가 재시작되어 요청이 실패하면 그 호출은 ``DEPENDENCY_FAILURE``로
+    차단되며, 끊어진 연결은 풀에서 제거되어 다음 호출이 새로 연결한다.
+    """
+
     def __init__(self, base_url: str, timeout_seconds: float) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self._url = base_url.rstrip("/") + "/v1/data/mint/decision"
         self._timeout = timeout_seconds
+        self._client: httpx.AsyncClient | None = None
+
+    async def aclose(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            await client.aclose()
+
+    def _http(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(follow_redirects=False, trust_env=False)
+        return self._client
 
     async def evaluate(
-        self, policy_input: dict[str, Any], *, policy_version_id: str, bundle_sha256: str
+        self,
+        policy_input: dict[str, Any],
+        *,
+        policy_version_id: str,
+        bundle_sha256: str,
+        budget_seconds: float | None = None,
     ) -> Evaluation:
+        """``budget_seconds``는 이 호출에 남은 판정 예산이다(없으면 생성 시 값)."""
         if not has_only_policy_fields(policy_input):
             return Evaluation(failure=StageResult.stop(Reason.SCHEMA_ERROR))
+        budget = self._timeout if budget_seconds is None else budget_seconds
+        if budget <= 0:
+            return Evaluation(failure=StageResult.stop(Reason.DEPENDENCY_FAILURE))
+        deadline = asyncio.get_running_loop().time() + budget
         try:
-            async with asyncio.timeout(self._timeout):
-                async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
-                    for _ in range(2):
-                        response = await client.post(self._url, json={"input": policy_input})
-                        response.raise_for_status()
-                        try:
-                            result = response.json()["result"]
-                            output = PolicyOutput.model_validate(result)
-                        except (KeyError, TypeError, ValueError, ValidationError):
+            async with asyncio.timeout_at(deadline):
+                client = self._http()
+                for _ in range(2):
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    response = await client.post(
+                        self._url, json={"input": policy_input}, timeout=max(remaining, 0.001)
+                    )
+                    response.raise_for_status()
+                    try:
+                        result = response.json()["result"]
+                        output = PolicyOutput.model_validate(result)
+                    except (KeyError, TypeError, ValueError, ValidationError):
+                        return Evaluation(failure=StageResult.stop(Reason.SCHEMA_ERROR))
+                    if (output.policy_version_id, output.bundle_sha256) == (
+                        policy_version_id,
+                        bundle_sha256,
+                    ):
+                        if output.missing_inputs:
                             return Evaluation(failure=StageResult.stop(Reason.SCHEMA_ERROR))
-                        if (output.policy_version_id, output.bundle_sha256) == (
-                            policy_version_id,
-                            bundle_sha256,
-                        ):
-                            if output.missing_inputs:
-                                return Evaluation(failure=StageResult.stop(Reason.SCHEMA_ERROR))
-                            try:
-                                PolicyDecision(output.decision)
-                            except ValueError:
-                                return Evaluation(failure=StageResult.stop(Reason.SCHEMA_ERROR))
-                            normalized = normalize_policy_output(
-                                output.decision, output.policy_ids, output.obligations
-                            )
-                            if normalized.failure is not None:
-                                return Evaluation(failure=normalized.failure)
-                            return Evaluation(output=output)
-                    return Evaluation(failure=StageResult.stop(Reason.POLICY_VERSION_MISMATCH))
+                        try:
+                            PolicyDecision(output.decision)
+                        except ValueError:
+                            return Evaluation(failure=StageResult.stop(Reason.SCHEMA_ERROR))
+                        normalized = normalize_policy_output(
+                            output.decision, output.policy_ids, output.obligations
+                        )
+                        if normalized.failure is not None:
+                            return Evaluation(failure=normalized.failure)
+                        return Evaluation(output=output)
+                return Evaluation(failure=StageResult.stop(Reason.POLICY_VERSION_MISMATCH))
         except (TimeoutError, httpx.HTTPError):
             return Evaluation(failure=StageResult.stop(Reason.DEPENDENCY_FAILURE))
