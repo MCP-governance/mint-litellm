@@ -69,6 +69,11 @@ def test_keep_and_restore_are_passed_through_with_the_bundle_path(wired, sync_co
 
     async def behavior(kwargs):
         calls["activate"].append(sorted(kwargs))
+        fresh = await kwargs["connect"]()
+        try:
+            assert fresh.info.dbname and not fresh.closed
+        finally:
+            await fresh.close()
         await kwargs["keep"]("v1", "a" * 64)
         assert await kwargs["restore"]("v1", "a" * 64) is True
 
@@ -132,6 +137,7 @@ def test_a_registered_version_is_retried_with_the_same_callbacks(wired, sync_con
         " VALUES ('inst1', 'v2', %s, %s)", ("c" * 64, "b" * 64))
 
     async def behavior(kwargs):
+        assert callable(kwargs["connect"])
         await kwargs["keep"]("v1", "a" * 64)
         await kwargs["restore"]("v1", "a" * 64)
         calls["activate"].append("retry")

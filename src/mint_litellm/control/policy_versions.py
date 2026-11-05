@@ -63,8 +63,11 @@ def activate(
     async def restore(active_version: str, active_sha: str) -> bool:
         return policy_bundle.restore_bundle(source.bundle_path, active_version, active_sha)
 
+    async def connect() -> psycopg.AsyncConnection:
+        return await psycopg.AsyncConnection.connect(database_url)
+
     async def run() -> None:
-        async with await psycopg.AsyncConnection.connect(database_url) as aconn:
+        async with await connect() as aconn:
             if row is None:
                 await policy_bundle.register_bundle(
                     aconn, instance_id=instance_id, bundle=bundle
@@ -82,6 +85,7 @@ def activate(
                 timeout_seconds=source.timeout_seconds,
                 keep=keep,
                 restore=restore,
+                connect=connect,
             )
 
     try:
