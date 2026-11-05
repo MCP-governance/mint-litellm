@@ -29,7 +29,7 @@ class FakeOpa:
                     "/v1/policies": {"result": [outer.module()]},
                     "/v1/data": {"result": outer.tree()},
                     "/v1/data/system": {
-                        "result": {"bundles": outer.bundles, "version": {"version": "1.21.4"}}
+                        "result": {"bundles": outer.bundles, "version": outer.version()}
                     },
                     "/v1/data/mint/data": {"result": outer.data},
                 }.get(self.path)
@@ -45,6 +45,11 @@ class FakeOpa:
         self.server = ThreadingHTTPServer(("localhost", 0), Handler)
         self.url = f"http://{socket.gethostbyname('localhost')}:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @staticmethod
+    def version():
+        keys = ("build_commit", "build_hostname", "build_timestamp", "version")
+        return dict.fromkeys(keys, "x") | {"version": "1.21.4"}
 
     def module(self):
         package = [{"type": "var", "value": "data"}, {"type": "string", "value": "mint"}]
