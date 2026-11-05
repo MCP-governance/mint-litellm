@@ -11,10 +11,12 @@ FROM ${LITELLM_IMAGE}
 COPY --from=openpolicyagent/opa:1.21.4@sha256:12420358d3f22a0cd2424ddc44a16e292ecb42825d3dfbca779986006822a3f6 /opa /usr/local/bin/opa
 COPY policy /opt/mint/policy
 COPY --from=build /wheels /tmp/wheels
+# uv.lock에서 내보낸 판본 제약. 설치할 패키지의 판본만 고정하며 기반 이미지의 litellm은 다시 설치하지 않는다.
+COPY deploy/constraints.txt /tmp/constraints.txt
 RUN python -m ensurepip \
-    && python -m pip install "$(ls /tmp/wheels/*.whl)[litellm]" \
+    && python -m pip install -c /tmp/constraints.txt "$(ls /tmp/wheels/*.whl)[litellm]" \
     && python -m pip uninstall -y pip \
-    && rm -rf /tmp/wheels
+    && rm -rf /tmp/wheels /tmp/constraints.txt
 
 # LiteLLM을 시작하기 전에 설정 파일을 검사하는 진입점. 검사에 실패하면 컨테이너가 시작되지 않는다.
 COPY deploy/mint-entrypoint.sh /usr/local/bin/mint-entrypoint

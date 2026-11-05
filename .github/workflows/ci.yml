@@ -18,6 +18,8 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv lock --check
+      - run: uv export --frozen --no-dev --extra litellm --format requirements-txt --no-hashes --no-emit-project -o deploy/constraints.txt
+      - run: git diff --exit-code deploy/constraints.txt
       - run: uv sync --locked --extra dev
       - run: uv run --no-sync ruff check src tests
       - run: uv run --no-sync pyflakes src tests
