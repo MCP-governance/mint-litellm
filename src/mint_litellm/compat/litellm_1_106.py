@@ -40,8 +40,9 @@ class ServerResolutionError(Exception):
 class HookData:
     """사전 훅 ``data``에서 읽는 값.
 
-    REST 호출은 같은 호출에서 로거 사전 훅이 두 번 불린다. 첫 번째는 요청 본문 단계라
-    ``mcp_server_name``이 없고, 두 번째(합성 단계)만 서버 이름과 도구 이름이 있다.
+    REST 호출은 같은 호출에서 사전 훅 단계가 두 번 있다. 첫 번째는 요청 본문 단계라
+    ``mcp_server_name``이 없고(가드레일은 건너뛰어진다), 두 번째(합성 단계)만 서버 이름과
+    도구 이름이 있다. ``arguments_ok``가 거짓이면 전송될 인자가 객체가 아니다.
     """
 
     server_name: str | None
@@ -49,6 +50,7 @@ class HookData:
     arguments: Mapping[str, Any]
     litellm_call_id: str | None
     logging_obj: Any
+    arguments_ok: bool = True
 
     @property
     def is_synthesized(self) -> bool:
@@ -64,19 +66,6 @@ def effective_arguments(data: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return arguments if isinstance(arguments, Mapping) else None
 
 
-def guardrail_runs(guardrail: Any, data: Mapping[str, Any]) -> bool:
-    """이 호출의 사전 훅 단계에서 ``guardrail``이 실행되는지.
-
-    LiteLLM이 가드레일을 건너뛸지 정할 때 쓰는 함수를 같은 이벤트와 같은 ``data``로 직접 부른다.
-    """
-    from litellm.types.guardrails import GuardrailEventHooks
-
-    return (
-        guardrail.should_run_guardrail(data=data, event_type=GuardrailEventHooks.pre_mcp_call)
-        is True
-    )
-
-
 def parse_hook_data(data: Mapping[str, Any]) -> HookData:
     arguments = effective_arguments(data)
     logging_obj = data.get("litellm_logging_obj")
@@ -87,6 +76,7 @@ def parse_hook_data(data: Mapping[str, Any]) -> HookData:
         arguments=arguments if arguments is not None else {},
         litellm_call_id=str(call_id) if call_id else None,
         logging_obj=logging_obj,
+        arguments_ok=arguments is not None,
     )
 
 
@@ -266,61 +256,6 @@ def unregister_callback(callback: Any) -> None:
     import litellm
 
     litellm.callbacks[:] = [cb for cb in litellm.callbacks if cb is not callback]
-
-
-# LiteLLM 1.106.6이 시작 때 모든 설정 콜백과 가드레일 뒤에 붙이는 내부 사전 훅이다. 소스로 확인한
-# 바로는 MCP 도구 호출에서 인자도 가드레일 관련 metadata도 바꾸지 않는다. 판본을 올리면 다시 본다.
-LITELLM_INTERNAL_PRE_HOOKS: frozenset[str] = frozenset(
-    {
-        "_PROXY_MaxParallelRequestsHandler_v3",
-        "_PROXY_CacheControlCheck",
-        "ResponsesIDSecurity",
-        "SkillsInjectionHook",
-        "_PROXY_MaxIterationsHandler",
-        "_PROXY_MaxBudgetPerSessionHandler",
-        "_PROXY_SensitiveDataRoutingHandler",
-    }
-)
-
-
-def class_name(callback: Any) -> str:
-    return callback if isinstance(callback, str) else type(callback).__name__
-
-
-def is_internal_pre_hook(callback: Any) -> bool:
-    """LiteLLM 패키지에 정의된 고정 목록의 내부 훅인지(같은 이름의 사용자 클래스는 아니다)."""
-    cls = type(callback)
-    return cls.__name__ in LITELLM_INTERNAL_PRE_HOOKS and cls.__module__.startswith("litellm.")
-
-
-def is_pre_call_hook(callback: Any) -> bool:
-    """LiteLLM이 MCP 호출의 사전 훅 순회에서 이 콜백의 훅을 부를 수 있는지.
-
-    순회와 같은 기준이다. 가드레일은 병렬 실행이 아니고 ``pre_mcp_call``에서 도는 것(판정이 어려우면
-    돈다고 본다), 그 밖의 로거는 말단 클래스가 ``async_pre_call_hook``을 재정의한 것이다.
-    """
-    try:
-        from litellm.integrations.custom_guardrail import CustomGuardrail
-        from litellm.integrations.custom_logger import CustomLogger
-    except ImportError:
-        return False
-    if isinstance(callback, str):
-        # LiteLLM은 순회 때 문자열을 로거로 풀어 훅을 부른다. 무엇이 될지 모르므로 훅으로 본다.
-        return True
-    if not isinstance(callback, CustomLogger):
-        return False
-    if isinstance(callback, CustomGuardrail):
-        if getattr(callback, "run_in_parallel", False):
-            return False
-        event_hook = getattr(callback, "event_hook", None)
-        if event_hook is None or not isinstance(event_hook, (str, list, tuple, set, frozenset)):
-            return True
-        items = [event_hook] if isinstance(event_hook, str) else event_hook
-        return "pre_mcp_call" in {str(getattr(item, "value", item)) for item in items}
-    cls = type(callback)
-    return "async_pre_call_hook" in vars(cls) and (
-        cls.async_pre_call_hook != CustomLogger.async_pre_call_hook
-    )
 
 
 def general_settings() -> Mapping[str, Any]:

@@ -359,7 +359,7 @@ def test_the_plugin_can_append_a_consumed_without_dispatch_event(scenario, plugi
         attempt_id=1,
         actor="mint-plugin",
         payload={
-            "reason": "ARGUMENTS_CHANGED",
+            "reason": "DEPENDENCY_FAILURE",
             "decision_ref": f"{invocation}:1",
             "call_approval_id": str(approval_id),
         },
@@ -375,7 +375,7 @@ def test_the_plugin_can_append_a_consumed_without_dispatch_event(scenario, plugi
         "SELECT payload FROM mint.events WHERE instance_id = %s AND kind = %s",
         (scenario.iid, kind.value),
     ).fetchone()
-    assert payload["reason"] == "ARGUMENTS_CHANGED"
+    assert payload["reason"] == "DEPENDENCY_FAILURE"
 
 
 def consume(scenario, call_id, event, **override):

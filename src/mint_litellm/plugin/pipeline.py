@@ -109,8 +109,6 @@ class CallRequest:
     resolution_failure: StageResult | None
     invocation_id: UUID = field(default_factory=new_uuid7)
     attempt_id: int = 1
-    # 판정 전에 이미 정해진 차단. 안전망이 판정 뒤의 변경을 기록할 때 쓴다.
-    forced_stop: StageResult | None = None
 
 
 @dataclass(frozen=True)
@@ -120,19 +118,6 @@ class Outcome:
     error: MintError | None
     evidence: Evidence
     context: dict[str, Any]
-
-
-def arguments_digest(arguments: Mapping[str, Any], key: bytes | None) -> str | None:
-    """판정한 인자의 요약. 호출별 승인과 같은 키의 HMAC 지문이며 호출 컨텍스트에만 둔다.
-
-    키가 없거나 인자를 JSON 값으로 만들 수 없으면 None이다.
-    """
-    if key is None:
-        return None
-    try:
-        return argument_fingerprint(arguments, key)
-    except ValueError:
-        return None
 
 
 def scope_matches(scope_type: str, scope_id: str, principal: Principal, server_id: str) -> bool:
@@ -171,8 +156,6 @@ def context_result(req: CallRequest, verified: bool) -> StageResult | None:
         return StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED)
     if req.principal.principal_type is PrincipalType.MASTER_KEY:
         return StageResult.stop(Reason.MASTER_KEY_FORBIDDEN)
-    if req.forced_stop is not None:
-        return req.forced_stop
     if req.resolution_failure is not None:
         return req.resolution_failure
     resolved = req.resolved
@@ -872,16 +855,12 @@ async def evaluate_request(req: CallRequest, deps: PipelineDeps) -> Outcome:
         snapshot=snapshot_doc,
         error=error,
         evidence=evidence,
-        context=_context_document(run, snapshot_doc, allowed, deps.config.fingerprint_key, consume),
+        context=_context_document(run, snapshot_doc, allowed, consume),
     )
 
 
 def _context_document(
-    run: _Run,
-    snapshot: DecisionSnapshot,
-    allowed: bool,
-    key: bytes | None,
-    consumed: ConsumeRequest | None,
+    run: _Run, snapshot: DecisionSnapshot, allowed: bool, consumed: ConsumeRequest | None
 ) -> dict[str, Any]:
     """응답·실패 이벤트가 읽는 호출 컨텍스트. JSON 값만 담고 인자·결과는 담지 않는다."""
     principal = run.principal
@@ -889,7 +868,6 @@ def _context_document(
         "invocation_id": str(snapshot.invocation_id),
         "attempt_id": snapshot.attempt_id,
         "decision_ref": snapshot.decision_ref,
-        "arguments_digest": arguments_digest(run.req.hook.arguments, key),
         "consumed_call_approval": (
             {"id": str(consumed.call_approval_id), "state_version": consumed.state_version}
             if allowed and consumed is not None
@@ -925,6 +903,8 @@ def build_request(
     failure: StageResult | None = None
     if hook.tool_name is None:
         failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="hook data has no tool")
+    elif not hook.arguments_ok:
+        failure = StageResult.stop(Reason.SCHEMA_ERROR, detail="arguments are not an object")
     else:
         try:
             resolved = resolver(hook)
