@@ -454,9 +454,16 @@ class EvidenceRecorder:
         self._schedule_replay()
         return DatabaseResult(stored=True)
 
-    async def fallback(self, event: Event) -> Evidence:
-        """DB에 쓰지 못한 사건을 버퍼에, 그것도 안 되면 표준 오류에 남긴다."""
+    async def fallback(
+        self, event: Event, *, on_written: Callable[[], None] | None = None
+    ) -> Evidence:
+        """DB에 쓰지 못한 사건을 버퍼에, 그것도 안 되면 표준 오류에 남긴다.
+
+        ``on_written``은 사건이 남겨진 직후, 넘침 보고를 기다리기 전에 불린다.
+        """
         evidence = await self._write_local(event)
+        if on_written is not None:
+            on_written()
         if evidence is Evidence.BUFFER:
             await self._report_overflow()
         return evidence

@@ -289,6 +289,32 @@ class TestGuardrailJudgment:
         assert blocked(lambda: pre(runtime.guardrail, data)).code == "MINT-SCHEMA-ERROR"
         assert snapshots.queries == []
 
+    def test_an_external_cancel_is_not_turned_into_a_block_and_leaves_one_cancelled_event(
+        self, tmp_path, contract_snapshot
+    ):
+        entered = asyncio.Event()
+
+        async def hangs(policy_input, **kwargs):
+            entered.set()
+            await asyncio.sleep(3600)
+
+        runtime, store, _ = build_runtime(tmp_path, contract_snapshot, evaluate=hangs)
+
+        async def main():
+            hook = runtime.guardrail.async_pre_call_hook(
+                auth(), None, synthesized(logging_obj()), "call_mcp_tool"
+            )
+            task = asyncio.ensure_future(hook)
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        run(main())
+        (event,) = store.of_kind("decision_evaluated")
+        assert event.payload["stop"]["reason_code"] == "CANCELLED"
+        assert event.payload["enforced_action"] == "block"
+
     def test_a_missing_arguments_key_is_judged_as_no_arguments(self, tmp_path, contract_snapshot):
         calls: list = []
         runtime, _, _ = build_runtime(tmp_path, contract_snapshot, evaluate=evaluator(calls=calls))
