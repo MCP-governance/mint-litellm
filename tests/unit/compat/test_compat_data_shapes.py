@@ -103,14 +103,13 @@ class Manager:
 class TestHookData:
     def test_a_synthesized_call_carries_server_tool_and_arguments(self):
         hook = compat.parse_hook_data(synthesized())
-        assert hook.is_synthesized
         assert (hook.server_name, hook.tool_name) == ("mslearn", "microsoft_docs_search")
         assert hook.arguments == {"query": "azure functions"}
         assert hook.litellm_call_id == "call-1"
 
-    def test_the_rest_request_body_stage_is_not_a_judgment_point(self):
+    def test_the_rest_request_body_stage_has_no_server_name(self):
         hook = compat.parse_hook_data(rest_body_stage())
-        assert not hook.is_synthesized and hook.server_name is None
+        assert hook.server_name is None
 
     def test_modified_arguments_win_when_truthy_and_empty_ones_are_ignored(self):
         assert compat.parse_hook_data(
@@ -120,12 +119,29 @@ class TestHookData:
             "query": "azure functions"
         }
 
+    def test_a_missing_arguments_key_is_an_empty_object_and_other_non_objects_are_not_ok(self):
+        data = synthesized()
+        del data["mcp_arguments"]
+        assert compat.parse_hook_data(data).arguments_ok
+        assert compat.parse_hook_data(data).arguments == {}
+        for odd in (None, "", [], 0, "text", [1]):
+            hook = compat.parse_hook_data(synthesized(mcp_arguments=odd))
+            assert not hook.arguments_ok and hook.arguments == {}, odd
+        assert compat.parse_hook_data(synthesized(mcp_arguments={})).arguments_ok
+
+    def test_a_non_object_replacement_is_not_ok_only_when_it_is_not_empty(self):
+        assert not compat.parse_hook_data(synthesized(modified_arguments="abc")).arguments_ok
+        for empty in ("", [], 0, None, {}):
+            hook = compat.parse_hook_data(synthesized(modified_arguments=empty))
+            assert hook.arguments_ok and hook.arguments == {"query": "azure functions"}, empty
+
     def test_missing_or_odd_arguments_become_empty(self):
         assert compat.parse_hook_data(synthesized(mcp_arguments=None)).arguments == {}
         assert compat.parse_hook_data(synthesized(mcp_arguments="text")).arguments == {}
 
     def test_effective_arguments_tell_a_missing_value_from_one_that_is_not_an_object(self):
-        assert compat.effective_arguments(synthesized(mcp_arguments=None)) == {}
+        assert compat.effective_arguments(synthesized(mcp_arguments=None)) is None
+        assert compat.effective_arguments(synthesized(mcp_arguments=[])) is None
         assert compat.effective_arguments(synthesized(mcp_arguments={})) == {}
         assert compat.effective_arguments(synthesized(mcp_arguments="text")) is None
         odd = synthesized(mcp_arguments={}, modified_arguments=["x"])

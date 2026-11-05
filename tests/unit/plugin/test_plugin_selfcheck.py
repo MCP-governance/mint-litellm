@@ -8,7 +8,6 @@ import pytest
 from plugin_helpers import FakeStore, config
 
 from mint_litellm.compat.litellm_1_106 import RegistryEntry
-from mint_litellm.plugin import selfcheck as selfcheck_module
 from mint_litellm.plugin.buffer import EvidenceRecorder, LocalBuffer, SystemEventKeys
 from mint_litellm.plugin.selfcheck import (
     LiteLLMView,
@@ -17,7 +16,7 @@ from mint_litellm.plugin.selfcheck import (
     check_items,
     collect_view,
     contract_mismatches,
-    order_check,
+    guardrail_definition_check,
     worker_id,
 )
 from mint_litellm.plugin.snapshot import RegisteredServer
@@ -46,27 +45,20 @@ class FakeLogger:
     pass
 
 
+def _always_judges(self, data, event_type):
+    return True
+
+
 class FakeGuardrail:
+    should_run_guardrail = _always_judges
+    mint_should_run_guardrail = _always_judges
+
     def __init__(self, **attributes):
         self.__dict__.update(attributes)
 
 
-class FakeHook:
-    """사전 훅을 가진 일반 콜백 대역."""
-
-    pre_hook = True
-
-
-class FakePassive:
-    """사전 훅이 없는 콜백 대역."""
-
-    pre_hook = False
-
-
-def hook(name):
-    """이름이 내부 훅 목록에 있으면 LiteLLM 패키지에 정의된 것처럼 만든다."""
-    namespace = {"__module__": "litellm.proxy.hooks.stand_in"} if name in INTERNAL else {}
-    return type(name, (FakeHook,), namespace)()
+class OtherGuardrail(FakeGuardrail):
+    """MINT가 아닌 다른 가드레일 대역."""
 
 
 def guardrail(**override):
@@ -74,20 +66,11 @@ def guardrail(**override):
         "guardrail_name": "mint",
         "event_hook": ["pre_mcp_call", "post_mcp_call"],
         "default_on": True,
-        "run_in_parallel": False,
+        "run_in_parallel": True,
+        "scan_raw_request": False,
     }
     args.update(override)
     return FakeGuardrail(**args)
-
-
-def fake_is_pre_hook(callback):
-    if hasattr(callback, "guardrail_name"):
-        if callback.run_in_parallel:
-            return False
-        return callback.event_hook is None or "pre_mcp_call" in selfcheck_module._hook_names(
-            callback.event_hook
-        )
-    return getattr(callback, "pre_hook", False)
 
 
 LOGGER = FakeLogger()
@@ -103,7 +86,6 @@ def view(**override):
         "user_url_validation": True,
         "registry": [entry()],
         "missing_symbols": [],
-        "is_pre_hook": fake_is_pre_hook,
     }
     args.update(override)
     return LiteLLMView(**args)
@@ -121,15 +103,12 @@ def registered(**override):
     return RegisteredServer(**args)
 
 
-def run_checks(
-    v=None, *, logger=LOGGER, guard=GUARDRAIL, controlled="default", allowed=frozenset()
-):
+def run_checks(v=None, *, logger=LOGGER, guard=GUARDRAIL, controlled="default"):
     return check_items(
         v or view(),
         logger=logger,
         guardrail=guard,
         controlled=[registered()] if controlled == "default" else controlled,
-        allowed_pre_hooks=allowed,
     )
 
 
@@ -172,73 +151,58 @@ def test_item_2_guardrail_modes_and_default_on():
     assert SelfCheckItem.GUARDRAIL_MODES in failed(run_checks(guard=None))
 
 
-INTERNAL = [
-    "_PROXY_MaxParallelRequestsHandler_v3",
-    "_PROXY_CacheControlCheck",
-    "ResponsesIDSecurity",
-    "SkillsInjectionHook",
-    "_PROXY_MaxIterationsHandler",
-    "_PROXY_MaxBudgetPerSessionHandler",
-    "_PROXY_SensitiveDataRoutingHandler",
-]
-
-
-def order_failed(callbacks, *, allowed=frozenset(), guard=GUARDRAIL):
-    results = run_checks(view(callbacks=callbacks), allowed=allowed, guard=guard)
+def definition_failed(callbacks, *, guard=GUARDRAIL):
+    results = run_checks(view(callbacks=callbacks), guard=guard)
     return SelfCheckItem.GUARDRAIL_ORDER in failed(results)
 
 
-def test_item_3_the_logger_sits_directly_before_the_guardrail():
-    assert not order_failed([LOGGER, GUARDRAIL])
-    assert order_failed([GUARDRAIL, LOGGER])
-    assert order_failed([LOGGER, FakePassive(), GUARDRAIL])
-    assert order_failed([LOGGER])
+def test_item_3_one_parallel_guardrail_with_its_judgment_intact_passes():
+    assert not definition_failed([LOGGER, GUARDRAIL])
+    assert guardrail_definition_check([LOGGER, GUARDRAIL], GUARDRAIL) == (True, "")
 
 
-def test_item_3_other_hooks_may_come_before_the_pair():
-    earlier = guardrail(guardrail_name="pii", event_hook=["pre_mcp_call"])
-    assert not order_failed([hook("Rewriter"), earlier, LOGGER, GUARDRAIL])
+def test_item_3_the_order_of_the_callbacks_does_not_matter():
+    assert not definition_failed([GUARDRAIL, LOGGER])
+    assert not definition_failed([object(), GUARDRAIL, object(), LOGGER])
+    assert not definition_failed([OtherGuardrail(guardrail_name="pii"), LOGGER, GUARDRAIL])
 
 
-def test_item_3_only_the_internal_hooks_and_allowed_ones_may_follow_the_guardrail():
-    internal = [hook(name) for name in INTERNAL]
-    assert not order_failed([LOGGER, GUARDRAIL, *internal])
-    custom = hook("Rewriter")
-    assert order_failed([LOGGER, GUARDRAIL, *internal, custom])
-    assert not order_failed([LOGGER, GUARDRAIL, *internal, custom], allowed=frozenset({"Rewriter"}))
-    pii = guardrail(guardrail_name="pii", event_hook=["pre_mcp_call"])
-    assert order_failed([LOGGER, GUARDRAIL, pii])
-    assert order_failed([LOGGER, GUARDRAIL, guardrail(guardrail_name="all", event_hook=None)])
+def test_item_3_a_missing_guardrail_fails():
+    assert definition_failed([LOGGER], guard=None)
 
 
-def test_item_3_hooks_that_do_not_run_before_a_tool_call_are_not_in_the_way():
-    assert not order_failed([LOGGER, GUARDRAIL, FakePassive()])
-    assert not order_failed(
-        [LOGGER, GUARDRAIL, guardrail(guardrail_name="a", event_hook=["pre_call"])]
-    )
-    parallel_after = guardrail(
-        guardrail_name="p", event_hook=["pre_mcp_call"], run_in_parallel=True
-    )
-    assert not order_failed([LOGGER, GUARDRAIL, parallel_after])
+def test_item_3_a_second_guardrail_of_the_same_kind_fails():
+    second = FakeGuardrail(**GUARDRAIL.__dict__)
+    assert definition_failed([LOGGER, GUARDRAIL, second])
 
 
-def test_item_3_the_guardrail_itself_must_not_run_in_parallel():
-    parallel = guardrail(run_in_parallel=True)
-    assert order_failed([LOGGER, parallel], guard=parallel)
+def test_item_3_the_guardrail_must_run_in_parallel_and_skip_the_raw_request():
+    sequential = guardrail(run_in_parallel=False)
+    assert definition_failed([LOGGER, sequential], guard=sequential)
+    unset = guardrail(run_in_parallel=None)
+    assert definition_failed([LOGGER, unset], guard=unset)
+    scanning = guardrail(scan_raw_request=True)
+    assert definition_failed([LOGGER, scanning], guard=scanning)
 
 
-def test_order_check_names_the_offending_hooks_once():
-    result = order_check(
-        [LOGGER, GUARDRAIL, hook("A"), hook("B"), hook("A")],
-        fake_is_pre_hook,
-        logger=LOGGER,
-        guardrail=GUARDRAIL,
-    )
-    assert not result.ok and result.offenders == ("A", "B")
-    between = order_check(
-        [LOGGER, hook("Between"), GUARDRAIL], fake_is_pre_hook, logger=LOGGER, guardrail=GUARDRAIL
-    )
-    assert between.offenders == ("Between",)
+def test_item_3_a_replaced_judgment_override_fails():
+    class Replaced(FakeGuardrail):
+        def should_run_guardrail(self, data, event_type):
+            return False
+
+    replaced = Replaced(**GUARDRAIL.__dict__)
+    assert definition_failed([LOGGER, replaced], guard=replaced)
+    assert guardrail_definition_check([LOGGER, replaced], replaced)[1].endswith("replaced")
+
+    class Missing:
+        run_in_parallel = True
+        scan_raw_request = False
+
+        def should_run_guardrail(self, data, event_type):
+            return True
+
+    missing = Missing()
+    assert definition_failed([LOGGER, missing], guard=missing)
 
 
 def test_item_4_key_access_is_strict_for_controlled_servers():
@@ -417,7 +381,6 @@ def make_runtime(
         recorder=recorder,
         evaluate=None,
         view_collector=lambda: state["view"],
-        callbacks_reader=lambda: state["view"].callbacks,
         terminate=lambda: stopped.append(1),
         readiness=readiness,
         retry_seconds=retry,
@@ -719,48 +682,27 @@ class TestVerifiedEvent:
             assert [c["item"] for c in event.payload["checks"]] == list(range(1, 9))
             assert all(c["ok"] for c in event.payload["checks"])
             assert event.payload["checks"][2]["name"] == SelfCheckItem.GUARDRAIL_ORDER.name
-            assert event.payload["allowed_hooks_used"] == []
-
-    def test_the_allowed_hooks_in_use_are_named(self, tmp_path):
-        late = view(callbacks=[LOGGER, GUARDRAIL, hook("Rewriter"), hook(INTERNAL[0])])
-        runtime, store, _, _ = make_runtime(tmp_path, v=late)
-        runtime.config = replace(runtime.config, allowed_pre_hooks=frozenset({"Rewriter", "Idle"}))
-        asyncio.run(runtime._startup())
-        (event,) = store.of_kind("enforcement_verified")
-        assert event.payload["allowed_hooks_used"] == ["Rewriter"]
 
     def test_a_failed_startup_records_no_verification(self, tmp_path):
-        runtime, store, _, _ = make_runtime(tmp_path, v=view(callbacks=[GUARDRAIL]))
+        runtime, store, _, _ = make_runtime(tmp_path, v=view(callbacks=[LOGGER]))
         asyncio.run(runtime._startup())
         assert store.of_kind("enforcement_verified") == []
 
-    def test_the_restored_configuration_is_verified_once_on_the_next_decision(self, tmp_path):
-        runtime, store, stopped, state = make_runtime(tmp_path)
-        asyncio.run(runtime._startup())
-        state["view"] = view(callbacks=[LOGGER, GUARDRAIL, hook("Late")])
-        asyncio.run(runtime.refresh_order())
-        assert len(store.of_kind("enforcement_unverified")) == 1
-        assert len(store.of_kind("enforcement_verified")) == 1
-        state["view"] = view(callbacks=[LOGGER, GUARDRAIL])
-        for _ in range(3):
-            asyncio.run(runtime.refresh_order())
-        assert runtime.deps.verified() is True
-        first, second = sorted(store.of_kind("enforcement_verified"), key=lambda e: e.inserted_at)
-        assert first.source_key.split(":")[1] != second.source_key.split(":")[1]
-        assert event_kinds(store) == [
-            "enforcement_unverified",
-            "enforcement_verified",
-            "enforcement_verified",
-        ]
-
-    def test_an_order_that_recovers_before_the_first_pass_is_not_a_verification(self, tmp_path):
-        runtime, store, _, state = make_runtime(
-            tmp_path, v=view(callbacks=[LOGGER, GUARDRAIL, hook("Late")])
+    def test_a_worker_that_passes_later_records_the_verification_once(self, tmp_path):
+        runtime, store, stopped, state = make_runtime(
+            tmp_path, v=view(strict_guardrail_modes=False), required=False
         )
-        assert asyncio.run(runtime.verify()) is False
-        state["view"] = view(callbacks=[LOGGER, GUARDRAIL])
-        asyncio.run(runtime.refresh_order())
-        assert runtime.order_ok is True and store.events == {}
+
+        async def scenario():
+            task = asyncio.create_task(runtime._startup())
+            await asyncio.sleep(0.3)
+            assert store.of_kind("enforcement_verified") == []
+            state["view"] = view()
+            await task
+
+        asyncio.run(scenario())
+        assert runtime.verified and stopped == []
+        assert event_kinds(store) == ["enforcement_unverified", "enforcement_verified"]
 
     def test_a_copy_that_went_through_the_buffer_converges_into_one_row(self, tmp_path):
         class CommitsThenFails(FakeStore):
@@ -785,89 +727,6 @@ class TestVerifiedEvent:
         assert len(store.of_kind("enforcement_verified")) == 1
         (report,) = store.of_kind("buffer_replayed")
         assert report.payload["duplicates"] == 1 and report.payload["replayed"] == 0
-
-
-def test_a_hook_after_the_guardrail_that_is_not_allowed_stops_the_startup(tmp_path):
-    late = view(callbacks=[LOGGER, GUARDRAIL, hook("Rewriter")])
-    runtime, store, stopped, _ = make_runtime(tmp_path, v=late)
-    asyncio.run(runtime._startup())
-    assert stopped == [1] and not runtime.verified
-    (event,) = store.of_kind("enforcement_unverified")
-    (failure,) = event.payload["failed"]
-    assert failure["item"] == 3 and "Rewriter" in failure["detail"]
-
-
-def test_the_same_hook_in_the_allowed_list_starts(tmp_path):
-    late = view(callbacks=[LOGGER, GUARDRAIL, hook("Rewriter")])
-    runtime, store, stopped, _ = make_runtime(tmp_path, v=late)
-    runtime.config = replace(runtime.config, allowed_pre_hooks=frozenset({"Rewriter"}))
-    asyncio.run(runtime._startup())
-    assert runtime.verified and stopped == [] and event_kinds(store) == ["enforcement_verified"]
-
-
-def test_a_default_setup_with_only_the_internal_hooks_starts(tmp_path):
-    internal = [hook(name) for name in INTERNAL]
-    runtime, store, stopped, _ = make_runtime(
-        tmp_path, v=view(callbacks=[LOGGER, GUARDRAIL, *internal])
-    )
-    asyncio.run(runtime._startup())
-    assert runtime.verified and stopped == [] and event_kinds(store) == ["enforcement_verified"]
-
-
-class TestCallbacksChangedAfterStartup:
-    @staticmethod
-    def started(tmp_path):
-        runtime, store, stopped, state = make_runtime(tmp_path)
-        assert asyncio.run(runtime.verify()) is True
-        return runtime, store, state
-
-    def test_an_unchanged_list_costs_no_recheck(self, tmp_path):
-        runtime, store, state = self.started(tmp_path)
-        runtime.view_collector = lambda: pytest.fail("the full view is read only on a change")
-        asyncio.run(runtime.refresh_order())
-        assert runtime.deps.verified() and store.events == {}
-
-    def test_a_hook_added_later_blocks_the_next_calls_with_one_system_event(self, tmp_path):
-        runtime, store, state = self.started(tmp_path)
-        state["view"] = view(callbacks=[LOGGER, GUARDRAIL, hook("Late")])
-        for _ in range(3):
-            asyncio.run(runtime.refresh_order())
-            assert runtime.deps.verified() is False
-        (event,) = store.of_kind("enforcement_unverified")
-        assert event.payload == {
-            "worker_id": worker_id(),
-            "cause": "callbacks_changed",
-            "hooks": ["Late"],
-        }
-        assert event.source_key.startswith("selfcheck:") and event.source_key.endswith(
-            ":1:enforcement_unverified"
-        )
-
-    def test_a_second_failure_after_a_recovery_is_a_new_event_under_a_new_run(self, tmp_path):
-        runtime, store, state = self.started(tmp_path)
-        state["view"] = view(callbacks=[LOGGER, GUARDRAIL, hook("Late")])
-        asyncio.run(runtime.refresh_order())
-        state["view"] = view(callbacks=[LOGGER, GUARDRAIL])
-        asyncio.run(runtime.refresh_order())
-        assert runtime.deps.verified() is True and len(store.of_kind("enforcement_unverified")) == 1
-        state["view"] = view(callbacks=[LOGGER, GUARDRAIL, hook("Later")])
-        asyncio.run(runtime.refresh_order())
-        first, second = store.of_kind("enforcement_unverified")
-        assert first.source_key != second.source_key
-        assert first.source_key.split(":")[1] != second.source_key.split(":")[1]
-        assert runtime.order_offenders == ("Later",)
-
-    def test_an_allowed_or_internal_hook_added_later_changes_nothing(self, tmp_path):
-        runtime, store, state = self.started(tmp_path)
-        runtime.config = replace(runtime.config, allowed_pre_hooks=frozenset({"Known"}))
-        state["view"] = view(callbacks=[LOGGER, GUARDRAIL, hook("Known"), hook(INTERNAL[0])])
-        asyncio.run(runtime.refresh_order())
-        assert runtime.deps.verified() is True and store.events == {}
-
-    def test_a_list_that_changed_before_the_first_check_is_left_to_the_startup(self, tmp_path):
-        runtime, store, stopped, state = make_runtime(tmp_path)
-        asyncio.run(runtime.refresh_order())
-        assert store.events == {} and runtime.order_snapshot is None
 
 
 def test_readiness_is_awaited_for_at_most_the_grace_period(tmp_path):

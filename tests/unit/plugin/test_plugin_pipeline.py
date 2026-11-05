@@ -89,33 +89,19 @@ def test_context_document_carries_only_plain_values(tmp_path):
     assert "q" not in json.dumps(ctx)
 
 
-class TestArgumentsDigest:
-    def test_it_is_the_keyed_fingerprint_of_the_judged_arguments(self, tmp_path):
-        from mint_litellm.plugin.pipeline import arguments_digest
-
+class TestContext:
+    def test_the_context_carries_plain_values_and_no_argument_value(self, tmp_path):
         outcome = decide(harness(tmp_path))
-        digest = outcome.context["arguments_digest"]
-        assert (
-            digest
-            == argument_fingerprint({"q": "x"}, FP_KEY)
-            == arguments_digest({"q": "x"}, FP_KEY)
-        )
-        assert digest != arguments_digest({"q": "x"}, bytes(range(1, 33)))
+        ctx = outcome.context
+        assert json.loads(json.dumps(ctx)) == ctx
+        assert "arguments_digest" not in ctx and ctx["consumed_call_approval"] is None
+        assert "x" not in {v for v in ctx.values() if isinstance(v, str) and len(v) == 1}
 
-    def test_it_is_missing_without_a_key_or_for_arguments_that_are_not_json(self):
-        from mint_litellm.plugin.pipeline import arguments_digest
-
-        assert arguments_digest({"q": "x"}, None) is None
-        assert arguments_digest({"q": float("nan")}, FP_KEY) is None
-
-    def test_it_stays_in_the_context_and_never_reaches_the_ledger(self, tmp_path):
-        h = harness(tmp_path)
-        outcome = decide(h)
-        digest = outcome.context["arguments_digest"]
-        assert h.store.events
-        for event in h.store.events.values():
-            assert digest not in event.to_json_line()
-        assert digest not in json.dumps(outcome.snapshot.model_dump(mode="json"))
+    def test_a_consumed_call_approval_is_named_in_the_context(self, tmp_path):
+        evaluate = evaluator("RequireApproval", policy_ids=("R2",))
+        h = harness(tmp_path, snapshot(call_approvals=(call_approval(),)), evaluate=evaluate)
+        consumed = decide(h).context["consumed_call_approval"]
+        assert consumed == {"id": str(call_approval().id), "state_version": 2}
 
 
 class TestErrorReference:

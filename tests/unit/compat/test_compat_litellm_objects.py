@@ -135,8 +135,10 @@ class TestRealManager:
         assert entry.transport == "http" and entry.auth_type == "none"
 
 
-def test_the_pre_call_hook_is_defined_on_the_logger_class_itself():
-    # LiteLLM runs a logger's pre-call hook only when the leaf class defines it.
+def test_the_judgment_hook_is_defined_on_the_guardrail_class_and_not_on_the_logger():
+    # LiteLLM runs a pre-call hook only when the leaf class defines it.
+    from mint_litellm.plugin.guardrail import MintGuardrail
     from mint_litellm.plugin.logger import MintLogger
 
-    assert "async_pre_call_hook" in vars(MintLogger)
+    assert "async_pre_call_hook" in vars(MintGuardrail)
+    assert "async_pre_call_hook" not in vars(MintLogger)

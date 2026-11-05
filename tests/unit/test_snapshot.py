@@ -8,7 +8,6 @@ from pydantic import ValidationError
 
 from mint_litellm.types.decision import (
     MINT_CTX_KEY,
-    MINT_DECISION_REF_KEY,
     MISSING_REASON_FIELDS,
     Action,
     DecisionSnapshot,
@@ -99,7 +98,6 @@ def test_valid_snapshot_exposes_the_contract_fields():
 
 def test_context_keys_are_the_documented_slots():
     assert MINT_CTX_KEY == "mint_ctx"
-    assert MINT_DECISION_REF_KEY == "mint_decision_ref"
 
 
 def test_decision_ref_must_match_the_invocation():
