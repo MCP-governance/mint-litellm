@@ -12,7 +12,7 @@ import pytest
 import mint_litellm
 
 ROOT = Path(mint_litellm.__file__).resolve().parents[2]
-SUFFIXES = {".py", ".sql", ".md", ".toml", ".yml", ".yaml", ".txt", ".cfg", ".ini"}
+SUFFIXES = {".py", ".sql", ".md", ".toml", ".yml", ".yaml", ".txt", ".cfg", ".ini", ".json", ".sh"}
 SKIP_DIRS = {
     ".git",
     ".venv",

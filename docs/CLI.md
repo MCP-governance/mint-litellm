@@ -48,6 +48,10 @@
 | `mint-litellm policy activate` | `admin` | 정책 번들을 검증하고 정책 엔진에 적재한 뒤 활성 판본으로 전환한다. | - | `policy_activated` |
 | `mint-litellm ledger list` | 모든 역할 | 원장 사건을 종류·기간·호출 식별자로 조회한다. | - | - |
 
+## 정책 활성화 실패와 복원
+
+`policy activate`가 시간 초과나 취소로 끝나면 이전 활성 번들을 복원하려고 시도하며, 결과를 `restore_outcome` 필드에 담는다(`--json`). 성공하면 값은 `null`이다. 복원도 확인하지 못했다면 그 사실이 필드에 남으므로 운영자가 현재 적재된 번들을 `status`로 다시 확인해야 한다.
+
 ## 서버와 승인의 활성화 순서
 
 1. LiteLLM에 서버를 구성한다. 설정 서버는 `server_id`를 명시한다.
@@ -57,6 +61,105 @@
 
 승인을 모두 철회해도 서버 상태는 바뀌지 않는다. 서버 전체를 막으려면 `server suspend`를 쓴다. 특정 주체를 더 넓은 승인까지 포함해 막으려면 `revoke --deny`를 쓴다.
 
+## 환경 변수
+
+| 변수 | 용도 | 기본값 |
+| --- | --- | --- |
+| `MINT_DATABASE_URL` | MINT 데이터베이스 접속 주소 | 필수 |
+| `MINT_INSTANCE_ID` | 배치 식별자. 영문자·숫자·`.`·`_`·`-`, 128자 이하 | `default` |
+| `MINT_OPERATOR_TOKEN` | 운영자 토큰. `--token-file <파일>`로 대신할 수 있다. | 인증이 필요한 명령에서 필수 |
+| `MINT_LITELLM_URL` | LiteLLM 관리 API 주소 | `server register`·`operator add`·`approve`·`consent add`·`check`·`status`에서 필요 |
+| `MINT_LITELLM_KEY` | 제어 평면 LiteLLM 키(`proxy_admin`, `allowed_routes` 7개로 제한) | 위와 같음 |
+| `MINT_LITELLM_CONFIG` | `check`·`status`가 읽는 LiteLLM `config.yaml` 경로. `--config`로 대신할 수 있다. | 없음 |
+| `MINT_MODE` | 모드 상한. `enforce`이면 `settings mode observe`가 거부된다. | `enforce` |
+| `MINT_REPLICAS` | `check`가 공유 캐시 설정을 판단할 때 쓰는 복제본 수 | `1` |
+| `MINT_SECRETS_FILE` | `init`이 인자 지문 키를 쓰는 비밀 파일. `--secrets-file`로 대신할 수 있다. | `~/.config/mint/secrets.env` |
+| `MINT_PLUGIN_DB_PASSWORD`, `MINT_CONTROL_DB_PASSWORD` | `init`이 판정 프로세스용·제어 평면용 로그인 역할(`mint_plugin_app`, `mint_control_app`)을 만들 때 쓰는 비밀번호 | 없음(역할을 만들지 않음) |
+| `MINT_OPA_URL`, `MINT_POLICY_ROOT`, `MINT_OPA_BUNDLE_PATH` | `policy activate`의 정책 엔진 주소, `policy/`를 담은 루트, 정책 엔진이 감시하는 번들 파일. 각 옵션(`--opa-url`, `--policy-root`, `--bundle-path`)으로 대신할 수 있다. | `/opt/mint`, `/bundles/mint.tar.gz` |
+
+## 설정 조각
+
+`init`은 LiteLLM 설정 조각을 `config/litellm.mint.yaml`에 쓰고, 호출별 승인의 인자 지문 키가 없으면 저장소 밖 비밀 파일(`--secrets-file`, 기본 `~/.config/mint/secrets.env`, 권한 0600)에 만든다. 출력의 `fingerprint_key_file`·`fingerprint_key_created`로 확인하며 키 값은 출력하지 않는다. `--out <경로>`로 위치를 바꾸고 `--out -`로 표준 출력에 낸다. 통제할 설정 서버는 `--mcp-server <이름>=<URL>`로 줄 수 있으며 `server_id`는 이름과 같게 명시된다.
+
+## 승인 조건과 대상 확인
+
+`approve`는 정책이 읽는 조건을 승인과 함께 저장한다. 승인은 생성한 뒤 조건을 바꿀 수 없으므로 조건이 달라지면 새 승인을 만든다. 조건은 지정한 것만 저장되고 사건에도 그대로 남는다.
+
+| 옵션 | 조건 | 효과 |
+| --- | --- | --- |
+| `--high-risk-tools a,b` | `high_risk_tools` | 나열한 도구는 호출별 승인을 요구한다. |
+| `--business-hours-only` | `business_hours_only` | 업무 시간 밖의 호출을 차단한다. 업무 시간은 정책 번들의 값이다. |
+| `--business-hours 시간대,요일,시작,끝` | `business_hours` | 이 승인의 업무 시간을 재정의한다(예: `Asia/Seoul,1-5,09:00,18:00`, 요일은 1=월 ~ 7=일). `--business-hours-only`와 함께 쓴다. |
+| `--require-consent 목적` | `require_consent` | 그 목적의 동의가 있어야 호출을 허용한다. |
+
+승인 범위(`--scope key|user|team`)의 대상은 LiteLLM에서 읽어 확인한다. 대상이 없거나, `object_permission.mcp_servers`에 서버 식별자가 아닌 항목(별칭·이름)이 있거나, 대상에 해당 서버의 권한(직접 부여 또는 서버가 속한 접근 그룹)이 없으면 승인은 만들어지지 않는다. 이용 관계에 팀이 있으면 `team` 범위는 그 팀, `key` 범위는 팀이 같은 키, `user` 범위는 그 팀에 속한 사용자여야 한다. 팀이 없는 관계에서는 `team` 범위가 그 조직에 묶인 팀이어야 하고, `key`·`user` 범위는 조직 유도 결과(팀 바인딩, 사용자 바인딩, 기본 조직 순)가 관계의 조직과 같아야 한다. `--scope org` 승인은 지원하지 않으므로 조직에 묶인 팀을 `team` 범위로 승인한다.
+
+## 서버 등록의 계약 URL
+
+`server register`는 서버의 URL 해시를 계약 값으로 저장한다. URL은 `--url`, LiteLLM 설정 파일(`--config` 또는 `MINT_LITELLM_CONFIG`의 `mcp_servers.<이름>.url`, `server_id`가 같은 항목), 관리 API 응답 순으로 정하며 출처는 사건의 `url_source`(`operator`, `config_file`, `registry`)에 남는다. 제어 평면 키는 제한된 키라서 관리 API가 URL을 응답하지 않는 것이 보통이다. 둘 이상의 출처가 보이면 모두 같아야 한다. URL이 없는 서버(stdio, OpenAPI 명세 기반)는 `MINT-UNSUPPORTED`(사유 `server_without_url`)로 거부한다. 이미 등록된 서버에 다시 실행하면 계약 값을 갱신한다. `status`는 플러그인이 관측한 계약 불일치(`server_identity_mismatch_observed`)를 서버를 다시 등록하기 전까지 경보로 표시한다.
+
+## 출력 형식
+
+기본 출력은 사람이 읽는 텍스트이다. `--json`(명령 앞이나 뒤 어디에 두어도 된다)을 주면 표준 출력에 JSON 객체 한 개만 쓴다. 안내와 오류 메시지는 표준 오류로 나간다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `ok` | 명령이 성공했는지. `check`가 필수 설정 위반으로 실패해도 결과는 출력된다. |
+| `command` | 명령 이름(`approve`, `org add` 등) |
+| `id` | 변경의 중심이 된 객체의 식별자. 생성 명령은 만든 객체(승인·거부·이용 관계·동의·허용 목록·호출별 승인은 UUID, 조직·운영자·정책 판본은 이름), 상태 변경 명령은 대상 객체 |
+| `state_version` | 변경 뒤 그 객체의 상태 버전 |
+| `events` | 이 명령이 원장에 남긴 사건 목록(남긴 순서). 항목: `event_id`, `kind`, `source_key`, `entity`, `entity_id`, `state_version` |
+| `token` | 토큰을 발급하는 명령(`operator add`, `operator bootstrap`)만. 다시 표시되지 않는다. |
+| `notes` | `approve`가 알리는 주의 사항 목록 |
+
+`id`와 `state_version`은 `events`의 첫 사건에서 온다. `approve`처럼 사건이 둘이면(`approval_granted`, `server_approved`) 첫 사건이 승인이다. `revoke --deny`는 `approval_revoked`, `denial_created` 순서이다.
+
+명령별 추가 필드는 다음과 같다.
+
+| 명령 | 추가 필드 |
+| --- | --- |
+| `init` | `migrations`(이번에 적용한 마이그레이션), `login_roles`(설정한 로그인 역할), `snippet_path`(설정 조각 파일) 또는 `snippet`(`--out -`일 때 본문) |
+| `check` | `incomplete`(확인하지 못한 필수 행), `findings`(각 항목 `item`, `level`=`OK`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
+| `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `policy_bundle`(`state`: `match`·`mismatch`·`unverified`·`none`, `detail`), `servers`(상태별 개수), `enforcement`(워커별 최근 집행 점검 전환: `worker_id`, `passed`, `cause`, `failed`, `hooks`, `last_transition_at`, `run_id`), `alerts`, `observations` |
+| `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`) |
+
 ## 종료 코드
 
-`check`는 필수 설정이 하나라도 어긋나면 0이 아닌 값으로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다.
+| 코드 | 의미 |
+| --- | --- |
+| 0 | 성공 |
+| 1 | 명령을 수행할 수 없음: 입력 검증 실패, 상태 전이 위반, 직무 분리 위반, LiteLLM 읽기 실패, 데이터베이스 오류, `check`의 필수 설정 위반 |
+| 2 | 명령줄 사용법 오류 |
+| 3 | 실패는 없지만 필수 검증을 모두 수행하지 못함: `check`가 관리 API나 LiteLLM 설치본이 없어 필수 행을 확인하지 못했거나, `check`·`status`가 정책 엔진에서 활성 판본의 적재 내용을 읽지 못했다. |
+| 4 | 인증 실패: 토큰이 없거나 틀렸거나 만료됨, 역할 부족 |
+
+`check`는 필수 설정이 하나라도 어긋나면 1로 끝나고, 어긋남은 없지만 필수 행을 확인하지 못했으면 3으로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다. 변경 명령은 한 트랜잭션에서 상태와 사건을 함께 기록하므로, 0이 아닌 코드로 끝난 명령은 아무것도 바꾸지 않는다.
+
+## 정책 번들 내용 대조
+
+`check`와 `status`는 활성 정책 판본의 번들 해시를 정책 엔진(`MINT_OPA_URL`)이 실제로 적재한 규칙 원문과 정책 데이터에서 다시 계산해 등록된 값과 대조한다. 다르면 두 명령 모두 종료 코드 1로 끝나고(`ok`는 `false`, `status`는 경보도 표시한다), 정책 엔진에서 적재 내용을 읽지 못하면 필수 확인을 하지 못한 것이므로 두 명령 모두 종료 코드 3으로 끝난다. 활성 판본이 없으면 `check`는 경고만 하고 `status`는 성공으로 끝난다. 대조 시점 사이에 정책 엔진의 내용이 바뀌면 다음 대조까지 알 수 없다.
+
+## 호출별 승인의 인자 지문
+
+`call-approval request`는 인자 지문을 세 가지 방법 중 하나로 받는다.
+
+- `--arguments '<JSON 객체>'` 또는 `--args-file <파일>`(읽을 수 없으면 오류로 끝난다): 호출 인자 원문으로 플러그인과 같은 함수(HMAC-SHA256, 키를 정렬하고 구분자 공백 없이 비ASCII 문자를 그대로 둔 JSON)로 지문을 계산한다. 키는 `MINT_FINGERPRINT_KEY`(없으면 비밀 파일이며, 권한이 0600이 아니거나 심볼릭 링크이면 거부한다)에서 읽고 키 판본은 `MINT_FINGERPRINT_KEY_VERSION`(`--fp-key-version`으로 바꿀 수 있다)을 쓴다.
+- `--args-fp <지문>`: 차단 사건에 기록된 지문(소문자 16진 64자)을 그대로 넣는다.
+
+키가 없으면 인자 원문으로는 요청할 수 없고, 지문 키가 설정되어 있지 않으면 플러그인에서 호출별 승인은 항상 요구 상태로 남는다.
+
+## 원장 조회
+
+`ledger list`는 `--kind`, `--since`, `--until`, `--invocation-id`로 사건을 거른다. 호출이 차단되었을 때 오류 본문의 `reference`(`<호출 식별자>:<시도 번호>`)는 `--decision-ref`에 그대로 넣으면 그 판정 사건 하나를 찾는다. `--decision-ref`와 `--invocation-id`는 함께 쓸 수 없다.
+
+## 지문 키 점검
+
+`check`는 `MINT_FINGERPRINT_KEY`(base64url, 32바이트 이상)와 `MINT_FINGERPRINT_KEY_VERSION`(1 이상의 정수)을 필수 행으로 확인한다. 환경 변수에 없으면 `MINT_SECRETS_FILE`의 비밀 파일을 읽는다. 키가 없거나 형식이 틀리면 종료 코드 1이고, 파일의 권한·링크·디렉터리 정책 위반이나 읽기·해독 오류로 읽을 수 없으면 확인하지 못한 것으로 종료 코드 3이다. 결과 줄에는 검사한 값의 출처(이 프로세스의 환경 변수, `--env-file`, 비밀 파일 경로)가 함께 나온다. 이 행은 제공된 값의 유효성만 확인하며, 이미 실행 중인 LiteLLM 서비스가 실제로 받은 값과 대조하지는 않는다. 서비스를 다시 만든 뒤에 같은 비밀 파일을 읽는 `check`를 실행해야 서비스와 같은 값을 검사한다.
+
+## 집행 점검 상태
+
+`status`는 워커마다 가장 최근의 `enforcement_verified`·`enforcement_unverified` 사건을 읽어 통과 여부, 실패와 원인, 마지막 전환 시각, 그 전환을 일으킨 실행 식별자를 보여 준다. 재시작한 워커는 같은 워커 식별자의 기록이 한 줄로 합쳐지며, 다른 워커의 기록이 밀려나지 않는다. 표시는 「최근 전환」이며, 그 워커가 지금 살아 있다는 뜻이 아니다.
+
+## 설정 조각과 기동 전 검사
+
+`init`이 만드는 설정 조각에는 `litellm_settings.callbacks`가 없다. MINT 로거는 MINT 가드레일이 등록하므로 `callbacks`에 로거가 적혀 있으면 기동 전 검사와 `check`가 거부한다. 기동 전 검사와 `check`는 주 설정 파일이 아니라 LiteLLM의 설정 로더가 `include`까지 병합한 설정을 검사한다. 이 로더를 쓸 수 없으면 `include`가 있는 설정을 거부하고, 파생 이미지의 기동 전 검사는 로더가 없으면 통과시키지 않는다.

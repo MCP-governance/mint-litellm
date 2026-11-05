@@ -223,3 +223,17 @@ def test_each_setting_row_has_one_location():
     assert (
         by_key["use_x_forwarded_for, mcp_trusted_proxy_ranges"] is SettingLocation.GENERAL_SETTINGS
     )
+
+
+def test_restore_is_described_only_as_a_scope_of_a_later_release():
+    from pathlib import Path
+
+    from mint_litellm.types.cli_commands import COMMANDS
+
+    doc = read("보장과-한계.md")
+    for line in doc.splitlines():
+        if "restore --attest" in line:
+            assert "현재 판본에는 복원 명령이 없고" in line
+    assert not any("restore" in command.name for command in COMMANDS)
+    script = Path(__file__).resolve().parents[2] / "deploy" / "mint.sh"
+    assert "restore" not in script.read_text(encoding="utf-8")

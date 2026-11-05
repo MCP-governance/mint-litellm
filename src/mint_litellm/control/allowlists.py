@@ -1,0 +1,79 @@
+"""허용 목록. 종료일이 필수이고 해제는 명시적 행위이다."""
+
+from datetime import datetime
+
+from mint_litellm.control import orgs
+from mint_litellm.control.context import Context
+from mint_litellm.control.db.connection import fetchone
+from mint_litellm.control.errors import ControlError
+from mint_litellm.types.events import EventKind
+from mint_litellm.types.ids import new_uuid7
+
+KINDS = ("provider", "auth_server", "egress_target", "registry_source")
+
+
+def add(
+    ctx: Context,
+    kind: str,
+    value: str,
+    valid_from: datetime,
+    valid_until: datetime,
+    org_id: str | None,
+    note: str | None,
+) -> str:
+    value = value.strip()
+    if kind not in KINDS:
+        raise ControlError(f"kind는 {', '.join(KINDS)} 중 하나여야 합니다.")
+    if not value:
+        raise ControlError("value가 비어 있습니다.")
+    if valid_from >= valid_until:
+        raise ControlError("valid-until은 valid-from보다 뒤여야 합니다.")
+    if org_id is not None:
+        orgs.require_active(ctx, org_id)
+    if fetchone(
+        ctx.conn,
+        "SELECT 1 AS x FROM mint.allowlists WHERE instance_id = %s AND status = 'active'"
+        " AND kind = %s AND value = %s AND org_id IS NOT DISTINCT FROM %s",
+        (ctx.instance_id, kind, value, org_id),
+    ):
+        raise ControlError("같은 항목이 이미 활성 상태로 등록되어 있습니다.")
+    entry_id = new_uuid7()
+    row = fetchone(
+        ctx.conn,
+        "INSERT INTO mint.allowlists (id, instance_id, org_id, kind, value, note, valid_from,"
+        " valid_until, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+        " RETURNING state_version",
+        (entry_id, ctx.instance_id, org_id, kind, value, note, valid_from, valid_until,
+         ctx.operator.name),
+    )
+    ctx.emit(
+        EventKind.ALLOWLIST_ADDED,
+        entry_id,
+        row["state_version"],
+        {
+            "allowlist_id": str(entry_id),
+            "kind": kind,
+            "value": value,
+            "org_id": org_id,
+            "valid_from": valid_from.isoformat(),
+            "valid_until": valid_until.isoformat(),
+        },
+    )
+    return str(entry_id)
+
+
+def lift(ctx: Context, allowlist_id: str) -> None:
+    row = fetchone(
+        ctx.conn,
+        "UPDATE mint.allowlists SET status = 'lifted' WHERE instance_id = %s AND id = %s"
+        " AND status = 'active' RETURNING state_version, kind, value",
+        (ctx.instance_id, allowlist_id),
+    )
+    if row is None:
+        raise ControlError(f"활성 상태의 허용 목록 항목 {allowlist_id}이(가) 없습니다.")
+    ctx.emit(
+        EventKind.ALLOWLIST_LIFTED,
+        allowlist_id,
+        row["state_version"],
+        {"allowlist_id": allowlist_id, "kind": row["kind"], "value": row["value"]},
+    )
