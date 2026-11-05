@@ -729,3 +729,37 @@ def test_a_restart_with_the_same_worker_id_is_one_line_with_the_latest_run(mint)
     code, out, _ = mint.run("--json", "status", token=boss)
     states = json.loads(out)["enforcement"]
     assert len(states) == 1 and states[0]["run_id"] == "SECOND" and states[0]["passed"] is False
+
+
+def test_ledger_list_marks_the_final_attempt_and_shows_reason_and_previous_attempt(mint):
+    boss = bootstrap(mint)
+    first = "01a19fbd-0000-7000-8000-0000000000a1"
+    second = "01a19fbd-0000-7000-8000-0000000000a2"
+    stop = {"status": "stop", "reason_code": "CANCELLED"}
+    rows = (
+        (first, 1, "decision_evaluated", {}),
+        (first, 2, "decision_evaluated",
+         {"original_decision_ref": f"{first}:1", "stop": stop}),
+        (second, 1, "decision_evaluated", {}),
+    )
+    with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+        for invocation, attempt, kind, payload in rows:
+            conn.execute(
+                "INSERT INTO mint.events (event_id, instance_id, kind, source_key, invocation_id,"
+                " attempt_id, payload) VALUES (gen_random_uuid(), 'clitest', %s, %s, %s, %s, %s)",
+                (kind, f"call:{invocation}:{attempt}:{kind}", invocation, attempt,
+                 json.dumps(payload)),
+            )
+        conn.commit()
+    code, out, _ = mint.run("--json", "ledger", "list", token=boss)
+    final = {e["source_key"]: e["final"] for e in json.loads(out)["events"]
+             if e["invocation_id"] in (first, second)}
+    assert final == {f"call:{first}:1:decision_evaluated": False,
+                     f"call:{first}:2:decision_evaluated": True,
+                     f"call:{second}:1:decision_evaluated": True}
+    code, out, _ = mint.run("ledger", "list", "--invocation-id", first, token=boss)
+    lines = {line.split("\t")[3]: line for line in out.strip().splitlines()}
+    latest = lines[f"call:{first}:2:decision_evaluated"]
+    assert latest.endswith("\t최종") and "사유 CANCELLED" in latest
+    assert f"이전 시도 {first}:1" in latest
+    assert "최종" not in lines[f"call:{first}:1:decision_evaluated"]

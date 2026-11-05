@@ -78,7 +78,9 @@ def list_events(
     return fetchall(
         conn,
         "SELECT event_id, inserted_at, kind, source_key, invocation_id, attempt_id, actor,"
-        " subject, payload FROM mint.events WHERE " + " AND ".join(clauses)
+        " subject, payload, COALESCE(attempt_id = (SELECT max(m.attempt_id) FROM mint.events m"
+        " WHERE m.instance_id = e.instance_id AND m.invocation_id = e.invocation_id), false)"
+        " AS final FROM mint.events e WHERE " + " AND ".join(clauses)
         + " ORDER BY inserted_at DESC, event_id DESC LIMIT %s",
         tuple(params),
     )
