@@ -384,6 +384,67 @@ class TestEvidenceRecorder:
         assert all(e.source_key.endswith(":1:buffer_replayed") for e in reports)
         assert len({e.source_key for e in reports}) == 2
 
+    @staticmethod
+    def refuse_system_events(buffer):
+        """시스템 사건만 버퍼에 쓰지 못하게 하고 버퍼에 닿은 호출을 센다."""
+        original = buffer.append
+        calls: list[EventKind] = []
+
+        def append(event):
+            calls.append(event.kind)
+            if event.kind in (EventKind.BUFFER_OVERFLOW, EventKind.BUFFER_REPLAYED):
+                raise BufferWriteError("full")
+            original(event)
+
+        buffer.append = append
+        return calls
+
+    def test_an_overflow_report_that_fits_nowhere_reaches_standard_error(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        stderr = io.StringIO()
+        rec, buffer = recorder(tmp_path, store, stderr=stderr)
+        calls = self.refuse_system_events(buffer)
+        buffer._dropped_events, buffer._dropped_files = 5, 2
+        assert asyncio.run(rec.fallback(make_event(1))) is Evidence.BUFFER
+        (line,) = stderr.getvalue().splitlines()
+        record = json.loads(line)
+        assert record["kind"] == "buffer_overflow" and record["evidence"] == "stderr"
+        assert record["payload"] == {"dropped_events": 5, "dropped_files": 2}
+        assert record["source_key"].startswith("buffer:")
+        assert calls == [EventKind.DECISION_EVALUATED, EventKind.BUFFER_OVERFLOW]
+
+    def test_a_replay_report_that_fits_nowhere_reaches_standard_error(self, tmp_path):
+        class ReportsFail(FakeStore):
+            async def insert_event(self, event, consume=None):
+                if event.kind is EventKind.BUFFER_REPLAYED:
+                    raise ConnectionError("down")
+                return await super().insert_event(event, consume)
+
+        store = ReportsFail()
+        store.fail = ConnectionError("down")
+        stderr = io.StringIO()
+        rec, buffer = recorder(tmp_path, store, stderr=stderr)
+        asyncio.run(rec.record(make_event(1)))
+        buffer.close()
+        store.fail = None
+        self.refuse_system_events(buffer)
+        asyncio.run(rec.replay())
+        (line,) = stderr.getvalue().splitlines()
+        record = json.loads(line)
+        assert record["kind"] == "buffer_replayed" and record["evidence"] == "stderr"
+        assert record["payload"] == {"replayed": 1, "duplicates": 0, "unreadable": 0}
+
+    def test_a_system_event_that_cannot_be_stored_is_not_reported_again(self, tmp_path):
+        store = FakeStore()
+        store.fail = ConnectionError("down")
+        rec, buffer = recorder(tmp_path, store)
+        calls = self.refuse_system_events(buffer)
+        buffer._dropped_events, buffer._dropped_files = 1, 1
+        asyncio.run(rec.fallback(make_event(1)))
+        assert calls.count(EventKind.BUFFER_OVERFLOW) == 1
+        assert buffer.take_overflow() is None
+
     def test_replay_loads_the_buffer_and_records_the_count(self, tmp_path):
         store = FakeStore()
         store.fail = ConnectionError("down")

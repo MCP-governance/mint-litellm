@@ -402,20 +402,25 @@ class EvidenceRecorder:
 
     async def fallback(self, event: Event) -> Evidence:
         """DB에 쓰지 못한 사건을 버퍼에, 그것도 안 되면 표준 오류에 남긴다."""
+        evidence = await self._write_local(event)
+        if evidence is Evidence.BUFFER:
+            overflow = self._buffer.take_overflow()
+            if overflow is not None:
+                await self._append_system(
+                    EventKind.BUFFER_OVERFLOW,
+                    {
+                        "dropped_events": overflow.dropped_events,
+                        "dropped_files": overflow.dropped_files,
+                    },
+                )
+        return evidence
+
+    async def _write_local(self, event: Event) -> Evidence:
         try:
             await asyncio.to_thread(self._buffer.append, event.with_evidence(Evidence.BUFFER))
         except Exception:
             self._write_stderr(event.with_evidence(Evidence.STDERR))
             return Evidence.STDERR
-        overflow = self._buffer.take_overflow()
-        if overflow is not None:
-            await self._append_system(
-                EventKind.BUFFER_OVERFLOW,
-                {
-                    "dropped_events": overflow.dropped_events,
-                    "dropped_files": overflow.dropped_files,
-                },
-            )
         return Evidence.BUFFER
 
     async def record(self, event: Event) -> Evidence:
@@ -478,6 +483,7 @@ class EvidenceRecorder:
             return
 
     async def _append_system(self, kind: EventKind, payload: dict[str, int]) -> None:
+        """시스템 사건도 DB → 버퍼 → 표준 오류 순서로 남긴다. 버퍼 넘침을 다시 알리지는 않는다."""
         event = Event(
             instance_id=self._instance_id,
             inserted_at=_utcnow(),
@@ -492,8 +498,7 @@ class EvidenceRecorder:
                 return
             except Exception:
                 pass
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(self._buffer.append, event.with_evidence(Evidence.BUFFER))
+        await self._write_local(event)
 
     def _write_stderr(self, event: Event) -> None:
         stream = self._stderr if self._stderr is not None else sys.stderr
