@@ -11,7 +11,6 @@ import tarfile
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -32,8 +31,14 @@ def _reject_constant(name: str) -> None:
     raise ValueError(f"invalid JSON constant {name}")
 
 
+class _Number(str):
+    """JSON 숫자의 원문 표기. 반올림이나 변환 없이 그대로 해시에 들어간다."""
+
+
 def parse_data_json(raw: str | bytes) -> object:
-    return json.loads(raw, parse_float=Decimal, parse_constant=_reject_constant)
+    return json.loads(
+        raw, parse_int=_Number, parse_float=_Number, parse_constant=_reject_constant
+    )
 
 
 def _canonical(value: object) -> str:
@@ -41,10 +46,8 @@ def _canonical(value: object) -> str:
         return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, int):
+    if isinstance(value, _Number):
         return str(value)
-    if isinstance(value, Decimal):
-        return str(value.normalize())
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
@@ -92,7 +95,7 @@ async def loaded_bundle_sha256(opa_url: str, client: httpx.AsyncClient | None = 
     async def get(path: str) -> dict:
         response = await client.get(base + path)
         response.raise_for_status()
-        body = json.loads(response.text, parse_float=Decimal, parse_constant=_reject_constant)
+        body = parse_data_json(response.text)
         return body if isinstance(body, dict) else {}
 
     bundles = (await get("/v1/data/system/bundles")).get("result")
@@ -107,11 +110,48 @@ async def loaded_bundle_sha256(opa_url: str, client: httpx.AsyncClient | None = 
                 and identifier.startswith(prefix)):
             raise BundleContentMismatch("module outside the loaded bundle")
         modules[identifier.removeprefix(prefix)] = raw
+    tree = (await get("/v1/data")).get("result")
+    unexpected = _unexpected_data(tree, _rule_paths(policies))
+    if unexpected:
+        raise BundleContentMismatch(f"data outside the bundle contract at {unexpected}")
     data = {}
     document = (await get("/v1/data/mint/data")).get("result")
     if document is not None:
         data[DATA_FILE] = document
     return bundle_content_sha256(modules, data)
+
+
+def _rule_paths(policies: object) -> set[tuple[str, ...]]:
+    """적재된 모듈의 규칙이 `data` 아래에서 차지하는 경로(패키지 경로 + 규칙 머리)."""
+    paths: set[tuple[str, ...]] = set()
+    for policy in policies if isinstance(policies, list) else []:
+        ast = policy.get("ast") or {}
+        package = tuple(term["value"] for term in ast["package"]["path"][1:])
+        for rule in ast.get("rules", []):
+            names: list[str] = []
+            for term in rule["head"]["ref"]:
+                if term["type"] not in {"var", "string"} or (names and term["type"] == "var"):
+                    break
+                names.append(term["value"])
+            paths.add(package + tuple(names))
+    return paths
+
+
+def _unexpected_data(
+    tree: object, rule_paths: set[tuple[str, ...]], path: tuple[str, ...] = ()
+) -> list[str]:
+    """규칙이 만든 문서와 허용된 데이터 문서(`mint/data`, `mint/meta`)가 아닌 항목의 경로."""
+    if path in rule_paths or path == ("mint", "data"):
+        return []
+    if path == ("mint", "meta"):
+        keys = {"policy_version_id", "bundle_sha256"}
+        return [] if isinstance(tree, dict) and set(tree) == keys else ["/".join(path)]
+    if not isinstance(tree, dict) or not any(p[: len(path)] == path for p in rule_paths):
+        return ["/".join(path) or "data"]
+    found: list[str] = []
+    for key, value in tree.items():
+        found += _unexpected_data(value, rule_paths, (*path, key))
+    return found
 
 
 @dataclass(frozen=True)
@@ -168,7 +208,7 @@ def prepare_bundle(
     if {name for name in source if name.endswith(".json")} != {DATA_FILE}:
         raise ValueError("invalid bundle data files")
     data = parse_data_json(source[DATA_FILE])
-    _validate_hours(data["business_hours"])
+    _validate_hours(json.loads(source[DATA_FILE])["business_hours"])
     catalog = (root / "policy" / "catalog.json").read_bytes()
     catalog_data = json.loads(catalog)
     if {rule["id"] for rule in catalog_data["rules"]} != {"R1", "R2", "R3", "R4"}:
@@ -223,6 +263,36 @@ async def register_bundle(conn, *, instance_id: str, bundle: PreparedBundle) -> 
         )
 
 
+async def _wait_until_loaded(
+    client: httpx.AsyncClient, opa_url: str, bundle: "PreparedBundle", budget: float
+) -> None:
+    """남은 예산 안에서 메타와 적재 내용이 함께 등록 값과 같아질 때까지 다시 확인한다."""
+    expected = {
+        "policy_version_id": bundle.policy_version_id,
+        "bundle_sha256": bundle.bundle_sha256,
+    }
+    mismatch: BundleContentMismatch | None = None
+    try:
+        async with asyncio.timeout(budget):
+            while True:
+                response = await client.get(opa_url.rstrip("/") + "/v1/data/mint/meta")
+                response.raise_for_status()
+                if response.json().get("result") == expected:
+                    try:
+                        if await loaded_bundle_sha256(opa_url, client) == bundle.bundle_sha256:
+                            return
+                        mismatch = BundleContentMismatch(
+                            "loaded bundle content differs from registered hash"
+                        )
+                    except BundleContentMismatch as exc:
+                        mismatch = exc
+                await asyncio.sleep(0.1)
+    except TimeoutError:
+        if mismatch is not None:
+            raise mismatch from None
+        raise
+
+
 async def activate_bundle(
     conn,
     *,
@@ -251,18 +321,9 @@ async def activate_bundle(
         )
         await publish(bundle.archive)
         async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
-            expected = {
-                "policy_version_id": bundle.policy_version_id,
-                "bundle_sha256": bundle.bundle_sha256,
-            }
-            while True:
-                response = await client.get(opa_url.rstrip("/") + "/v1/data/mint/meta")
-                response.raise_for_status()
-                if response.json().get("result") == expected:
-                    break
-                await asyncio.sleep(0.1)
-            if await loaded_bundle_sha256(opa_url, client) != bundle.bundle_sha256:
-                raise BundleContentMismatch("loaded bundle content differs from registered hash")
+            await _wait_until_loaded(
+                client, opa_url, bundle, timeout_seconds - min(0.5, timeout_seconds / 5)
+            )
         await conn.execute(
             "UPDATE mint.policy_versions SET status = 'superseded' "
             "WHERE instance_id = %s AND status = 'active'", (instance_id,)

@@ -1,3 +1,4 @@
+import decimal
 import hashlib
 import io
 import json
@@ -68,16 +69,30 @@ def test_bundle_hash_excludes_metadata_and_covers_paths_and_contents(tmp_path, m
     assert prepare_bundle(tmp_path, "first").bundle_sha256 == before_meta
 
 
-def test_canonical_json_ignores_layout_and_key_order():
-    left = parse_data_json('{"b": [1, 2.50, "\\u00fc"], "a": {"y": null, "x": true}}')
-    right = parse_data_json('{ "a":{"x":true,"y":null},\n"b":[1,2.5,"ü"] }')
+def test_canonical_json_ignores_layout_and_key_order_but_keeps_number_text():
+    left = parse_data_json('{"b": [1, 2.50, "\u00fc"], "a": {"y": null, "x": true}}')
+    right = parse_data_json('{ "a":{"x":true,"y":null},\n"b":[1,2.50,"ü"] }')
     assert canonical_json(left) == canonical_json(right)
-    assert canonical_json(left) == '{"a":{"x":true,"y":null},"b":[1,2.5,"ü"]}'.encode()
+    assert canonical_json(left) == '{"a":{"x":true,"y":null},"b":[1,2.50,"ü"]}'.encode()
     assert canonical_json(parse_data_json('{"n": 12345678901234567890}')) == (
         b'{"n":12345678901234567890}'
     )
+    assert canonical_json(parse_data_json('{"n": 2.5}')) != canonical_json(left)
     with pytest.raises(ValueError):
         parse_data_json('{"n": NaN}')
+
+
+def test_canonical_numbers_keep_every_digit_and_ignore_the_decimal_context():
+    first = parse_data_json('{"n": 0.12345678901234567890123456781}')
+    second = parse_data_json('{"n": 0.12345678901234567890123456782}')
+    assert canonical_json(first) != canonical_json(second)
+    with decimal.localcontext() as context:
+        context.prec = 5
+        assert canonical_json(first) == b'{"n":0.12345678901234567890123456781}'
+        assert canonical_json(first) != canonical_json(second)
+    assert canonical_json(parse_data_json('{"n": [1.0, 1e2, -0.0, 1E+30]}')) == (
+        b'{"n":[1.0,1e2,-0.0,1E+30]}'
+    )
 
 
 def test_content_hash_separates_paths_and_line_endings():

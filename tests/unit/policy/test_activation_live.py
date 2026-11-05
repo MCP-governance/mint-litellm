@@ -191,16 +191,15 @@ def _run(coroutine_function):
 
 
 def _tampered(archive: bytes, name: str, change) -> bytes:
-    """메타는 그대로 두고 번들 안 한 파일의 내용만 바꾼 아카이브."""
+    """메타는 그대로 두고 번들 안 한 파일을 바꾸거나(없으면 ``change(b"")``로 추가한) 아카이브."""
     source = io.BytesIO(archive)
     output = io.BytesIO()
     with tarfile.open(fileobj=source, mode="r:gz") as reader, \
             tarfile.open(fileobj=output, mode="w:gz") as writer:
-        for member in reader.getmembers():
-            content = reader.extractfile(member).read()
-            if member.name == name:
-                content = change(content)
-            info = tarfile.TarInfo(member.name)
+        members = {m.name: reader.extractfile(m).read() for m in reader.getmembers()}
+        members[name] = change(members.get(name, b""))
+        for member_name, content in members.items():
+            info = tarfile.TarInfo(member_name)
             info.size = len(content)
             info.mtime = 0
             writer.addfile(info, io.BytesIO(content))
@@ -212,8 +211,17 @@ def _tampered(archive: bytes, name: str, change) -> bytes:
     [
         ("mint/policy.rego", lambda text: text + b"# edited" + bytes([10])),
         ("mint/data/data.json", lambda text: text.replace(b"09:00", b"00:00")),
+        ("mint/data/inner/data.json", lambda _: b'{"d": 1}'),
+        ("data.json", lambda _: b'{"root_extra": 1}'),
+        ("mint/extra/data.json", lambda _: b'{"k": 1}'),
+        ("mint/data.json", lambda _: b'{"extra": 2}'),
+        ("mint/policy/data.json", lambda _: b'{"extra": 3}'),
+        ("mint/decision/data.json", lambda _: b'{"extra": 4}'),
     ],
-    ids=["rule-line", "data-value"],
+    ids=[
+        "rule-line", "data-value", "data-subtree", "root-data", "other-data-path",
+        "mint-data", "rule-package-data", "decision-package-data",
+    ],
 )
 def test_activation_rejects_content_changed_with_unchanged_metadata(live_database, name, change):
     import psycopg
@@ -243,7 +251,7 @@ def test_activation_rejects_content_changed_with_unchanged_metadata(live_databas
             with pytest.raises(BundleContentMismatch):
                 await activate_bundle(
                     conn, instance_id="test", actor="operator", bundle=forged,
-                    publish=publish, opa_url=opa_url, timeout_seconds=30,
+                    publish=publish, opa_url=opa_url, timeout_seconds=8,
                 )
             await conn.rollback()
             rows = await (await conn.execute(
@@ -256,8 +264,11 @@ def test_activation_rejects_content_changed_with_unchanged_metadata(live_databas
             assert events[0] == 1
             await publish(good.archive)
             for _ in range(100):
-                if await loaded_bundle_sha256(opa_url) == good.bundle_sha256:
-                    break
+                try:
+                    if await loaded_bundle_sha256(opa_url) == good.bundle_sha256:
+                        break
+                except BundleContentMismatch:
+                    pass
                 await asyncio.sleep(0.1)
             assert await loaded_bundle_sha256(opa_url) == good.bundle_sha256
 
