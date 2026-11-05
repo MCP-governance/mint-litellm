@@ -419,13 +419,15 @@ def test_status_shows_observed_server_identity_mismatches_until_reregistered(min
             "INSERT INTO mint.events (event_id, instance_id, kind, source_key, payload)"
             " VALUES (gen_random_uuid(), 'clitest', 'server_identity_mismatch_observed',"
             " 'selfcheck:run1:1:server_identity_mismatch_observed',"
-            " '{\"server_id\": \"ctl-everything\", \"field\": \"url\"}')"
+            " '{\"server_id\": \"ctl-everything\", \"fields\": [\"url_sha256\", \"transport\"]}')"
         )
         conn.commit()
     code, out, _ = mint.run("--json", "status", token=boss)
     alerts = [a for a in json.loads(out)["alerts"]
               if a["kind"] == "server_identity_mismatch_observed"]
-    assert [(a["server_id"], a["field"]) for a in alerts] == [("ctl-everything", "url")]
+    assert [(a["server_id"], a["fields"]) for a in alerts] == [
+        ("ctl-everything", ["url_sha256", "transport"])
+    ]
     mint.run("server", "register", "ctl-everything", "--url", "http://u.test/mcp", token=boss)
     code, out, _ = mint.run("--json", "status", token=boss)
     assert [a for a in json.loads(out)["alerts"]

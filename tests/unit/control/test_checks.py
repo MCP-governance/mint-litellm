@@ -159,12 +159,12 @@ def test_observation_items_report_values_and_do_not_fail(stub, litellm):
 def test_optout_metadata_on_keys_and_teams_is_counted_and_warned(healthy, stub):
     keys = fixture("key_list_full")
     keys["keys"] = [
-        {**key_entry("k-good"), "metadata": {"opted_out_global_guardrails": ["mint"]}},
+        {**key_entry("k-good"), "metadata": {"opted_out_global_guardrails": ["pii"]}},
         {**key_entry("k-unbound"), "user_id": "u", "metadata": {"disable_global_guardrails": True}},
     ]
     stub.set("/key/list", keys)
     teams = fixture("team_list")
-    teams[0]["metadata"] = {"opted_out_global_guardrails": ["mint"]}
+    teams[0]["metadata"] = {"opted_out_global_guardrails": ["pii"]}
     stub.set("/team/list", teams)
     report = run(good_config(), healthy)
     assert report.observations["guardrail_optout_subjects"] == 3
@@ -188,6 +188,15 @@ def test_duplicate_server_names_fail(healthy, stub):
     assert Level.FAIL in levels(report)["서버 이름·별칭 유일성"]
     assert "everything" in next(f.message for f in report.findings
                                 if f.item == "서버 이름·별칭 유일성")
+
+
+def test_names_that_differ_only_by_a_space_collide_like_the_runtime_check(healthy, stub):
+    entry = fixture("server_get")
+    first = {**entry, "server_id": "uuid-1", "server_name": "a b", "alias": None}
+    second = {**entry, "server_id": "uuid-2", "server_name": "a_b", "alias": None}
+    stub.set("/v1/mcp/server", [first, second])
+    report = run(good_config(), healthy)
+    assert Level.FAIL in levels(report)["서버 이름·별칭 유일성"]
 
 
 def test_one_server_with_equal_name_and_alias_is_not_a_duplicate(stub, litellm):
@@ -370,9 +379,9 @@ def optout_keys(stub, *metadata):
     stub.set("/team/list", [])
 
 
-def test_excluding_only_other_guardrails_is_not_counted_and_not_warned(healthy, stub):
-    optout_keys(stub, {"opted_out_global_guardrails": ["pii"]}, {"opted_out_global_guardrails": []},
-                {"disable_global_guardrails": False}, {})
+def test_excluding_only_the_mint_guardrail_or_nothing_is_not_counted(healthy, stub):
+    optout_keys(stub, {"opted_out_global_guardrails": ["mint"]},
+                {"opted_out_global_guardrails": []}, {"disable_global_guardrails": False}, {})
     report = run(good_config(), healthy)
     assert report.observations["guardrail_optout_subjects"] == 0
     assert "가드레일 제외 대상" not in levels(report)
@@ -386,7 +395,7 @@ def test_the_mint_guardrail_name_comes_from_the_config(healthy, stub):
     config = good_config()
     config["guardrails"][0]["guardrail_name"] = "mint-prod"
     report = run(config, healthy)
-    assert report.observations["guardrail_optout_subjects"] == 3  # 이름이 다른 'mint'는 해당 없음
+    assert report.observations["guardrail_optout_subjects"] == 3  # 이름이 다른 'mint'도 MINT 외 이름이다
     message = next(f.message for f in report.findings if f.item == "가드레일 제외 대상")
     assert "다른 가드레일뿐입니다" in message and "호출할 수 없게" not in message
 
@@ -415,8 +424,9 @@ def test_values_that_litellm_ignores_are_not_counted_and_never_raise(healthy, st
     assert "가드레일 제외 대상" not in levels(report)
 
 
-def test_only_a_list_naming_the_mint_guardrail_or_true_is_counted(healthy, stub):
-    optout_keys(stub, {"opted_out_global_guardrails": ["mint"]},
+def test_only_a_list_naming_another_guardrail_or_true_is_counted(healthy, stub):
+    optout_keys(stub, {"opted_out_global_guardrails": ["mint"]},  # MINT만이면 세지 않는다
+                {"opted_out_global_guardrails": ["pii"]},
                 {"opted_out_global_guardrails": ["x", [1], "mint"]},
                 {"disable_global_guardrails": True},
                 {"disable_global_guardrails": True, "opted_out_global_guardrails": "bad"})

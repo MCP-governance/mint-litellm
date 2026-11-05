@@ -20,6 +20,7 @@ class FakeOpa:
             if bundles is None
             else bundles
         )
+        self.meta = {"policy_version_id": "v1", "bundle_sha256": expected_hash()}
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -32,6 +33,7 @@ class FakeOpa:
                         "result": {"bundles": outer.bundles, "version": outer.version()}
                     },
                     "/v1/data/mint/data": {"result": outer.data},
+                    "/v1/data/mint/meta": {"result": outer.meta},
                 }.get(self.path)
                 payload = json.dumps(body if body is not None else {}).encode()
                 self.send_response(200 if body is not None else 404)
@@ -58,8 +60,7 @@ class FakeOpa:
                 "ast": {"package": {"path": package}, "rules": [{"head": head}]}}
 
     def tree(self):
-        meta = {"policy_version_id": "v1", "bundle_sha256": "x"}
-        return {"mint": {"allow": False, "data": self.data, "meta": meta}}
+        return {"mint": {"allow": False, "data": self.data, "meta": self.meta}}
 
     def close(self):
         self.server.shutdown()
