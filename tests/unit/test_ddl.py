@@ -176,12 +176,12 @@ EXPECTED_TABLES = {
 }
 
 
-def test_schema_has_the_fourteen_tables(db):
+def test_schema_keeps_the_fourteen_stage_one_tables(db):
     rows = db.execute(
         "SELECT table_name FROM information_schema.tables"
         " WHERE table_schema = 'mint' AND table_type = 'BASE TABLE'"
     ).fetchall()
-    assert {r[0] for r in rows} == EXPECTED_TABLES
+    assert {r[0] for r in rows} >= EXPECTED_TABLES
 
 
 def test_server_walks_the_full_lifecycle(db):
@@ -721,7 +721,7 @@ def test_plugin_role_reads_state_and_consumes_call_approvals_only(db, base):
     before = epoch(db)
     db.execute("SET LOCAL ROLE mint_plugin")
     assert scalar(db, "SELECT count(*) FROM mint.approvals") == 0
-    add_event(db)
+    add_event(db, key="selfcheck:r1:1:enforcement_verified", kind="enforcement_verified")
     invocation = new_uuid7()
     db.execute(
         "UPDATE mint.call_approvals SET status = 'consumed', consumed_invocation_id = %s"
@@ -790,6 +790,11 @@ def test_inserted_events_never_carry_seal_columns(db, role):
         db.execute(f"SET LOCAL ROLE {role}")
     key, _ = add_event(
         db,
+        **(
+            {"key": "selfcheck:r1:1:enforcement_verified", "kind": "enforcement_verified"}
+            if role == "mint_plugin"
+            else {}
+        ),
         seal_seq=7,
         prev_hash=b"" * 32,
         row_hash=b"" * 32,
@@ -1017,13 +1022,13 @@ def test_epoch_cases_cover_the_enforcement_tables():
     assert set(EPOCH_CASES) == ENFORCEMENT_TABLES
 
 
-def test_epoch_triggers_exist_on_exactly_the_enforcement_tables(db):
+def test_epoch_triggers_exist_on_the_stage_one_enforcement_tables(db):
     rows = db.execute(
         "SELECT DISTINCT c.relname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid"
         " JOIN pg_namespace n ON n.oid = c.relnamespace"
         " WHERE n.nspname = 'mint' AND right(t.tgname, 6) = '_epoch' AND NOT t.tgisinternal"
     ).fetchall()
-    assert {r[0] for r in rows} == ENFORCEMENT_TABLES
+    assert {r[0] for r in rows} >= ENFORCEMENT_TABLES
 
 
 @pytest.mark.parametrize("operation", ["insert", "update", "delete"])

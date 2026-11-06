@@ -12,7 +12,7 @@ def test_applies_once_and_is_a_no_op_the_second_time(fresh_db):
     with psycopg.connect(fresh_db) as conn:
         assert migrate.apply_migrations(conn) == []
         names = [r[0] for r in conn.execute("SELECT name FROM mint.schema_migrations")]
-        assert names == ["001_initial"]
+        assert names == ["001_initial", "002_stage2"]
 
 
 def test_first_run_on_an_empty_database_applies_everything(fresh_db):
@@ -25,7 +25,7 @@ def test_first_run_on_an_empty_database_applies_everything(fresh_db):
         conn.execute(f'CREATE DATABASE "{name}"')
     try:
         with psycopg.connect(make_conninfo(**dict(params, dbname=name))) as conn:
-            assert migrate.apply_migrations(conn) == ["001_initial"]
+            assert migrate.apply_migrations(conn) == ["001_initial", "002_stage2"]
             assert conn.execute("SELECT count(*) FROM mint.orgs").fetchone()[0] == 0
     finally:
         with psycopg.connect(make_conninfo(**admin), autocommit=True) as conn:
@@ -37,3 +37,51 @@ def test_a_changed_applied_migration_is_refused(fresh_db):
         conn.execute("UPDATE mint.schema_migrations SET sha256 = repeat('0', 64)")
         with pytest.raises(ControlError, match="바뀌었습니다"):
             migrate.apply_migrations(conn)
+
+
+def test_a_database_with_only_the_first_migration_is_upgraded(fresh_db):
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    params = conninfo_to_dict(fresh_db)
+    admin = dict(params, dbname="postgres")
+    name = params["dbname"] + "_c"
+    with psycopg.connect(make_conninfo(**admin), autocommit=True) as conn:
+        conn.execute(f'CREATE DATABASE "{name}"')
+    try:
+        with psycopg.connect(make_conninfo(**dict(params, dbname=name))) as conn:
+            files = dict(migrate._migration_files())
+            conn.execute(files["001_initial"].encode("utf-8"))
+            conn.execute("CREATE SCHEMA IF NOT EXISTS mint")
+            conn.execute(
+                "CREATE TABLE mint.schema_migrations (name text PRIMARY KEY, sha256 text NOT NULL,"
+                " applied_at timestamptz NOT NULL DEFAULT now())"
+            )
+            import hashlib
+
+            conn.execute(
+                "INSERT INTO mint.schema_migrations (name, sha256) VALUES (%s, %s)",
+                ("001_initial", hashlib.sha256(files["001_initial"].encode()).hexdigest()),
+            )
+            conn.execute("INSERT INTO mint.orgs (instance_id, org_id, name) VALUES ('i', 'o', 'o')")
+            conn.execute(
+                "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256,"
+                " transport, auth_type, registered_by) VALUES"
+                " (gen_random_uuid(), 'i', 's', 'awaiting_approval', repeat('a', 64), 'http',"
+                " 'none', 'alice')"
+            )
+            before = conn.execute("SELECT epoch FROM mint.state_epoch").fetchone()[0]
+            conn.commit()
+            assert migrate.apply_migrations(conn) == ["002_stage2"]
+            assert conn.execute("SELECT count(*) FROM mint.intakes").fetchone()[0] == 0
+            row = conn.execute(
+                "SELECT contract_status, issuer, last_observed_at, deployment_drift,"
+                " deployment_drift_fields FROM mint.servers"
+            ).fetchone()
+            assert row == ("none", None, None, False, None)
+            assert conn.execute("SELECT epoch FROM mint.state_epoch").fetchone()[0] == before
+            roles = {r[0] for r in conn.execute("SELECT rolname FROM pg_roles")}
+            assert {"mint_control", "mint_staff", "mint_worker", "mint_sealer"} <= roles
+            assert migrate.apply_migrations(conn) == []
+    finally:
+        with psycopg.connect(make_conninfo(**admin), autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
