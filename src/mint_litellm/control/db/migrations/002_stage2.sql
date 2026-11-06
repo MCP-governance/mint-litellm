@@ -812,6 +812,9 @@ BEGIN
             USING ERRCODE = 'insufficient_privilege';
     END IF;
     IF p_target IN ('confirmed', 'rejected') THEN
+        IF sc.expires_at <= now() THEN
+            RAISE EXCEPTION 'this self confirmation has expired' USING ERRCODE = 'check_violation';
+        END IF;
         UPDATE mint.self_confirmations
         SET status = p_target, confirmed_by_user_id = uid,
             confirmed_by_key_token = p_key_token, confirmed_at = now()
@@ -895,9 +898,10 @@ CREATE FUNCTION mint.staff_touch_session(p_id_hash text, p_idle_expiry timestamp
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
 BEGIN
     UPDATE mint.console_sessions
-    SET last_seen_at = now(), idle_expiry = p_idle_expiry
+    SET last_seen_at = now(), idle_expiry = least(p_idle_expiry, absolute_expiry)
     WHERE id_hash = p_id_hash AND user_id = mint.staff_user() AND subject = 'staff'
-      AND instance_id = mint.staff_instance() AND revoked_at IS NULL;
+      AND instance_id = mint.staff_instance() AND revoked_at IS NULL
+      AND idle_expiry > now() AND absolute_expiry > now();
     IF NOT FOUND THEN
         RAISE EXCEPTION 'no active session of this user' USING ERRCODE = 'insufficient_privilege';
     END IF;

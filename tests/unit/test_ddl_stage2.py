@@ -995,6 +995,37 @@ def test_staff_cannot_repeat_or_reverse_a_decision(db, base):
     assert len(event_keys(db, "call_approval_approved")) == 1
 
 
+def test_staff_cannot_confirm_or_reject_an_expired_row_but_can_cancel_it(db, base):
+    past = NOW.replace(year=2000)
+    a, b, c = (add_confirmation(db, fp=fp, expires_at=past) for fp in (HEX, H2, "c" * 64))
+    as_role(db, "mint_staff")
+    staff_context(db)
+    with fails(db, errors.CheckViolation):
+        staff_call(db, "SELECT mint.staff_confirm(%s, 't')", a)
+    with fails(db, errors.CheckViolation):
+        staff_call(db, "SELECT mint.staff_reject(%s, 't')", b)
+    staff_call(db, "SELECT mint.staff_cancel(%s)", c)
+    db.execute("RESET ROLE")
+    assert status_of(db, "self_confirmations", a) == "pending"
+    assert status_of(db, "self_confirmations", c) == "cancelled"
+
+
+def test_staff_cannot_revive_an_expired_or_revoked_session_and_idle_is_capped(db, base):
+    past, far = NOW.replace(year=2000), NOW.replace(year=2090)
+    expired = add_session(db, user="u1", idle_expiry=past, absolute_expiry=far)
+    gone = add_session(db, user="u1", revoked_at=NOW)
+    capped = add_session(db, user="u1", idle_expiry=far, absolute_expiry=far)
+    as_role(db, "mint_staff")
+    staff_context(db)
+    for sid in (expired, gone):
+        with fails(db, errors.InsufficientPrivilege):
+            staff_call(db, "SELECT mint.staff_touch_session(%s, %s)", sid, far)
+    staff_call(db, "SELECT mint.staff_touch_session(%s, %s)", capped, NOW.replace(year=2200))
+    db.execute("RESET ROLE")
+    assert scalar(db, "SELECT idle_expiry FROM mint.console_sessions WHERE id_hash = %s", capped) == far  # noqa: E501
+    assert scalar(db, "SELECT idle_expiry FROM mint.console_sessions WHERE id_hash = %s", expired) == past  # noqa: E501
+
+
 def test_staff_has_no_direct_table_rights(db, base):
     cid = add_confirmation(db)
     sid = add_session(db, user="u1")
