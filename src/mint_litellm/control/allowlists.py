@@ -5,7 +5,7 @@ from datetime import datetime
 from mint_litellm.control import orgs
 from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchone
-from mint_litellm.control.errors import ControlError
+from mint_litellm.control.errors import ControlError, not_found
 from mint_litellm.types.events import EventKind
 from mint_litellm.types.ids import new_uuid7
 
@@ -70,7 +70,7 @@ def lift(ctx: Context, allowlist_id: str) -> None:
         (ctx.instance_id, allowlist_id),
     )
     if row is None:
-        raise ControlError(f"활성 상태의 허용 목록 항목 {allowlist_id}이(가) 없습니다.")
+        raise not_found(f"활성 상태의 허용 목록 항목 {allowlist_id}이(가) 없습니다.")
     ctx.emit(
         EventKind.ALLOWLIST_LIFTED,
         allowlist_id,

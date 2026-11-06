@@ -9,7 +9,7 @@ from typing import Any
 
 from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchone
-from mint_litellm.control.errors import ControlError
+from mint_litellm.control.errors import ControlError, not_found
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
 from mint_litellm.types.decision import normalize_auth_type, url_sha256
 from mint_litellm.types.events import EventKind
@@ -123,7 +123,7 @@ def _transition(ctx: Context, server_id: str, source: str, target: str, kind: Ev
         (target, ctx.instance_id, server_id, source),
     )
     if row is None:
-        raise ControlError(f"{source} 상태의 서버 {server_id}이(가) 없습니다.")
+        raise not_found(f"{source} 상태의 서버 {server_id}이(가) 없습니다.")
     ctx.emit(kind, row["id"], row["state_version"], {"server_id": server_id, "status": target})
 
 

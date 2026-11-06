@@ -22,26 +22,32 @@ from mint_litellm.control import (
     allowlists,
     approvals,
     checks,
-    consents,
     ledger,
     litellm_config,
     operators,
-    orgs,
     policy_check,
     policy_versions,
-    relations,
     secrets_file,
-    servers,
-    settings_store,
     status,
 )
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.context import Context, Operator
-from mint_litellm.control.db.connection import connect, fetchall, fetchone
+from mint_litellm.control.db.connection import connect, fetchall
 from mint_litellm.control.db.migrate import apply_migrations
-from mint_litellm.control.db.roles import LOGIN_ROLES, ensure_login_roles
+from mint_litellm.control.db.roles import LOGIN_PASSWORD_VARIABLES, LOGIN_ROLES, ensure_login_roles
 from mint_litellm.control.errors import AuthError, ControlError
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
+from mint_litellm.control.services import allowlists as allowlist_service
+from mint_litellm.control.services import approvals as approval_service
+from mint_litellm.control.services import call_approvals as call_approval_service
+from mint_litellm.control.services import consents as consent_service
+from mint_litellm.control.services import denials as denial_service
+from mint_litellm.control.services import operators as operator_service
+from mint_litellm.control.services import orgs as org_service
+from mint_litellm.control.services import policy as policy_service
+from mint_litellm.control.services import relations as relation_service
+from mint_litellm.control.services import servers as server_service
+from mint_litellm.control.services import settings as settings_service
 from mint_litellm.types import fingerprint
 from mint_litellm.types.cli_commands import (
     COMMANDS,
@@ -49,7 +55,6 @@ from mint_litellm.types.cli_commands import (
     CliCommand,
     OperatorRole,
 )
-from mint_litellm.types.events import EventKind
 from mint_litellm.types.identity import SubjectType
 from mint_litellm.types.settings import Mode
 
@@ -107,7 +112,7 @@ def _csv(text: str) -> list[str]:
 
 
 def _init(run: Run) -> None:
-    args, cfg = run.args, run.cfg
+    args = run.args
     servers_arg: dict[str, tuple[str, str]] = {}
     for item in args.mcp_server or []:
         name, sep, url = item.partition("=")
@@ -117,33 +122,11 @@ def _init(run: Run) -> None:
     applied = apply_migrations(run.conn)
     passwords = {
         group: run.environ[var]
-        for group, var in (
-            ("mint_plugin", "MINT_PLUGIN_DB_PASSWORD"),
-            ("mint_control", "MINT_CONTROL_DB_PASSWORD"),
-        )
+        for group, var in LOGIN_PASSWORD_VARIABLES.items()
         if run.environ.get(var)
     }
     configured_roles = ensure_login_roles(run.conn, passwords)
-    ctx = run.context()
-    version = settings_store.ensure(run.conn, cfg.instance_id)
-    if version is not None:
-        ctx.emit(
-            EventKind.SETTINGS_CHANGED,
-            cfg.instance_id,
-            version,
-            {
-                "created": True,
-                "observable_policy_ids": list(settings_store.DEFAULT_OBSERVABLE_POLICY_IDS),
-            },
-        )
-        # 처음 만든 설정에서만 기본 조직을 정한다. 이후 재실행은 운영자가 바꾼 값을 건드리지 않는다.
-        if not fetchone(
-            run.conn,
-            "SELECT 1 AS x FROM mint.orgs WHERE instance_id = %s AND org_id = %s",
-            (cfg.instance_id, args.org_id),
-        ):
-            orgs.add(ctx, args.org_id, args.org_name)
-        settings_store.set_default_org(ctx, args.org_id)
+    settings_service.initialize(run.context(), args.org_id, args.org_name)
     text = litellm_config.snippet(servers_arg, no_spend_logs=args.no_spend_logs)
     secrets_path = Path(args.secrets_file or run.environ.get("MINT_SECRETS_FILE")
                         or secrets_file.DEFAULT_PATH).expanduser()
@@ -275,14 +258,14 @@ def _issued(run: Run, token: str) -> None:
 
 def _operator_add(run: Run) -> None:
     a = run.args
-    token = operators.add(
+    token = operator_service.add(
         run.context(), run.litellm(), a.name, OperatorRole(a.role), a.user_id, a.expires_in_days
     )
     _issued(run, token)
 
 
 def _operator_bootstrap(run: Run) -> None:
-    token = operators.bootstrap(
+    token = operator_service.bootstrap(
         run.conn, run.cfg.instance_id, run.litellm(), run.args.name, run.args.user_id, run.emitted
     )
     _issued(run, token)
@@ -304,7 +287,7 @@ def _created(run: Run, object_id: str) -> None:
 
 def _approve(run: Run) -> None:
     a = run.args
-    approval_id, _ = approvals.approve(
+    approval_id, _ = approval_service.approve(
         run.context(),
         run.litellm(),
         relation_id=a.relation,
@@ -396,29 +379,19 @@ def _policy_activate(run: Run) -> None:
     if not source.opa_url:
         raise ControlError("--opa-url 또는 MINT_OPA_URL이 필요합니다.")
     try:
-        policy_versions.activate(
-            run.conn, run.cfg.require_database(), ctx.instance_id, ctx.operator.name, a.version,
-            source,
-        )
+        row = policy_service.activate(ctx, run.cfg.require_database(), a.version, source)
     except policy_versions.ActivationError as error:
         run.data.update(id=a.version, restore_outcome=error.restore_outcome)
         run.failure = str(error)
         return
     run.data["restore_outcome"] = None
-    run.conn.commit()
-    row = fetchone(
-        run.conn,
-        "SELECT event_id, kind, source_key FROM mint.events WHERE instance_id = %s"
-        " AND kind = 'policy_activated' AND source_key LIKE %s ORDER BY inserted_at DESC LIMIT 1",
-        (ctx.instance_id, f"policy_version:{a.version}:%"),
-    )
     if row:
         run.extra_events.append(row)
     run.data["id"] = a.version
 
 
 def _server_register(run: Run) -> None:
-    servers.register(
+    server_service.register(
         run.context(),
         run.litellm(),
         run.args.server_id,
@@ -438,7 +411,7 @@ def _denial(run: Run) -> None:
     a = run.args
     _created(
         run,
-        approvals.create_denial(
+        denial_service.deny(
             run.context(),
             scope_type=a.scope,
             scope_id=a.scope_id,
@@ -470,7 +443,7 @@ def _call_request(run: Run) -> None:
     args_fp, fp_key_version = _fingerprint(run)
     _created(
         run,
-        approvals.call_request(
+        call_approval_service.request(
             ctx,
             org_id=a.org,
             principal_type=a.principal_type,
@@ -490,7 +463,7 @@ def _consent_add(run: Run) -> None:
     a = run.args
     _created(
         run,
-        consents.add(
+        consent_service.add(
             run.context(),
             run.litellm(),
             a.org,
@@ -511,7 +484,7 @@ def _allowlist_add(run: Run) -> None:
     a = run.args
     _created(
         run,
-        allowlists.add(
+        allowlist_service.add(
             run.context(),
             a.kind,
             a.value,
@@ -530,39 +503,40 @@ HANDLERS: dict[str, Handler] = {
     "operator add": _operator_add,
     "operator bootstrap": _operator_bootstrap,
     "server register": _server_register,
-    "server suspend": _done(servers.suspend, "server_id"),
-    "server resume": _done(servers.resume, "server_id"),
+    "server suspend": _done(server_service.suspend, "server_id"),
+    "server resume": _done(server_service.resume, "server_id"),
     "relation add": lambda r: _created(
-        r, relations.add(r.context(), r.args.org, r.args.server, r.args.purpose, r.args.team)
+        r, relation_service.add(r.context(), r.args.org, r.args.server, r.args.purpose,
+                                r.args.team)
     ),
-    "relation terminate": _done(relations.terminate, "relation"),
+    "relation terminate": _done(relation_service.terminate, "relation"),
     "approve": _approve,
     "deny": _denial,
-    "denial lift": _done(approvals.lift_denial, "denial_id"),
-    "revoke": lambda r: approvals.revoke(
+    "denial lift": _done(denial_service.lift, "denial_id"),
+    "revoke": lambda r: approval_service.revoke(
         r.context(), r.args.approval_id, r.args.reason, r.args.deny
     ),
     "call-approval request": _call_request,
-    "call-approval approve": lambda r: approvals.call_approve(
+    "call-approval approve": lambda r: call_approval_service.approve(
         r.context(), r.args.call_approval_id, _second(r)
     ),
-    "call-approval reject": _done(approvals.call_reject, "call_approval_id"),
-    "call-approval cancel": _done(approvals.call_cancel, "call_approval_id"),
+    "call-approval reject": _done(call_approval_service.reject, "call_approval_id"),
+    "call-approval cancel": _done(call_approval_service.cancel, "call_approval_id"),
     "consent add": _consent_add,
-    "consent revoke": _done(consents.revoke, "consent_id"),
+    "consent revoke": _done(consent_service.revoke, "consent_id"),
     "allowlist add": _allowlist_add,
-    "allowlist lift": _done(allowlists.lift, "allowlist_id"),
-    "org add": lambda r: orgs.add(r.context(), r.args.org_id, r.args.name),
-    "org close": _done(orgs.close, "org_id"),
-    "org bind": lambda r: orgs.bind(r.context(), r.args.org, *_subject(r.args)),
-    "org unbind": lambda r: orgs.unbind(r.context(), *_subject(r.args)),
-    "settings default-org": lambda r: settings_store.set_default_org(
+    "allowlist lift": _done(allowlist_service.lift, "allowlist_id"),
+    "org add": lambda r: org_service.add(r.context(), r.args.org_id, r.args.name),
+    "org close": _done(org_service.close, "org_id"),
+    "org bind": lambda r: org_service.bind(r.context(), r.args.org, *_subject(r.args)),
+    "org unbind": lambda r: org_service.unbind(r.context(), *_subject(r.args)),
+    "settings default-org": lambda r: settings_service.set_default_org(
         r.context(), None if r.args.clear else r.args.org
     ),
-    "settings mode": lambda r: settings_store.set_mode(
+    "settings mode": lambda r: settings_service.set_mode(
         r.context(), Mode(r.args.mode), r.cfg.mode_ceiling
     ),
-    "settings observable": lambda r: settings_store.set_observable(
+    "settings observable": lambda r: settings_service.set_observable(
         r.context(), r.args.reasons, r.args.policy_ids
     ),
     "policy activate": _policy_activate,

@@ -6,7 +6,7 @@ from datetime import datetime
 from mint_litellm.control import orgs
 from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchone
-from mint_litellm.control.errors import ControlError
+from mint_litellm.control.errors import ControlError, not_found
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
 from mint_litellm.control.operators import HUMAN_ROLES
 from mint_litellm.types.events import EventKind
@@ -82,7 +82,7 @@ def revoke(ctx: Context, consent_id: str) -> None:
         (ctx.instance_id, consent_id),
     )
     if row is None:
-        raise ControlError(f"철회되지 않은 동의 {consent_id}이(가) 없습니다.")
+        raise not_found(f"철회되지 않은 동의 {consent_id}이(가) 없습니다.")
     ctx.emit(
         EventKind.CONSENT_REVOKED,
         consent_id,
