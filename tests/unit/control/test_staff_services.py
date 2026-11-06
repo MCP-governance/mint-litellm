@@ -65,7 +65,7 @@ def world(fresh_db, login_roles):
 
 def sctx(world, user=USER):
     _, staff_conn, control_conn = world
-    return staff.StaffContext(staff_conn, control_conn, INSTANCE, user)
+    return staff.StaffContext(staff_conn, control_conn, INSTANCE, user, consent_max_days=90)
 
 
 def add_confirmation(url, user=USER, *, expires=None, requested_key=HARNESS_KEY, tool="echo"):
@@ -202,7 +202,7 @@ def test_the_acting_user_does_not_leak_between_calls_on_one_connection(world):
 
 def consent_args(**overrides):
     values = dict(org_id="acme", server_id="srv", purpose="ops", data_scope="all",
-                  text_version="v1", valid_until=later(days=30), max_valid_days=90)
+                  text_version="v1", valid_until=later(days=30))
     values.update(overrides)
     return values
 
@@ -260,3 +260,12 @@ def test_a_user_outside_the_org_and_a_suspended_server_are_refused(world):
         admin.execute("UPDATE mint.servers SET status = 'suspended' WHERE server_id = 'srv'")
     with pytest.raises(ControlError, match="suspended"):
         staff.grant_consent(sctx(world), SESSION, **consent_args())
+
+
+def test_the_consent_ceiling_comes_from_the_context(world):
+    login(world)
+    _, staff_conn, control_conn = world
+    short = staff.StaffContext(staff_conn, control_conn, INSTANCE, USER, consent_max_days=7)
+    with pytest.raises(ControlError, match="7일"):
+        staff.grant_consent(short, SESSION, **consent_args(valid_until=later(days=30)))
+    staff.grant_consent(short, SESSION, **consent_args(valid_until=later(days=6)))

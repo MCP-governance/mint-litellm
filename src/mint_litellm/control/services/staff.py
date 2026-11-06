@@ -35,6 +35,8 @@ class StaffContext:
     control: psycopg.Connection  # 제어 로그인 역할(확인용 읽기만)
     instance_id: str
     user_id: str
+    # 본인 동의의 유효 기간 상한(일). Stage2Settings.staff_consent_max_days 값을 넘긴다.
+    consent_max_days: int = 90
 
 
 @contextmanager
@@ -213,13 +215,13 @@ def grant_consent(
     data_scope: str,
     text_version: str,
     valid_until: datetime,
-    max_valid_days: int,
     team_ids: Sequence[str] = (),
 ) -> str:
     """본인 직접 동의를 등록하고 동의 식별자를 돌려준다.
 
-    ``max_valid_days``는 유효 기간 상한(일)이고 호출자가 정한다. ``team_ids``는 사용자가 속한
-    팀으로, 팀 바인딩으로 조직에 속한 사용자를 인정하는 데 쓴다.
+    유효 기간 상한은 ``sctx.consent_max_days``(설정 MINT_STAFF_CONSENT_MAX_DAYS)이다.
+    ``team_ids``는 LiteLLM 세션 키 정보에서 읽은 값이어야 하며 화면 입력을 넘기지 않는다
+    (팀 바인딩으로 조직에 속한 사용자를 인정하는 데 쓰인다. 강제는 콘솔 직원 화면이 한다).
     """
     if not 1 <= len(purpose.strip()) <= 128:
         raise ControlError("purpose는 1자 이상 128자 이하여야 합니다.")
@@ -230,8 +232,8 @@ def grant_consent(
         raise ControlError("valid-until에는 시간대가 필요합니다.")
     if valid_until <= now:
         raise ControlError("valid-until이 이미 지났습니다.")
-    if valid_until > now + timedelta(days=max_valid_days):
-        raise ControlError(f"동의 유효 기간은 최대 {max_valid_days}일입니다.")
+    if valid_until > now + timedelta(days=sctx.consent_max_days):
+        raise ControlError(f"동의 유효 기간은 최대 {sctx.consent_max_days}일입니다.")
     _active_session(sctx, session_id_hash)
     _check_consent_target(sctx, org_id, server_id, team_ids)
     consent_id = new_uuid7()
