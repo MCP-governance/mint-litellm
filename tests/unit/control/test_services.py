@@ -152,6 +152,7 @@ def test_a_role_outside_the_command_table_is_forbidden_and_changes_nothing(conn)
 
 def test_init_needs_no_token(db):
     conn = db
+    conn.execute("SELECT 1")  # 바깥 트랜잭션 안이어야 세이브포인트가 되어 시험 뒤 되돌아간다
     ctx = make_ctx(conn, "init", "admin", None)
     settings.initialize(ctx, "default", "기본 조직")
     settings.initialize(ctx, "default", "바뀐 이름")  # 다시 실행해도 그대로
