@@ -269,3 +269,39 @@ def test_the_consent_ceiling_comes_from_the_context(world):
     with pytest.raises(ControlError, match="7일"):
         staff.grant_consent(short, SESSION, **consent_args(valid_until=later(days=30)))
     staff.grant_consent(short, SESSION, **consent_args(valid_until=later(days=6)))
+
+
+def test_org_membership_is_decided_by_the_first_matching_binding(world):
+    url = world[0]
+    with psycopg.connect(url) as admin:
+        admin.execute("INSERT INTO mint.orgs (instance_id, org_id, name) VALUES (%s, 'beta', 'B')",
+                      (INSTANCE,))
+        admin.execute(
+            "INSERT INTO mint.org_bindings (id, instance_id, org_id, subject_type, subject_id,"
+            " created_by) VALUES (gen_random_uuid(), %s, 'beta', 'team', 't1', 'root')",
+            (INSTANCE,),
+        )
+        admin.execute(
+            "INSERT INTO mint.usage_relations (id, instance_id, org_id, purpose, server_id)"
+            " VALUES (gen_random_uuid(), %s, 'beta', 'ops', 'srv')",
+            (INSTANCE,),
+        )
+    login(world)
+    # 사용자 바인딩(acme)이 있으면 팀 바인딩(beta)은 보지 않는다
+    with pytest.raises(AdminError) as raised:
+        staff.grant_consent(sctx(world), SESSION, **consent_args(org_id="beta"), team_ids=["t1"])
+    assert raised.value.code == AdminCode.FORBIDDEN
+    # 사용자 바인딩이 없으면 팀 바인딩이 소속을 정한다
+    with psycopg.connect(url) as admin:
+        admin.execute("DELETE FROM mint.org_bindings WHERE subject_type = 'user'")
+    staff.grant_consent(sctx(world), SESSION, **consent_args(org_id="beta"), team_ids=["t1"])
+    with pytest.raises(AdminError):
+        staff.grant_consent(sctx(world), SESSION, **consent_args(), team_ids=["t1"])
+
+
+def test_a_staff_transaction_refuses_a_connection_inside_a_transaction(world):
+    login(world)
+    context = sctx(world)
+    with context.staff.transaction():
+        with pytest.raises(RuntimeError):
+            staff.list_consents(context)

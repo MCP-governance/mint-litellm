@@ -38,6 +38,9 @@ def ensure_login_roles(conn: psycopg.Connection, passwords: dict[str, str]) -> l
         if fetchone(conn, "SELECT 1 AS x FROM pg_roles WHERE rolname = %s", (LOGIN_ROLES[key],)):
             conn.execute(sql.SQL("ALTER ROLE {} LOGIN PASSWORD {}").format(
                 login, sql.Literal(password)))
+            # 다시 실행해도 그룹 구성을 설계 표에 맞춘다.
+            conn.execute(sql.SQL("GRANT {} TO {}").format(
+                sql.SQL(", ").join(sql.Identifier(g) for g in groups), login))
         else:
             conn.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {} IN ROLE {}").format(
                 login, sql.Literal(password),

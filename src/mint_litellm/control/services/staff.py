@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 import psycopg
 from psycopg.rows import dict_row
 
-from mint_litellm.control.db.connection import fetchone
+from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.errors import (
     ControlError,
     conflict,
@@ -42,6 +42,9 @@ class StaffContext:
 @contextmanager
 def _staff_transaction(sctx: StaffContext) -> Iterator[psycopg.Connection]:
     """직원 함수가 읽는 설정을 이 트랜잭션에만 걸고 연결을 내준다."""
+    # 바깥 트랜잭션 안이면 세이브포인트가 되어 설정이 바깥 끝까지 남는다. 유휴 연결만 받는다.
+    if sctx.staff.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise RuntimeError("staff connection must be idle before a staff transaction")
     with sctx.staff.transaction():
         sctx.staff.execute(
             "SELECT set_config('mint.staff_user_id', %s, true),"
@@ -177,18 +180,33 @@ def _check_consent_target(
         )
         if org is None or org["status"] != "active":
             raise ControlError(f"활성 상태의 조직 {org_id}이(가) 없습니다.")
-        member = fetchone(
-            sctx.control,
-            "SELECT 1 AS x FROM mint.org_bindings WHERE instance_id = %s AND org_id = %s AND"
-            " ((subject_type = 'user' AND subject_id = %s)"
-            " OR (subject_type = 'team' AND subject_id = ANY(%s)))"
-            " UNION ALL SELECT 1 FROM mint.settings WHERE instance_id = %s AND default_org_id = %s"
-            " AND NOT EXISTS (SELECT 1 FROM mint.org_bindings b WHERE b.instance_id = %s"
-            " AND b.subject_type = 'user' AND b.subject_id = %s)",
-            (sctx.instance_id, org_id, sctx.user_id, list(team_ids), sctx.instance_id, org_id,
-             sctx.instance_id, sctx.user_id),
-        )
-        if member is None:
+        # 사용자 바인딩 → 팀 바인딩 → 기본 조직, 처음 맞는 쪽이 소속을 정한다.
+        user_orgs = {
+            r["org_id"] for r in fetchall(
+                sctx.control,
+                "SELECT org_id FROM mint.org_bindings WHERE instance_id = %s"
+                " AND subject_type = 'user' AND subject_id = %s",
+                (sctx.instance_id, sctx.user_id),
+            )
+        }
+        team_orgs = set() if user_orgs else {
+            r["org_id"] for r in fetchall(
+                sctx.control,
+                "SELECT org_id FROM mint.org_bindings WHERE instance_id = %s"
+                " AND subject_type = 'team' AND subject_id = ANY(%s)",
+                (sctx.instance_id, list(team_ids)),
+            )
+        }
+        orgs = user_orgs or team_orgs
+        if not orgs:
+            default = fetchone(
+                sctx.control,
+                "SELECT default_org_id FROM mint.settings WHERE instance_id = %s",
+                (sctx.instance_id,),
+            )
+            orgs = {default["default_org_id"]} if default and default["default_org_id"] else set()
+        member = org_id in orgs
+        if not member:
             raise forbidden(f"조직 {org_id}에 속한 사용자만 이 조직의 동의를 등록할 수 있습니다.")
         server = fetchone(
             sctx.control,
