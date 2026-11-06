@@ -18,7 +18,10 @@ from mint_litellm.types.decision import (
 )
 from mint_litellm.types.reason_codes import Reason
 
-SUPPORTED_OBLIGATIONS: frozenset[ObligationType] = frozenset(ObligationType)
+# ``require_user_confirmation``은 형식만 정의되어 있고 판정 경로가 받아들이지 않는다(UNSUPPORTED).
+SUPPORTED_OBLIGATIONS: frozenset[ObligationType] = frozenset(
+    {ObligationType.ALERT, ObligationType.REQUIRE_CALL_APPROVAL, ObligationType.REQUIRE_CONSENT}
+)
 
 _SEVERITY_RANK = {Severity.LOW: 0, Severity.MEDIUM: 1, Severity.HIGH: 2, Severity.CRITICAL: 3}
 
@@ -41,6 +44,18 @@ class RequireConsent(BaseModel):
 
     type: Literal[ObligationType.REQUIRE_CONSENT] = ObligationType.REQUIRE_CONSENT
     purpose: str = Field(min_length=1, max_length=128, pattern=r"\S")
+
+
+class RequireUserConfirmation(BaseModel):
+    """본인 확인 의무의 형식. ``display_fields``는 확인 화면에 보일 인자 이름이다."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    type: Literal[ObligationType.REQUIRE_USER_CONFIRMATION] = (
+        ObligationType.REQUIRE_USER_CONFIRMATION
+    )
+    purpose: str = Field(min_length=1, max_length=128, pattern=r"\S")
+    display_fields: tuple[str, ...] = ()
 
 
 Obligation = Annotated[

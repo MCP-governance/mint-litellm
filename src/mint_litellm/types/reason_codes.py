@@ -45,6 +45,17 @@ class Reason(StrEnum):
     ANONYMOUS = "ANONYMOUS"
     ENFORCEMENT_UNVERIFIED = "ENFORCEMENT_UNVERIFIED"
     CANCELLED = "CANCELLED"
+    CONFIRMATION_REQUIRED = "CONFIRMATION_REQUIRED"
+    CONFIRMATION_STALE = "CONFIRMATION_STALE"
+
+
+class ContractDriftKind(StrEnum):
+    """``CONTRACT_DRIFT_<kind>``의 한정자. 경보형 변경(설명·출력 스키마)은 사유가 되지 않는다."""
+
+    INPUT_SCHEMA = "input_schema"
+    DEPLOYMENT = "deployment"
+    UNOBSERVED = "unobserved"
+    UNAPPROVED_TOOL = "unapproved_tool"
 
 
 PARAMETERIZED_REASONS: frozenset[Reason] = frozenset(
@@ -77,6 +88,10 @@ def make_reason_code(reason: Reason, qualifier: str | None = None) -> str:
     if qualifier is not None:
         raise ValueError(f"{reason.value} does not take a qualifier")
     return reason.value
+
+
+def contract_drift_code(kind: ContractDriftKind) -> str:
+    return make_reason_code(Reason.CONTRACT_DRIFT, ContractDriftKind(kind).value)
 
 
 def parse_reason_code(code: str) -> tuple[Reason, str | None]:

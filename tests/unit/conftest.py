@@ -7,7 +7,9 @@ import pytest
 
 import mint_litellm
 
-MIGRATION = Path(mint_litellm.__file__).parent / "control" / "db" / "migrations" / "001_initial.sql"
+MIGRATIONS = Path(mint_litellm.__file__).parent / "control" / "db" / "migrations"
+MIGRATION = MIGRATIONS / "001_initial.sql"
+STAGE2 = MIGRATIONS / "002_stage2.sql"
 DATABASE_URL = os.environ.get("MINT_TEST_DATABASE_URL")
 
 
@@ -28,6 +30,7 @@ def migrated_database() -> Iterator[str]:
     try:
         with psycopg.connect(url, autocommit=True) as conn:
             conn.execute(MIGRATION.read_text(encoding="utf-8"))
+            conn.execute(STAGE2.read_text(encoding="utf-8"))
         yield url
     finally:
         with psycopg.connect(DATABASE_URL, autocommit=True) as admin:

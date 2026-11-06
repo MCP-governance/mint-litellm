@@ -51,6 +51,7 @@ class ObligationType(StrEnum):
     ALERT = "alert"
     REQUIRE_CALL_APPROVAL = "require_call_approval"
     REQUIRE_CONSENT = "require_consent"
+    REQUIRE_USER_CONFIRMATION = "require_user_confirmation"
 
 
 class Severity(StrEnum):
