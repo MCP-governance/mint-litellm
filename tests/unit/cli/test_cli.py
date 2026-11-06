@@ -763,3 +763,31 @@ def test_ledger_list_marks_the_final_attempt_and_shows_reason_and_previous_attem
     assert latest.endswith("\t최종") and "사유 CANCELLED" in latest
     assert f"이전 시도 {first}:1" in latest
     assert "최종" not in lines[f"call:{first}:1:decision_evaluated"]
+
+
+def test_init_creates_worker_and_staff_login_roles_when_passwords_are_given(mint):
+    mint.env["MINT_WORKER_DB_PASSWORD"] = "worker-pass"
+    mint.env["MINT_STAFF_DB_PASSWORD"] = "staff-pass"
+    try:
+        code, _, err = mint.run("init")
+        assert code == 0 and "mint_worker_app" in err and "mint_staff_app" in err
+        with psycopg.connect(mint.env["MINT_DATABASE_URL"]) as conn:
+            groups = {
+                (r[0], r[1])
+                for r in conn.execute(
+                    "SELECT m.rolname, g.rolname FROM pg_auth_members a"
+                    " JOIN pg_roles m ON m.oid = a.member JOIN pg_roles g ON g.oid = a.roleid"
+                    " WHERE m.rolname IN ('mint_worker_app', 'mint_staff_app')"
+                )
+            }
+        assert groups == {
+            ("mint_worker_app", "mint_control"),
+            ("mint_worker_app", "mint_worker"),
+            ("mint_worker_app", "mint_sealer"),
+            ("mint_staff_app", "mint_staff"),
+        }
+    finally:
+        with psycopg.connect(mint.env["MINT_DATABASE_URL"], autocommit=True) as conn:
+            for login in ("mint_worker_app", "mint_staff_app"):
+                conn.execute(f'DROP OWNED BY "{login}"')
+                conn.execute(f'DROP ROLE IF EXISTS "{login}"')
