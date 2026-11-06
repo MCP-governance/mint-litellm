@@ -2,7 +2,7 @@
 
 from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchone
-from mint_litellm.control.errors import ControlError
+from mint_litellm.control.errors import ControlError, not_found
 from mint_litellm.types.events import EventKind
 from mint_litellm.types.identity import SubjectType
 from mint_litellm.types.ids import new_uuid7
@@ -32,7 +32,7 @@ def close(ctx: Context, org_id: str) -> None:
         (ctx.instance_id, org_id),
     )
     if row is None:
-        raise ControlError(f"활성 상태의 조직 {org_id}이(가) 없습니다.")
+        raise not_found(f"활성 상태의 조직 {org_id}이(가) 없습니다.")
     ctx.emit(EventKind.ORG_CLOSED, org_id, row["state_version"], {"org_id": org_id})
 
 
@@ -43,7 +43,7 @@ def require_active(ctx: Context, org_id: str) -> None:
         (ctx.instance_id, org_id),
     )
     if row is None:
-        raise ControlError(f"조직 {org_id}이(가) 없습니다.")
+        raise not_found(f"조직 {org_id}이(가) 없습니다.")
     if row["status"] != "active":
         raise ControlError(f"조직 {org_id}은(는) 닫혀 있습니다.")
 
@@ -84,7 +84,7 @@ def unbind(ctx: Context, subject_type: SubjectType, subject_id: str) -> None:
         (ctx.instance_id, subject_type.value, subject_id),
     )
     if row is None:
-        raise ControlError(f"{subject_type.value} {subject_id}의 조직 바인딩이 없습니다.")
+        raise not_found(f"{subject_type.value} {subject_id}의 조직 바인딩이 없습니다.")
     # 삭제된 행은 버전을 올릴 수 없으므로 마지막 버전의 다음 값으로 사건 키를 만든다.
     ctx.emit(
         EventKind.ORG_BINDING_REMOVED,

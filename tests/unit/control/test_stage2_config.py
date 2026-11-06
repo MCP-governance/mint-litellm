@@ -77,3 +77,12 @@ def test_invalid_values_are_refused(extra):
 
 def test_webhook_key_is_not_required_without_urls():
     assert Stage2Settings.from_env({**BASE, "MINT_WEBHOOK_URLS": " "}).webhook_urls == ()
+
+
+def test_staff_consent_ceiling_defaults_and_is_bounded():
+    assert Stage2Settings.from_env(BASE).staff_consent_max_days == 90
+    env = {**BASE, "MINT_STAFF_CONSENT_MAX_DAYS": "365"}
+    assert Stage2Settings.from_env(env).staff_consent_max_days == 365
+    for bad in ("0", "366", "abc", "-1"):
+        with pytest.raises(ControlError):
+            Stage2Settings.from_env({**BASE, "MINT_STAFF_CONSENT_MAX_DAYS": bad})

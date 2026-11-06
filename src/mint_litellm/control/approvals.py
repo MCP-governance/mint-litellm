@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from mint_litellm.control import operators
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.db.connection import fetchall, fetchone
-from mint_litellm.control.errors import ControlError
+from mint_litellm.control.errors import ControlError, forbidden, not_found, separation_of_duties
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
 from mint_litellm.types.events import EventKind
 from mint_litellm.types.ids import new_uuid7
@@ -224,7 +224,7 @@ def approve(
         (ctx.instance_id, relation_id),
     )
     if relation is None or relation["status"] != "active":
-        raise ControlError(f"활성 상태의 이용 관계 {relation_id}이(가) 없습니다.")
+        raise not_found(f"활성 상태의 이용 관계 {relation_id}이(가) 없습니다.")
     server = fetchone(
         ctx.conn,
         "SELECT id, status FROM mint.servers WHERE instance_id = %s AND server_id = %s FOR UPDATE",
@@ -314,7 +314,7 @@ def revoke(ctx: Context, approval_id: str, reason: str, deny: bool) -> None:
         (reason, ctx.instance_id, approval_id),
     )
     if row is None:
-        raise ControlError(f"활성 상태의 승인 {approval_id}이(가) 없습니다.")
+        raise not_found(f"활성 상태의 승인 {approval_id}이(가) 없습니다.")
     ctx.emit(
         EventKind.APPROVAL_REVOKED,
         approval_id,
@@ -385,7 +385,7 @@ def lift_denial(ctx: Context, denial_id: str) -> None:
         (ctx.operator.name, ctx.instance_id, denial_id),
     )
     if row is None:
-        raise ControlError(f"해제되지 않은 거부 {denial_id}이(가) 없습니다.")
+        raise not_found(f"해제되지 않은 거부 {denial_id}이(가) 없습니다.")
     ctx.emit(
         EventKind.DENIAL_LIFTED,
         denial_id,
@@ -494,9 +494,11 @@ def call_approve(ctx: Context, call_id: str, second: Operator | None) -> None:
         (ctx.instance_id, call_id),
     )
     if current is None:
-        raise ControlError(f"호출별 승인 {call_id}이(가) 없습니다.")
+        raise not_found(f"호출별 승인 {call_id}이(가) 없습니다.")
     if current["principal_type"] == "user" and current["principal_id"] == ctx.operator.user_id:
-        raise ControlError("호출 주체와 같은 사용자의 운영자는 호출별 승인을 승인할 수 없습니다.")
+        raise separation_of_duties(
+            "호출 주체와 같은 사용자의 운영자는 호출별 승인을 승인할 수 없습니다."
+        )
     second_info = operators.require_distinct_person(
         ctx.operator, current["requested_by"], second, "호출별 승인"
     )
@@ -521,12 +523,12 @@ def call_cancel(ctx: Context, call_id: str) -> None:
         (ctx.instance_id, call_id),
     )
     if current is None:
-        raise ControlError(f"호출별 승인 {call_id}이(가) 없습니다.")
+        raise not_found(f"호출별 승인 {call_id}이(가) 없습니다.")
     is_requester = (
         ctx.operator.user_id is not None and current["requested_by"] == ctx.operator.user_id
     )
     if ctx.operator.role != "admin" and not is_requester:
-        raise ControlError("호출별 승인은 요청자 본인이나 admin만 취소할 수 있습니다.")
+        raise forbidden("호출별 승인은 요청자 본인이나 admin만 취소할 수 있습니다.")
     _call_update(ctx, call_id, "cancelled", ("pending", "approved"),
                  EventKind.CALL_APPROVAL_CANCELLED)
 

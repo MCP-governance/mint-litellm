@@ -8,6 +8,7 @@ from mint_litellm.control.settings_store import ensure
 fresh_db = ctl_fixtures.fresh_db
 litellm = ctl_fixtures.litellm
 stub = ctl_fixtures.stub
+login_roles = ctl_fixtures.login_roles
 
 
 @pytest.fixture

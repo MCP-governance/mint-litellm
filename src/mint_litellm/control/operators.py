@@ -13,7 +13,7 @@ import psycopg
 from mint_litellm.control import ledger
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.db.connection import fetchone
-from mint_litellm.control.errors import AuthError, ControlError
+from mint_litellm.control.errors import AuthError, ControlError, separation_of_duties
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
 from mint_litellm.types.cli_commands import APPROVER_UP, OperatorRole
 from mint_litellm.types.events import EventKind
@@ -146,12 +146,12 @@ def require_distinct_person(
     if other_user_id is None or operator.user_id != other_user_id:
         return None
     if second is None:
-        raise ControlError(
+        raise separation_of_duties(
             f"{what}의 요청자와 같은 사용자이므로 승인할 수 없습니다. "
             "다른 사용자의 운영자 토큰을 --second-approver로 함께 제시하십시오."
         )
     if second.role not in {r.value for r in APPROVER_UP} or second.user_id in (None, other_user_id):
-        raise ControlError(
+        raise separation_of_duties(
             "두 번째 승인자는 요청자와 다른 사용자에 결속된 approver 이상이어야 합니다."
         )
     return {"name": second.name, "user_id": second.user_id}

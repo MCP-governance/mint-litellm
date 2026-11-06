@@ -52,3 +52,39 @@ def fresh_db() -> Iterator[str]:
     finally:
         with psycopg.connect(DATABASE_URL, autocommit=True) as admin:
             admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+LOGIN_PASSWORDS = {
+    "mint_plugin": "pw-plugin",
+    "mint_control": "pw-control",
+    "mint_worker": "pw-worker",
+    "mint_staff": "pw-staff",
+}
+
+
+def as_login(url: str, key: str):
+    """``mint_<프로세스>_app`` 로그인 역할로 접속한다(``login_roles`` 장치가 먼저 필요하다)."""
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    from mint_litellm.control.db.roles import LOGIN_ROLES
+
+    params = conninfo_to_dict(url)
+    params.update(user=LOGIN_ROLES[key], password=LOGIN_PASSWORDS[key])
+    return psycopg.connect(make_conninfo(**params))
+
+
+@pytest.fixture
+def login_roles(fresh_db: str) -> Iterator[list[str]]:
+    """네 프로세스의 로그인 역할을 만들고 시험이 끝나면 지운다(역할은 클러스터 전체에 속한다)."""
+    import psycopg
+
+    from mint_litellm.control.db.roles import LOGIN_ROLES, ensure_login_roles
+
+    with psycopg.connect(fresh_db) as conn:
+        configured = ensure_login_roles(conn, LOGIN_PASSWORDS)
+    yield configured
+    with psycopg.connect(fresh_db, autocommit=True) as conn:
+        for login in LOGIN_ROLES.values():
+            conn.execute(f'DROP OWNED BY "{login}"')
+            conn.execute(f'DROP ROLE IF EXISTS "{login}"')
