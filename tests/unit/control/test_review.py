@@ -33,7 +33,9 @@ LATER = NOW + timedelta(days=30)
 
 def events(conn, kind):
     return fetchall(
-        conn, "SELECT * FROM mint.events WHERE instance_id = %s AND kind = %s", (INSTANCE, kind)
+        conn, "SELECT * FROM mint.events WHERE instance_id = %s AND kind = %s"
+        " ORDER BY inserted_at, event_id",
+        (INSTANCE, kind),
     )
 
 

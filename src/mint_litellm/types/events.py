@@ -81,6 +81,9 @@ class EventKind(StrEnum):
     ALERT_RESOLVED = "alert_resolved"
     CONSOLE_SESSION_STARTED = "console_session_started"
     CONSOLE_SESSION_ENDED = "console_session_ended"
+    DEPLOYMENT_CONTRACT_APPROVED = "deployment_contract_approved"
+    DEPLOYMENT_DRIFT_DETECTED = "deployment_drift_detected"
+    DEPLOYMENT_CONTRACT_SUPERSEDED = "deployment_contract_superseded"
 
 
 CALL_KINDS: frozenset[EventKind] = frozenset(
@@ -154,6 +157,9 @@ CONTROL_ENTITY: dict[EventKind, str] = {
     EventKind.ALERT_RESOLVED: "alert",
     EventKind.CONSOLE_SESSION_STARTED: "console_session",
     EventKind.CONSOLE_SESSION_ENDED: "console_session",
+    EventKind.DEPLOYMENT_CONTRACT_APPROVED: "deployment_contract",
+    EventKind.DEPLOYMENT_DRIFT_DETECTED: "deployment_contract",
+    EventKind.DEPLOYMENT_CONTRACT_SUPERSEDED: "deployment_contract",
 }
 
 _ENTITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")

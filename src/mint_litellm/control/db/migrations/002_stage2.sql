@@ -4,7 +4,7 @@
 
 -- ---------------------------------------------------------------------------
 -- 역할
---   mint_staff:  직원 화면. 본인 확인과 본인 세션 행만 다룬다.
+--   mint_staff:  직원 화면. 표에 직접 쓰지 않고 mint.staff_* 함수만 실행한다.
 --   mint_worker: 작업 실행기의 작업·동기화·내보내기·경보 표.
 -- 로그인 역할은 프로세스마다 아래 그룹 역할을 받는다.
 --   콘솔 관리 화면·CLI: mint_control
@@ -26,12 +26,31 @@ END $$;
 
 GRANT USAGE ON SCHEMA mint TO mint_staff, mint_worker;
 
--- 직원 화면 연결은 트랜잭션마다 set_config('mint.acting_user_id', <user_id>, true)로 본인을
--- 밝힌다. 본인 행만 보이게 하는 행 수준 보안과 전이 트리거가 이 값을 쓴다.
-CREATE FUNCTION mint.acting_user() RETURNS text
-LANGUAGE sql STABLE AS $$
-    SELECT nullif(current_setting('mint.acting_user_id', true), '')
-$$;
+-- 직원 화면 연결은 트랜잭션마다 set_config('mint.staff_user_id', <user_id>, true)와
+-- set_config('mint.staff_instance_id', <instance_id>, true)로 본인과 배치를 밝힌다.
+-- 직원 함수는 이 값에서만 대상을 읽고, 비어 있으면 거부한다.
+CREATE FUNCTION mint.staff_user() RETURNS text
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    uid text := nullif(current_setting('mint.staff_user_id', true), '');
+BEGIN
+    IF uid IS NULL THEN
+        RAISE EXCEPTION 'mint.staff_user_id is not set' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN uid;
+END $$;
+
+CREATE FUNCTION mint.staff_instance() RETURNS text
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    iid text := nullif(current_setting('mint.staff_instance_id', true), '');
+BEGIN
+    IF iid IS NULL THEN
+        RAISE EXCEPTION 'mint.staff_instance_id is not set'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN iid;
+END $$;
 
 -- 추가만 가능한 표의 행 수정·삭제를 막는다.
 CREATE FUNCTION mint.reject_mutation() RETURNS trigger
@@ -336,7 +355,7 @@ CREATE TABLE mint.console_sessions (
     user_id          text NOT NULL CHECK (length(user_id) > 0),
     key_token        text NOT NULL CHECK (length(key_token) > 0),
     operator_name    text CHECK (operator_name IS NULL OR length(operator_name) > 0),
-    role             text NOT NULL CHECK (length(role) > 0),
+    role             text NOT NULL CHECK (role IN ('admin', 'approver', 'viewer', 'staff')),
     created_at       timestamptz NOT NULL DEFAULT now(),
     last_seen_at     timestamptz NOT NULL DEFAULT now(),
     last_verified_at timestamptz NOT NULL DEFAULT now(),
@@ -418,7 +437,7 @@ END $$;
 
 -- 역할마다 할 수 있는 전이를 합친 것이 허용 전이다(슈퍼유저는 모든 역할의 구성원이다).
 --   mint_plugin:  confirmed>consumed
---   mint_staff:   본인 행의 pending>confirmed|rejected, pending|confirmed>cancelled
+--   mint_staff:   pending>confirmed|rejected, pending|confirmed>cancelled (직원 함수가 본인 행에만 건다)
 --   mint_control: pending|confirmed>cancelled, pending|confirmed>expired (확인·거절은 불가)
 -- 확인·거절의 주체는 요청 주체 본인이어야 한다.
 CREATE FUNCTION mint.restrict_self_confirmation() RETURNS trigger
@@ -442,11 +461,6 @@ BEGIN
                 'confirmed>expired'))) THEN
         RAISE EXCEPTION 'this role cannot move a self confirmation from % to %',
             OLD.status, NEW.status USING ERRCODE = 'insufficient_privilege';
-    END IF;
-    IF is_staff AND NOT is_control AND NOT is_plugin
-       AND mint.acting_user() IS DISTINCT FROM OLD.principal_id THEN
-        RAISE EXCEPTION 'staff can only change their own self confirmations'
-            USING ERRCODE = 'insufficient_privilege';
     END IF;
     IF step IN ('pending>confirmed', 'pending>rejected')
        AND NEW.confirmed_by_user_id IS DISTINCT FROM OLD.principal_id THEN
@@ -708,26 +722,17 @@ CREATE TRIGGER self_confirmations_epoch AFTER UPDATE ON mint.self_confirmations
     EXECUTE FUNCTION mint.bump_epoch();
 
 -- ---------------------------------------------------------------------------
--- 행 수준 보안: 직원 화면은 본인 행만 본다. 다른 역할은 모든 행을 본다.
+-- 행 수준 보안: 본인 확인과 세션 표는 직원 화면 역할이 직접 읽지 못한다(직원 함수만 쓴다).
 -- 표 소유자와 슈퍼유저는 정책을 받지 않는다.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE mint.self_confirmations ENABLE ROW LEVEL SECURITY;
 CREATE POLICY self_confirmations_system ON mint.self_confirmations
     TO mint_plugin, mint_control USING (true) WITH CHECK (true);
-CREATE POLICY self_confirmations_staff_read ON mint.self_confirmations
-    FOR SELECT TO mint_staff USING (principal_id = mint.acting_user());
-CREATE POLICY self_confirmations_staff_update ON mint.self_confirmations
-    FOR UPDATE TO mint_staff
-    USING (principal_id = mint.acting_user()) WITH CHECK (principal_id = mint.acting_user());
 
 ALTER TABLE mint.console_sessions ENABLE ROW LEVEL SECURITY;
 CREATE POLICY console_sessions_control ON mint.console_sessions
     TO mint_control USING (true) WITH CHECK (true);
-CREATE POLICY console_sessions_staff ON mint.console_sessions
-    TO mint_staff
-    USING (subject = 'staff' AND user_id = mint.acting_user())
-    WITH CHECK (subject = 'staff' AND user_id = mint.acting_user());
 
 -- ---------------------------------------------------------------------------
 -- 권한
@@ -762,14 +767,6 @@ GRANT UPDATE (observed_sha256, observed_at) ON mint.tool_contracts TO mint_worke
 -- 봉인자
 GRANT SELECT, INSERT ON mint.seal_batches TO mint_sealer;
 
--- 직원 화면: 본인 확인의 결정 열과 본인 세션 행만 다룬다.
-GRANT SELECT ON mint.self_confirmations TO mint_staff;
-GRANT UPDATE (status, confirmed_by_user_id, confirmed_by_key_token, confirmed_at)
-    ON mint.self_confirmations TO mint_staff;
-GRANT SELECT, INSERT ON mint.console_sessions TO mint_staff;
-GRANT UPDATE (last_seen_at, last_verified_at, idle_expiry, revoked_at)
-    ON mint.console_sessions TO mint_staff;
-
 -- 플러그인: 계약 읽기, 내보내기 읽기, 본인 확인 요청 행 추가와 소비.
 GRANT SELECT (id, instance_id, server_id, credential_scope, tool, sha256, pin_sha256,
               risk_grade, action_type, status, drift)
@@ -781,3 +778,191 @@ GRANT INSERT (id, instance_id, org_id, principal_id, server_id, tool, args_fp, f
     ON mint.self_confirmations TO mint_plugin;
 GRANT UPDATE (status, consumed_invocation_id, consumed_at)
     ON mint.self_confirmations TO mint_plugin;
+
+-- ---------------------------------------------------------------------------
+-- 직원 화면 함수. 직원 역할은 표 권한 없이 이 함수만 실행한다.
+-- 대상 사용자는 mint.staff_user_id 설정에서만 읽고, 본인 행만 바꾸며,
+-- 상태 변경과 사건을 같은 트랜잭션에 쓴다.
+-- ---------------------------------------------------------------------------
+
+CREATE FUNCTION mint.staff_event(
+    p_kind text, p_entity text, p_id text, p_version bigint, p_actor text, p_payload jsonb
+) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+    INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload)
+    VALUES (gen_random_uuid(), mint.staff_instance(), p_kind,
+            p_entity || ':' || p_id || ':' || p_version || ':' || p_kind, p_actor, p_payload)
+    ON CONFLICT (instance_id, source_key) DO NOTHING
+$$;
+
+-- 본인 확인의 상태를 바꾸고 사건을 남긴다.
+CREATE FUNCTION mint.staff_decide_confirmation(
+    p_id uuid, p_target text, p_key_token text
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+DECLARE
+    uid text := mint.staff_user();
+    sc mint.self_confirmations;
+BEGIN
+    SELECT * INTO sc FROM mint.self_confirmations
+    WHERE id = p_id AND principal_id = uid AND instance_id = mint.staff_instance()
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no such self confirmation for this user'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF p_target IN ('confirmed', 'rejected') THEN
+        UPDATE mint.self_confirmations
+        SET status = p_target, confirmed_by_user_id = uid,
+            confirmed_by_key_token = p_key_token, confirmed_at = now()
+        WHERE id = p_id RETURNING * INTO sc;
+    ELSE
+        UPDATE mint.self_confirmations SET status = p_target WHERE id = p_id
+        RETURNING * INTO sc;
+    END IF;
+    PERFORM mint.staff_event(
+        CASE p_target WHEN 'confirmed' THEN 'call_approval_approved'
+                      WHEN 'rejected' THEN 'call_approval_rejected'
+                      ELSE 'call_approval_cancelled' END,
+        'call_approval', p_id::text, sc.state_version, uid,
+        jsonb_build_object('kind', 'confirmation'));
+END $$;
+
+CREATE FUNCTION mint.staff_confirm(p_id uuid, p_key_token text) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+    SELECT mint.staff_decide_confirmation(p_id, 'confirmed', p_key_token)
+$$;
+
+CREATE FUNCTION mint.staff_reject(p_id uuid, p_key_token text) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+    SELECT mint.staff_decide_confirmation(p_id, 'rejected', p_key_token)
+$$;
+
+CREATE FUNCTION mint.staff_cancel(p_id uuid) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+    SELECT mint.staff_decide_confirmation(p_id, 'cancelled', NULL)
+$$;
+
+CREATE FUNCTION mint.staff_grant_consent(
+    p_id uuid, p_org_id text, p_server_id text, p_purpose text, p_data_scope text,
+    p_text_version text, p_valid_until timestamptz
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+DECLARE
+    uid text := mint.staff_user();
+BEGIN
+    INSERT INTO mint.consents (id, instance_id, org_id, human_user_id, server_id, purpose,
+                               data_scope, text_version, source, granted_at, valid_until,
+                               registered_by)
+    VALUES (p_id, mint.staff_instance(), p_org_id, uid, p_server_id, p_purpose, p_data_scope,
+            p_text_version, 'self_service', now(), p_valid_until, uid);
+    PERFORM mint.staff_event('consent_granted', 'consent', p_id::text, 1, uid, '{}'::jsonb);
+END $$;
+
+CREATE FUNCTION mint.staff_revoke_consent(p_id uuid) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+DECLARE
+    uid text := mint.staff_user();
+    version bigint;
+BEGIN
+    UPDATE mint.consents SET revoked_at = now()
+    WHERE id = p_id AND human_user_id = uid AND revoked_at IS NULL
+      AND instance_id = mint.staff_instance()
+    RETURNING state_version INTO version;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no active consent of this user' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM mint.staff_event('consent_revoked', 'consent', p_id::text, version, uid, '{}'::jsonb);
+END $$;
+
+-- 직원 세션을 시작·갱신·종료한다. 시작과 종료는 사건을 남긴다.
+CREATE FUNCTION mint.staff_start_session(
+    p_id_hash text, p_key_token text, p_idle_expiry timestamptz, p_absolute_expiry timestamptz
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+DECLARE
+    uid text := mint.staff_user();
+BEGIN
+    INSERT INTO mint.console_sessions (id_hash, instance_id, subject, user_id, key_token, role,
+                                       idle_expiry, absolute_expiry)
+    VALUES (p_id_hash, mint.staff_instance(), 'staff', uid, p_key_token, 'staff',
+            p_idle_expiry, p_absolute_expiry);
+    PERFORM mint.staff_event('console_session_started', 'console_session', p_id_hash, 1, uid,
+                             jsonb_build_object('subject', 'staff'));
+END $$;
+
+CREATE FUNCTION mint.staff_touch_session(p_id_hash text, p_idle_expiry timestamptz) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+BEGIN
+    UPDATE mint.console_sessions
+    SET last_seen_at = now(), idle_expiry = p_idle_expiry
+    WHERE id_hash = p_id_hash AND user_id = mint.staff_user() AND subject = 'staff'
+      AND instance_id = mint.staff_instance() AND revoked_at IS NULL;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no active session of this user' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+END $$;
+
+CREATE FUNCTION mint.staff_end_session(p_id_hash text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+DECLARE
+    uid text := mint.staff_user();
+BEGIN
+    UPDATE mint.console_sessions SET revoked_at = now()
+    WHERE id_hash = p_id_hash AND user_id = uid AND subject = 'staff'
+      AND instance_id = mint.staff_instance() AND revoked_at IS NULL;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no active session of this user' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM mint.staff_event('console_session_ended', 'console_session', p_id_hash, 2, uid,
+                             jsonb_build_object('subject', 'staff'));
+END $$;
+
+-- 본인 범위 조회
+CREATE FUNCTION mint.staff_list_confirmations() RETURNS SETOF mint.self_confirmations
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+    SELECT * FROM mint.self_confirmations
+    WHERE principal_id = mint.staff_user() AND instance_id = mint.staff_instance()
+    ORDER BY created_at DESC
+$$;
+
+CREATE FUNCTION mint.staff_list_consents() RETURNS SETOF mint.consents
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+    SELECT * FROM mint.consents
+    WHERE human_user_id = mint.staff_user() AND instance_id = mint.staff_instance()
+    ORDER BY granted_at DESC
+$$;
+
+CREATE FUNCTION mint.staff_list_events(p_limit integer DEFAULT 100) RETURNS SETOF mint.events
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = mint, pg_catalog AS $$
+    SELECT * FROM mint.events
+    WHERE instance_id = mint.staff_instance()
+      AND (actor = mint.staff_user() OR subject ->> 'principal_id' = mint.staff_user())
+    ORDER BY inserted_at DESC, event_id DESC
+    LIMIT least(greatest(p_limit, 1), 1000)
+$$;
+
+-- 내부 함수는 실행 권한을 닫고, 공개 함수만 직원 역할에 연다.
+REVOKE ALL ON FUNCTION mint.staff_event(text, text, text, bigint, text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_decide_confirmation(uuid, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_confirm(uuid, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_reject(uuid, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_cancel(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_grant_consent(
+    uuid, text, text, text, text, text, timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_revoke_consent(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_start_session(text, text, timestamptz, timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_touch_session(text, timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_end_session(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_list_confirmations() FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_list_consents() FROM PUBLIC;
+REVOKE ALL ON FUNCTION mint.staff_list_events(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION
+    mint.staff_confirm(uuid, text), mint.staff_reject(uuid, text), mint.staff_cancel(uuid),
+    mint.staff_grant_consent(uuid, text, text, text, text, text, timestamptz),
+    mint.staff_revoke_consent(uuid),
+    mint.staff_start_session(text, text, timestamptz, timestamptz),
+    mint.staff_touch_session(text, timestamptz), mint.staff_end_session(text),
+    mint.staff_list_confirmations(), mint.staff_list_consents(),
+    mint.staff_list_events(integer)
+    TO mint_staff;

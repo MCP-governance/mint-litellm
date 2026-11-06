@@ -135,10 +135,6 @@ def status_of(conn, table, cid):
     return scalar(conn, f"SELECT status FROM mint.{table} WHERE id = %s", cid)
 
 
-def acting(conn, user):
-    conn.execute("SELECT set_config('mint.acting_user_id', %s, true)", (user,))
-
-
 # ---------------------------------------------------------------------------
 # 목록
 # ---------------------------------------------------------------------------
@@ -917,90 +913,281 @@ def denied(conn, *statements):
             conn.execute(statement)
 
 
-def test_staff_sees_and_decides_only_their_own_confirmations(db, base):
-    mine, theirs = add_confirmation(db), add_confirmation(db, principal="u2")
+def staff_context(conn, user="u1", instance=I):
+    conn.execute("SELECT set_config('mint.staff_user_id', %s, true)", (user,))
+    conn.execute("SELECT set_config('mint.staff_instance_id', %s, true)", (instance,))
+
+
+def staff_call(conn, sql, *params):
+    return conn.execute(sql, params).fetchall()
+
+
+def event_keys(conn, kind):
+    rows = conn.execute(
+        "SELECT source_key, actor, payload FROM mint.events WHERE kind = %s ORDER BY source_key",
+        (kind,),
+    ).fetchall()
+    return rows
+
+
+def test_staff_confirms_rejects_and_cancels_only_their_own_rows_with_events(db, base):
+    mine, rej, can, theirs = (
+        add_confirmation(db),
+        add_confirmation(db, fp=H2),
+        add_confirmation(db, fp="c" * 64),
+        add_confirmation(db, principal="u2"),
+    )
     as_role(db, "mint_staff")
-    assert scalar(db, "SELECT count(*) FROM mint.self_confirmations") == 0
-    acting(db, "u1")
-    assert scalar(db, "SELECT count(*) FROM mint.self_confirmations") == 1
-    confirm(db, mine, principal="u1")
-    assert status_of(db, "self_confirmations", mine) == "confirmed"
-    # 다른 사람의 행은 보이지 않아 바꿀 수 없다.
-    cur = db.execute("UPDATE mint.self_confirmations SET status = 'cancelled' WHERE id = %s",
-                     (theirs,))  # fmt: skip
-    assert cur.rowcount == 0
+    staff_context(db)
+    staff_call(db, "SELECT mint.staff_confirm(%s, 'tok-other')", mine)
+    staff_call(db, "SELECT mint.staff_reject(%s, 'tok-other')", rej)
+    staff_call(db, "SELECT mint.staff_cancel(%s)", can)
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_confirm(%s, 'tok-other')", theirs)
+    assert len(staff_call(db, "SELECT * FROM mint.staff_list_confirmations()")) == 3
     db.execute("RESET ROLE")
+    assert status_of(db, "self_confirmations", mine) == "confirmed"
+    assert status_of(db, "self_confirmations", rej) == "rejected"
+    assert status_of(db, "self_confirmations", can) == "cancelled"
     assert status_of(db, "self_confirmations", theirs) == "pending"
+    assert scalar(db, "SELECT confirmed_by_user_id FROM mint.self_confirmations WHERE id = %s", mine) == "u1"  # noqa: E501
+    # 상태 변경과 사건이 같은 트랜잭션에 있고 키의 번호는 새 버전이다.
+    assert event_keys(db, "call_approval_approved") == [
+        (f"call_approval:{mine}:2:call_approval_approved", "u1", {"kind": "confirmation"})
+    ]
+    assert len(event_keys(db, "call_approval_rejected")) == 1
+    assert len(event_keys(db, "call_approval_cancelled")) == 1
 
 
-def test_staff_cannot_act_as_another_user_or_without_a_declared_user(db, base):
+def test_staff_functions_refuse_without_a_declared_user_or_instance(db, base):
     cid = add_confirmation(db)
     as_role(db, "mint_staff")
-    sql = "UPDATE mint.self_confirmations SET status = 'cancelled' WHERE id = %s"
-    assert db.execute(sql, (cid,)).rowcount == 0
-    acting(db, "u2")
-    assert db.execute(sql, (cid,)).rowcount == 0
-    assert scalar(db, "SELECT count(*) FROM mint.self_confirmations") == 0
-
-
-def test_staff_transitions_are_limited_to_confirm_reject_and_cancel(db, base):
-    a, b, c = add_confirmation(db), add_confirmation(db, fp=H2), add_confirmation(db, fp="c" * 64)
-    confirm(db, c)
-    as_role(db, "mint_staff")
-    acting(db, "u1")
-    update(db, "self_confirmations", f"id = '{a}'", status="rejected",
-           confirmed_by_user_id="u1", confirmed_by_key_token="t", confirmed_at=NOW)  # fmt: skip
-    update(db, "self_confirmations", f"id = '{b}'", status="cancelled")
-    update(db, "self_confirmations", f"id = '{c}'", status="cancelled")
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_confirm(%s, 't')", cid)
+    db.execute("SELECT set_config('mint.staff_user_id', '', true)")
+    staff_context(db, user="")
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_confirm(%s, 't')", cid)
+    staff_context(db)
+    db.execute("SELECT set_config('mint.staff_instance_id', '', true)")
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_cancel(%s)", cid)
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT * FROM mint.staff_list_events()")
+    staff_context(db, user="u2")
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_cancel(%s)", cid)
     db.execute("RESET ROLE")
-    d = add_confirmation(db, fp="d" * 64)
-    confirm(db, d)
-    as_role(db, "mint_staff")
-    acting(db, "u1")
-    for target, extra in [("expired", {}), ("consumed", {"consumed_invocation_id": new_uuid7(),
-                                                          "consumed_at": NOW})]:  # fmt: skip
-        with fails(db, (errors.InsufficientPrivilege, errors.CheckViolation)):
-            update(db, "self_confirmations", f"id = '{d}'", status=target, **extra)
+    assert status_of(db, "self_confirmations", cid) == "pending"
 
 
-def test_staff_cannot_touch_anything_else(db, base):
+def test_staff_cannot_repeat_or_reverse_a_decision(db, base):
+    cid = add_confirmation(db)
     as_role(db, "mint_staff")
-    acting(db, "u1")
+    staff_context(db)
+    staff_call(db, "SELECT mint.staff_confirm(%s, 't')", cid)
+    with fails(db, errors.CheckViolation):
+        staff_call(db, "SELECT mint.staff_reject(%s, 't')", cid)
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_confirm(%s, 't')", cid)
+    staff_call(db, "SELECT mint.staff_cancel(%s)", cid)
+    db.execute("RESET ROLE")
+    assert len(event_keys(db, "call_approval_approved")) == 1
+
+
+def test_staff_has_no_direct_table_rights(db, base):
+    cid = add_confirmation(db)
+    sid = add_session(db, user="u1")
+    as_role(db, "mint_staff")
+    staff_context(db)
     denied(
         db,
+        "SELECT * FROM mint.self_confirmations",
+        f"UPDATE mint.self_confirmations SET status = 'cancelled' WHERE id = '{cid}'",
+        "INSERT INTO mint.self_confirmations (id) VALUES (gen_random_uuid())",
+        "SELECT * FROM mint.console_sessions",
+        f"UPDATE mint.console_sessions SET revoked_at = now() WHERE id_hash = '{sid}'",
+        "INSERT INTO mint.console_sessions (id_hash) VALUES ('x')",
+        "SELECT * FROM mint.consents",
+        "INSERT INTO mint.consents (id) VALUES (gen_random_uuid())",
+        "UPDATE mint.consents SET revoked_at = now()",
         "SELECT * FROM mint.approvals",
         "SELECT * FROM mint.call_approvals",
         "SELECT * FROM mint.operators",
         "SELECT * FROM mint.events",
+        "INSERT INTO mint.events (event_id) VALUES (gen_random_uuid())",
         "SELECT * FROM mint.intakes",
         "SELECT * FROM mint.jobs",
-        "INSERT INTO mint.events (event_id) VALUES (gen_random_uuid())",
         "UPDATE mint.servers SET status = 'approved'",
         "UPDATE mint.settings SET mode = 'observe'",
         "SELECT mint.raise_epoch('inst1', 5)",
         "SELECT mint.restore_attest_epoch('inst1', 5)",
         "UPDATE mint.state_epoch SET epoch = epoch + 1",
-        "INSERT INTO mint.consents (id) VALUES (gen_random_uuid())",
+        "SELECT mint.staff_event('x', 'y', 'z', 1, 'a', '{}')",
+        "SELECT mint.staff_decide_confirmation(gen_random_uuid(), 'confirmed', 't')",
     )
 
 
-def test_staff_session_rows_are_their_own(db, base):
-    own, other = add_session(db, user="u1"), add_session(db, user="u2")
-    add_session(db, subject="admin", user="u1", name="root")
+def test_staff_functions_are_closed_to_other_roles(db, base):
+    for role in ("mint_plugin", "mint_control", "mint_worker", "mint_sealer"):
+        db.execute(f"SET LOCAL ROLE {role}")
+        staff_context(db)
+        with fails(db, errors.InsufficientPrivilege):
+            staff_call(db, "SELECT mint.staff_cancel(gen_random_uuid())")
+        db.execute("RESET ROLE")
+
+
+def test_staff_consents_are_granted_and_revoked_with_events(db, base):
+    cid = new_uuid7()
     as_role(db, "mint_staff")
-    acting(db, "u1")
-    assert scalar(db, "SELECT count(*) FROM mint.console_sessions") == 1
-    update(db, "console_sessions", f"id_hash = '{own}'", last_seen_at=NOW)
-    cur = db.execute("UPDATE mint.console_sessions SET revoked_at = now() WHERE id_hash = %s",
-                     (other,))  # fmt: skip
-    assert cur.rowcount == 0
-    with pytest.raises(errors.InsufficientPrivilege), db.transaction():
-        add_session(db, user="u2")
-    with pytest.raises(errors.InsufficientPrivilege), db.transaction():
-        add_session(db, subject="admin", user="u1", name="root")
-    add_session(db, user="u1")
-    denied(db, "UPDATE mint.console_sessions SET user_id = 'u9'",
-           "DELETE FROM mint.console_sessions")  # fmt: skip
+    staff_context(db)
+    staff_call(db, "SELECT mint.staff_grant_consent(%s, 'orgA', 'srv-1', 'research', 'all', 'v1', %s)",  # noqa: E501
+               cid, NOW.replace(year=2100))
+    assert len(staff_call(db, "SELECT * FROM mint.staff_list_consents()")) == 1
+    staff_context(db, user="u2")
+    assert len(staff_call(db, "SELECT * FROM mint.staff_list_consents()")) == 0
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_revoke_consent(%s)", cid)
+    staff_context(db)
+    staff_call(db, "SELECT mint.staff_revoke_consent(%s)", cid)
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_revoke_consent(%s)", cid)
+    db.execute("RESET ROLE")
+    row = db.execute(
+        "SELECT human_user_id, source, registered_by, revoked_at IS NOT NULL FROM mint.consents"
+    ).fetchone()
+    assert row == ("u1", "self_service", "u1", True)
+    assert event_keys(db, "consent_granted")[0][0] == f"consent:{cid}:1:consent_granted"
+    assert event_keys(db, "consent_revoked")[0][0] == f"consent:{cid}:2:consent_revoked"
+
+
+def test_staff_grant_cannot_name_another_user_or_instance_object(db, base):
+    as_role(db, "mint_staff")
+    staff_context(db)
+    with fails(db, errors.ForeignKeyViolation):
+        staff_call(db, "SELECT mint.staff_grant_consent(gen_random_uuid(), 'orgA', 'nope', 'p',"
+                       " 's', 'v', now() + interval '1 day')")
+
+
+def test_staff_sessions_start_and_end_with_events_and_stay_personal(db, base):
+    far = NOW.replace(year=2090)
+    as_role(db, "mint_staff")
+    staff_context(db)
+    sid = "a" * 64
+    staff_call(db, "SELECT mint.staff_start_session(%s, 'tok', %s, %s)", sid, far, far)
+    staff_call(db, "SELECT mint.staff_touch_session(%s, %s)", sid, far)
+    staff_context(db, user="u2")
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_end_session(%s)", sid)
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_touch_session(%s, %s)", sid, far)
+    staff_context(db)
+    staff_call(db, "SELECT mint.staff_end_session(%s)", sid)
+    with fails(db, errors.InsufficientPrivilege):
+        staff_call(db, "SELECT mint.staff_end_session(%s)", sid)
+    mine = staff_call(db, "SELECT kind FROM mint.staff_list_events() ORDER BY kind")
+    assert [r[0] for r in mine] == ["console_session_ended", "console_session_started"]
+    db.execute("RESET ROLE")
+    row = db.execute("SELECT subject, role, user_id, revoked_at IS NOT NULL FROM mint.console_sessions").fetchone()  # noqa: E501
+    assert row == ("staff", "staff", "u1", True)
+    assert [r[0] for r in event_keys(db, "console_session_started")] == [
+        f"console_session:{sid}:1:console_session_started"
+    ]
+
+
+def test_staff_event_listing_is_personal(db, base):
+    add_event(db, key="approval:a1:1:approval_granted", actor="u1")
+    add_event(db, key="approval:a2:1:approval_granted", actor="u2")
+    as_role(db, "mint_staff")
+    staff_context(db)
+    rows = staff_call(db, "SELECT source_key FROM mint.staff_list_events(10)")
+    assert [r[0] for r in rows] == ["approval:a1:1:approval_granted"]
+
+
+def test_the_search_path_of_staff_functions_is_pinned(db):
+    rows = db.execute(
+        "SELECT proname, proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace"
+        " WHERE n.nspname = 'mint' AND proname LIKE 'staff\\_%' AND prosecdef"
+    ).fetchall()
+    assert len(rows) >= 12
+    for name, config in rows:
+        assert config and any(c.startswith("search_path=") for c in config), name
+
+
+def test_two_staff_decisions_at_once_leave_one_decision_and_one_event(migrated_database):
+
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    params = conninfo_to_dict(migrated_database)
+    admin = make_conninfo(**dict(params, dbname="postgres"))
+    name = params["dbname"] + "_conc"
+    with psycopg.connect(admin, autocommit=True) as conn:
+        conn.execute(f'CREATE DATABASE "{name}"')
+    try:
+        _concurrent_decisions(make_conninfo(**dict(params, dbname=name)))
+    finally:
+        with psycopg.connect(admin, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+def _concurrent_decisions(migrated_database):
+    import threading
+    import time
+
+    with psycopg.connect(migrated_database, autocommit=True) as setup:
+        from mint_litellm.control.db.migrate import _migration_files
+
+        for _, text in _migration_files():
+            setup.execute(text)
+    instance = f"conc{new_uuid7().hex[:12]}"
+    with psycopg.connect(migrated_database, autocommit=True) as setup:
+        setup.execute("INSERT INTO mint.orgs (instance_id, org_id, name) VALUES (%s, 'o', 'o')", (instance,))  # noqa: E501
+        setup.execute(
+            "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256, transport,"
+            " auth_type, registered_by) VALUES (gen_random_uuid(), %s, 's', 'pending', %s,"
+            " 'http', 'none', 'a')", (instance, HEX))
+        setup.execute("INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256,"
+                      " bundle_sha256) VALUES (%s, 'pv', %s, %s)", (instance, HEX, HEX))
+        cid = new_uuid7()
+        setup.execute(
+            "INSERT INTO mint.self_confirmations (id, instance_id, org_id, principal_id,"
+            " server_id, tool, args_fp, fp_key_version, policy_version_id, purpose,"
+            " requested_by_key_token, expires_at) VALUES (%s, %s, 'o', 'u1', 's', 't', %s, 1,"
+            " 'pv', 'p', 'tok', now() + interval '1 day')", (cid, instance, HEX))
+    first = psycopg.connect(migrated_database)
+    second = psycopg.connect(migrated_database)
+    outcome = {}
+
+    def late():
+        try:
+            second.execute("SELECT set_config('mint.staff_user_id', 'u1', true)")
+            second.execute("SELECT set_config('mint.staff_instance_id', %s, true)", (instance,))
+            second.execute("SELECT mint.staff_confirm(%s, 'tok-b')", (cid,))
+            second.commit()
+            outcome["second"] = "ok"
+        except psycopg.Error as error:
+            second.rollback()
+            outcome["second"] = type(error).__name__
+
+    try:
+        first.execute("SELECT set_config('mint.staff_user_id', 'u1', true)")
+        first.execute("SELECT set_config('mint.staff_instance_id', %s, true)", (instance,))
+        first.execute("SELECT mint.staff_confirm(%s, 'tok-a')", (cid,))
+        thread = threading.Thread(target=late)
+        thread.start()
+        time.sleep(0.5)
+        assert thread.is_alive()
+        first.commit()
+        thread.join(10)
+    finally:
+        first.close()
+        second.close()
+    assert outcome["second"] == "CheckViolation"
+    with psycopg.connect(migrated_database) as check:
+        assert check.execute("SELECT confirmed_by_key_token FROM mint.self_confirmations"
+                             " WHERE id = %s", (cid,)).fetchone()[0] == "tok-a"
+        assert check.execute("SELECT count(*) FROM mint.events WHERE instance_id = %s"
+                             " AND kind = 'call_approval_approved'", (instance,)).fetchone()[0] == 1
 
 
 def test_control_can_cancel_and_expire_but_never_confirm_or_consume(db, base):
