@@ -7,6 +7,7 @@ import json
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
+import test_ddl  # noqa: E402
 from psycopg import errors  # noqa: E402
 from test_ddl import (  # noqa: E402
     ENFORCEMENT_TABLES,
@@ -17,13 +18,14 @@ from test_ddl import (  # noqa: E402
     add_event,
     add_org,
     add_server,
-    base,  # noqa: E402,F401
     epoch,
     fails,
     scalar,
     server_in,
     set_server_status,
 )
+
+base = test_ddl.base  # 공용 fixture를 이 모듈에도 등록한다
 
 from mint_litellm.types.ids import new_uuid7  # noqa: E402
 
