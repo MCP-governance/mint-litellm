@@ -60,6 +60,27 @@ class EventKind(StrEnum):
     POLICY_ACTIVATED = "policy_activated"
     SETTINGS_CHANGED = "settings_changed"
     OPERATOR_ADDED = "operator_added"
+    # 2단계 제어 사건
+    INTAKE_RECEIVED = "intake_received"
+    INTAKE_REQUESTER_ASSIGNED = "intake_requester_assigned"
+    INTAKE_CHECKED = "intake_checked"
+    INTAKE_DECIDED = "intake_decided"
+    CONTRACT_APPROVED = "contract_approved"
+    CONTRACT_DRIFT_DETECTED = "contract_drift_detected"
+    CONTRACT_SUPERSEDED = "contract_superseded"
+    REAPPROVAL_REQUESTED = "reapproval_requested"
+    SYNC_APPLIED = "sync_applied"
+    SYNC_HELD = "sync_held"
+    EXPORT_WRITTEN = "export_written"
+    EXPORT_FAILED = "export_failed"
+    RESTORE_BLOCKED = "restore_blocked"
+    RESTORE_ATTESTED = "restore_attested"
+    RESTORE_STALE_ACCEPTED = "restore_stale_accepted"
+    ALERT_OPENED = "alert_opened"
+    ALERT_ACKNOWLEDGED = "alert_acknowledged"
+    ALERT_RESOLVED = "alert_resolved"
+    CONSOLE_SESSION_STARTED = "console_session_started"
+    CONSOLE_SESSION_ENDED = "console_session_ended"
 
 
 CALL_KINDS: frozenset[EventKind] = frozenset(
@@ -113,6 +134,26 @@ CONTROL_ENTITY: dict[EventKind, str] = {
     EventKind.POLICY_ACTIVATED: "policy_version",
     EventKind.SETTINGS_CHANGED: "settings",
     EventKind.OPERATOR_ADDED: "operator",
+    EventKind.INTAKE_RECEIVED: "intake",
+    EventKind.INTAKE_REQUESTER_ASSIGNED: "intake",
+    EventKind.INTAKE_CHECKED: "intake_check",
+    EventKind.INTAKE_DECIDED: "intake",
+    EventKind.CONTRACT_APPROVED: "tool_contract",
+    EventKind.CONTRACT_DRIFT_DETECTED: "tool_contract",
+    EventKind.CONTRACT_SUPERSEDED: "tool_contract",
+    EventKind.REAPPROVAL_REQUESTED: "tool_contract",
+    EventKind.SYNC_APPLIED: "litellm_grant",
+    EventKind.SYNC_HELD: "litellm_grant",
+    EventKind.EXPORT_WRITTEN: "export",
+    EventKind.EXPORT_FAILED: "export",
+    EventKind.RESTORE_BLOCKED: "restore",
+    EventKind.RESTORE_ATTESTED: "restore",
+    EventKind.RESTORE_STALE_ACCEPTED: "restore",
+    EventKind.ALERT_OPENED: "alert",
+    EventKind.ALERT_ACKNOWLEDGED: "alert",
+    EventKind.ALERT_RESOLVED: "alert",
+    EventKind.CONSOLE_SESSION_STARTED: "console_session",
+    EventKind.CONSOLE_SESSION_ENDED: "console_session",
 }
 
 _ENTITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
