@@ -4,6 +4,7 @@
 환경변수는 acc.env를 읽은 상태에서 실행한다. 사용: python make_site.py > tests/acceptance/stage2/.runtime/site.json
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,7 +32,13 @@ site["intake"].update(org_id="default", owner_user_id="acc-owner")
 for name, entry in site["servers"].items():
     entry["server_id"] = name
     entry["url"] = f"https://cnt:8443/{name}/mcp"
-    site["counters"][name] = "http://127.0.0.1:4350/" + name
+    site["counters"][name] = f"http://{os.environ.get('ACC_COUNTER_HOST', '127.0.0.1')}:4350/{name}"
+# 실제 클라이언트(pj1·pj3): 기기에서 ssh로 고정 명령을 실행한다(환경 파일은 각 장비에 둔다).
+for device, target in (("pj1", os.environ.get("ACC_PJ1")), ("pj3", os.environ.get("ACC_PJ3"))):
+    if target:
+        remote = os.environ["ACC_" + device.upper() + "_CMD"]
+        site["clients"][device] = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                                   target, remote]
 site["decision_logs"] = [["docker", "logs", "mints2-litellm-1"], ["docker", "logs", "mints2-litellm2-1"]]
 site["artifacts"]["export_dir"] = str(Path.home() / "mint-s2" / "export")
 site["artifacts"]["client_pj1"] = str(HERE.parent / ".runtime" / "client-pj1.json")
