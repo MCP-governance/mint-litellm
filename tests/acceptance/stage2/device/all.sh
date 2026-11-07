@@ -21,6 +21,8 @@ setsid nohup "$PY" "$HERE/counter_service.py" http://127.0.0.1:4320/__log 4350 >
 source "$HERE/env.sh"
 mkdir -p tests/acceptance/stage2/.runtime
 "$PY" "$HERE/make_site.py" > tests/acceptance/stage2/.runtime/site.json
+# 수용검증의 URL 검사가 요구하는 제공자 허용 목록(계수 역프록시 호스트). 기준 스냅숏에 들어가도록 스냅숏 전에 등록한다.
+MINT_OPERATOR_TOKEN=$ACC_ADMIN_TOKEN "$PY" -m mint_litellm.cli allowlist add --kind provider --value cnt   --valid-until "$(date -u -d '+300 days' +%Y-%m-%dT%H:%M:%SZ)" --note acceptance --json > /dev/null
 sleep 20
 "$PY" -m tests.acceptance.stage2.adapters snapshot apply
 echo all-done
