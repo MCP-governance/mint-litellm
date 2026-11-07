@@ -1,6 +1,7 @@
 """직원 서비스: 실제 직원 로그인(표를 읽지 못함)과 제어 로그인(확인용 읽기)으로 검증한다.
 MINT_TEST_DATABASE_URL이 없으면 건너뛴다."""
 
+import threading
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -497,3 +498,64 @@ def test_direct_consent_denies_unset_empty_or_out_of_range_max_days(world, days)
                 "SELECT mint.staff_grant_consent(%s, 'acme', 'srv', 'ops', 'all', 'v1', %s)",
                 (uuid.uuid4(), later(days=1)),
             )
+
+
+# --- 행 잠금: 직원 쓰기와 상태 변경은 직렬화된다 ------------------------------
+
+_CHANGES = {
+    "session": "UPDATE mint.console_sessions SET revoked_at = now()",
+    "server": "UPDATE mint.servers SET status = 'suspended'",
+    "membership": "DELETE FROM mint.org_bindings WHERE subject_type = 'user'",
+    "relation": "UPDATE mint.usage_relations SET status = 'terminating'",
+    "org": "UPDATE mint.orgs SET status = 'closed'",
+}
+
+
+def _grant(conn):
+    conn.execute(
+        "SELECT mint.staff_grant_consent(%s, 'acme', 'srv', 'ops', 'metadata', 'v1', %s)",
+        (uuid.uuid4(), later(days=1)),
+    )
+
+
+@pytest.mark.parametrize("change", list(_CHANGES))
+def test_a_state_change_waits_for_an_open_staff_write(world, change):
+    """재확인 직후 철회·조직 이동·중지는 직원 쓰기 트랜잭션이 끝난 뒤에만 들어간다."""
+    url = world[0]
+    login(world)
+    context = sctx(world)
+    with staff._staff_transaction(context, SESSION) as conn:
+        _grant(conn)
+        with psycopg.connect(url, autocommit=True) as other:
+            other.execute("SET lock_timeout = '300ms'")
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                other.execute(_CHANGES[change])
+    with psycopg.connect(url, autocommit=True) as other:
+        other.execute(_CHANGES[change])
+
+
+@pytest.mark.parametrize("change", list(_CHANGES))
+def test_a_staff_write_that_waits_on_a_state_change_is_refused_after_it_commits(world, change):
+    """상태 변경이 먼저 행을 잡고 있으면 직원 쓰기는 기다렸다가 커밋된 상태로 다시 판정한다."""
+    url = world[0]
+    login(world)
+    context = sctx(world)
+    result = {}
+
+    def staff_write():
+        try:
+            with staff._staff_transaction(context, SESSION) as conn:
+                _grant(conn)
+            result["error"] = None
+        except psycopg.errors.InsufficientPrivilege as exc:
+            result["error"] = exc
+
+    with psycopg.connect(url) as admin:
+        admin.execute(_CHANGES[change])
+        worker = threading.Thread(target=staff_write)
+        worker.start()
+        worker.join(0.5)
+        assert worker.is_alive()  # 변경이 커밋되기 전에는 직원 쓰기가 잠금을 기다린다.
+        admin.commit()
+    worker.join(10)
+    assert isinstance(result["error"], psycopg.errors.InsufficientPrivilege)

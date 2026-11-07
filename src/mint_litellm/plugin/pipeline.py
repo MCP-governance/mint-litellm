@@ -1072,7 +1072,8 @@ async def _evaluate(run: _Run, deps: PipelineDeps) -> Outcome:
         run.event_written = True
     else:
         if stored.consumption_lost:
-            conclusion = _block_with(conclusion, StageResult.stop(stored.consumption_reason))
+            reason = Reason(stored.consumption_reason)
+            conclusion = _block_with(conclusion, StageResult.stop(reason))
             consume = None
             event = decision_event(_decision_snapshot(run, conclusion, None))
             retry = await deps.recorder.try_database(event, timeout=run.deadline.remaining())
