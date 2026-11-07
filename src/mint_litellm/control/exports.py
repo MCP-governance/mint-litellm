@@ -233,3 +233,34 @@ def export_checkpoint(job: JobContext) -> None:
         resign_newest_negative(job.settings, job.instance_id)
     except (OSError, files.ExportUnverified):
         raise ExportFailed("옛 키로 서명된 부정 상태 파일을 다시 서명하지 못했습니다.") from None
+
+
+def write_files(
+    conn: psycopg.Connection,
+    instance_id: str,
+    settings: Stage2Settings,
+    *,
+    force_latest: bool = False,
+) -> str:
+    """DB 기준 부정 상태 파일과 체크포인트 파일, ``latest.json``을 ``exports`` 행 없이 쓴다.
+
+    복원 해제 명령이 쓴다. 제어 평면 역할은 ``exports``에 쓰지 못하고, 되돌림 상태의 작업
+    실행기는 쓰기를 멈추기 때문이다. 다음 정상 체크포인트가 행을 남긴다. 새 부정 상태 파일의
+    경로를 돌려준다.
+    """
+    snap = snapshot(conn, instance_id)
+    body: dict[str, Any] = {
+        "format": files.FORMAT, "instance_id": instance_id, "state_epoch": snap["epoch"],
+        "to_seal_seq": snap["seq"], "tail_hash": snap["tail"], "items": snap["items"],
+        "written_at": files.now(),
+    }
+    key = settings.export_hmac_key
+    negative = files.negative_path(settings.export_dir, instance_id, snap["epoch"])
+    checkpoint = files.checkpoint_path(settings.export_dir, instance_id, datetime.now(UTC))
+    try:
+        for kind, path in (("negative_state", negative), ("checkpoint", checkpoint)):
+            files.atomic_write(path, files.sign({**body, "kind": kind}, key))
+        _write_latest(settings, instance_id, body, force_latest)
+    except OSError as error:
+        raise ExportFailed(f"내보내기 파일을 쓰지 못했습니다: {type(error).__name__}") from None
+    return str(negative.relative_to(settings.export_dir)).replace("\\", "/")

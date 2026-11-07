@@ -163,11 +163,8 @@ def attest(
         _record(ctx, EventKind.RESTORE_ATTESTED, file_epoch,
                 {"reason": reason, "file_epoch": file_epoch, "db_epoch": current,
                  "reapplied": reapplied})
-    written = exports.write_export(
-        ctx.conn, ctx.instance_id, settings, "negative_state", actor=ctx.operator.name
-    )
-    return {"file_epoch": file_epoch, "db_epoch": current, "reapplied": reapplied,
-            "export": None if written is None else written["path"]}
+    path = exports.write_files(ctx.conn, ctx.instance_id, settings)
+    return {"file_epoch": file_epoch, "db_epoch": current, "reapplied": reapplied, "export": path}
 
 
 def accept_stale(
@@ -201,13 +198,6 @@ def accept_stale(
     with ctx.conn.transaction():
         _record(ctx, EventKind.RESTORE_STALE_ACCEPTED, snap["epoch"],
                 {"reason": reason, "second_approver": second.name, "cause": state.error})
-    negative = exports.write_export(
-        ctx.conn, ctx.instance_id, settings, "negative_state", force_latest=True,
-        actor=ctx.operator.name,
-    )
-    checkpoint = exports.write_export(
-        ctx.conn, ctx.instance_id, settings, "checkpoint", force_latest=True,
-        actor=ctx.operator.name,
-    )
+    path = exports.write_files(ctx.conn, ctx.instance_id, settings, force_latest=True)
     return {"cause": state.error, "db_epoch": snap["epoch"],
-            "latest": (checkpoint or negative or {}).get("path")}
+            "latest": path}

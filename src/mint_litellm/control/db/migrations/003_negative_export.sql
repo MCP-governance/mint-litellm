@@ -52,7 +52,3 @@ CREATE CONSTRAINT TRIGGER consents_zz_export AFTER UPDATE ON mint.consents
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
     WHEN (OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL)
     EXECUTE FUNCTION mint.enqueue_export_negative();
-
--- 복원 해제 명령(restore attest·accept-stale)이 DB 기준 새 내보내기 파일을 직접 쓴다.
--- 작업 실행기는 되돌림 상태에서 쓰기를 멈추므로(보류·차단) 제어 평면이 쓸 수 있어야 한다.
-GRANT INSERT, UPDATE ON mint.exports TO mint_control;
