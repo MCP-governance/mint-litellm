@@ -61,6 +61,13 @@ SELECT jsonb_build_object(
         SELECT coalesce(jsonb_agg(to_jsonb(a)), '[]'::jsonb) FROM mint.allowlists a
         WHERE a.instance_id = %(iid)s AND a.id = ANY (SELECT unnest(basis_allowlist_ids) FROM srv)
     ),
+    'egress_targets', (
+        SELECT coalesce(jsonb_agg(jsonb_build_object('value', e.value, 'org_id', e.org_id)),
+                        '[]'::jsonb)
+        FROM mint.allowlists e
+        WHERE e.instance_id = %(iid)s AND e.kind = 'egress_target' AND e.status = 'active'
+          AND e.valid_from <= now() AND now() < e.valid_until
+    ),
     'relations', (
         SELECT coalesce(jsonb_agg(to_jsonb(r)), '[]'::jsonb) FROM mint.usage_relations r
         WHERE r.instance_id = %(iid)s AND r.id IN (SELECT relation_id FROM ap)
@@ -252,6 +259,8 @@ class Snapshot:
     call_approvals: tuple[CallApprovalRow, ...]
     consents: tuple[ConsentRow, ...]
     policy_version: PolicyVersionRow | None
+    # (값, 조직 또는 None): 지금 유효한 허용 목적지 목록. 패턴 계산의 허용 호스트에 쓴다.
+    egress_targets: tuple[tuple[str, str | None], ...] = ()
 
 
 def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
@@ -356,6 +365,7 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
         policy_version=None
         if policy is None
         else PolicyVersionRow(id=policy["id"], bundle_sha256=policy["bundle_sha256"]),
+        egress_targets=tuple((e["value"], e["org_id"]) for e in doc.get("egress_targets", [])),
     )
 
 

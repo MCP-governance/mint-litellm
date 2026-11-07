@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import posixpath
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from mint_litellm.compat.litellm_1_106 import HookData, ServerResolutionError
@@ -28,6 +30,7 @@ from mint_litellm.plugin.obligations import (
 )
 from mint_litellm.plugin.policy.input import policy_input as make_policy_input
 from mint_litellm.plugin.policy.opa_client import Evaluation
+from mint_litellm.plugin.policy.patterns import compute_patterns
 from mint_litellm.plugin.snapshot import (
     ApprovalRow,
     CallApprovalRow,
@@ -98,6 +101,7 @@ class PipelineDeps:
     evaluate: PolicyEvaluate | None
     verified: Callable[[], bool]
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    secret_markers: Callable[..., Awaitable[tuple[str, ...] | None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +312,41 @@ def _argument_sizes(arguments: Mapping[str, Any]) -> dict[str, int]:
     return sizes
 
 
+def _condition_list(conditions: Mapping[str, Any], key: str) -> list[str]:
+    values = conditions.get(key, [])
+    if not isinstance(values, list) or not all(isinstance(v, str) and v for v in values):
+        raise InputError(f"{key} must be a list of non-empty strings")
+    return values
+
+
+def _host_of(value: str) -> str:
+    value = value.strip().lower()
+    try:
+        host = urlsplit(value if "://" in value else "//" + value).hostname or ""
+    except ValueError:
+        return ""
+    return host.removeprefix("*.").rstrip(".")
+
+
+def _argument_patterns(
+    snapshot: Snapshot,
+    principal: Principal,
+    conditions: Mapping[str, Any],
+    arguments: Mapping[str, Any],
+    secret_markers: Sequence[str],
+) -> dict[str, bool]:
+    hosts = {_host_of(h) for h in _condition_list(conditions, "allowed_hosts")}
+    hosts |= {_host_of(v) for v, org in snapshot.egress_targets if org in (None, principal.org_id)}
+    raw_paths = _condition_list(conditions, "allowed_paths")
+    paths = [posixpath.normpath(p.replace("\\", "/")) for p in raw_paths]
+    return compute_patterns(
+        arguments,
+        allowed_hosts={h for h in hosts if h},
+        allowed_paths=paths,
+        secret_markers=secret_markers,
+    )
+
+
 def build_policy_input(
     *,
     snapshot: Snapshot,
@@ -319,8 +358,9 @@ def build_policy_input(
     mode: Mode,
     operation: OperationType,
     high_risk_tools: frozenset[str],
+    secret_markers: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """정책 입력. 인자 원문은 넣지 않고, 1단계에 없는 값은 키를 만들지 않는다."""
+    """정책 입력. 인자 원문은 넣지 않고(패턴 불리언만), 값이 없는 입력은 키를 만들지 않는다."""
     now = snapshot.now
     server = snapshot.server
     allowed_kinds = (
@@ -376,6 +416,9 @@ def build_policy_input(
         high_risk_tools=sorted(high_risk_tools),
         mode=mode.value,
         operation=operation.value,
+        argument_patterns=_argument_patterns(
+            snapshot, principal, approval.get("conditions", {}), arguments, secret_markers
+        ),
     )
 
 
@@ -766,6 +809,21 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
 
     stages.add(Stage.CONTRACT, UNSUPPORTED_STAGE)
     run.current = Stage.POLICY
+    markers: Sequence[str] = ()
+    if deps.secret_markers is not None and snapshot.policy_version is not None:
+        try:
+            fetched = await deps.secret_markers(
+                policy_version_id=snapshot.policy_version.id,
+                bundle_sha256=snapshot.policy_version.bundle_sha256,
+                budget_seconds=run.deadline.remaining(),
+            )
+        except Exception:
+            fetched = None
+        if fetched is None:
+            stages.add(Stage.POLICY, StageResult.stop(Reason.DEPENDENCY_FAILURE))
+            stages.dependency = Dependency.OPA
+            return
+        markers = fetched
     try:
         policy_input = build_policy_input(
             snapshot=snapshot,
@@ -777,6 +835,7 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
             mode=run.mode,
             operation=req.operation,
             high_risk_tools=config.high_risk_tools,
+            secret_markers=markers,
         )
     except InputError as exc:
         stages.add(Stage.POLICY, StageResult.stop(Reason.SCHEMA_ERROR, detail=str(exc)[:200]))
