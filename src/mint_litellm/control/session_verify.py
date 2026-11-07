@@ -75,7 +75,7 @@ def run(job: jobs.JobContext) -> None:
         reason = verdict(session, key, user, operator)
         if reason is None:
             if session["subject"] == "staff":
-                teams = console_sessions.teams_of(key or {}, user or {})
+                teams = console_sessions.teams_of(key or {})
                 console_sessions.set_teams(conn, instance, session["id_hash"], teams)
             console_sessions.mark_verified(conn, instance, session["id_hash"])
         else:

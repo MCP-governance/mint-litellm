@@ -148,13 +148,10 @@ def active_sessions(conn: psycopg.Connection, instance_id: str) -> list[dict]:
     )
 
 
-def teams_of(key_info: dict, user_info: dict) -> tuple[str, ...]:
-    """키 정보와 사용자 정보에 적힌 팀 식별자(문자열만)를 정렬해 돌려준다."""
-    found = {key_info.get("team_id")}
-    teams = user_info.get("teams")
-    if isinstance(teams, list):
-        found.update(teams)
-    return tuple(sorted(t for t in found if isinstance(t, str) and t))
+def teams_of(key_info: dict) -> tuple[str, ...]:
+    """키 정보의 team_id(문자열일 때만). 화면 입력이나 사용자 정보는 쓰지 않는다."""
+    team = key_info.get("team_id")
+    return (team,) if isinstance(team, str) and team else ()
 
 
 def set_teams(

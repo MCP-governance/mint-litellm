@@ -177,14 +177,14 @@ def test_a_staff_request_without_a_csrf_token_is_refused(sworld):
 # --- 소속 팀 ----------------------------------------------------------------------------------
 
 
-def test_teams_come_from_the_key_info_and_the_user_info_never_from_the_request(sworld):
+def test_teams_come_from_the_key_info_only_never_from_the_user_info_or_the_request(sworld):
     sworld.stub.own("sk-team", STAFFER, team_id="team-key")
     sworld.stub.routes[("/user/info", "sk-team", None)] = (
         200, {"user_id": STAFFER, "keys": [], "user_info": {
             "user_id": STAFFER, "user_role": "internal_user", "teams": ["team-user", 7]}})
     logged_in(sworld, "sk-team")
     teams = sworld.query("SELECT team_ids FROM mint.console_sessions")[0][0]
-    assert teams == ["team-key", "team-user"]
+    assert teams == ["team-key"]
 
 
 def test_a_key_without_a_team_has_an_empty_team_list(sworld):

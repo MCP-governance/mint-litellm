@@ -259,6 +259,9 @@ def decision_event(
     else:
         kind = EventKind.DECISION_EVALUATED
     principal = snapshot.principal
+    payload = snapshot.model_dump(mode="json")
+    if snapshot.cause is not None:
+        payload["cause"] = snapshot.cause
     return Event(
         instance_id=principal.instance_id,
         inserted_at=inserted_at or snapshot.evaluated_at,
@@ -271,7 +274,7 @@ def decision_event(
             "principal_id": principal.principal_id,
             "org_id": principal.org_id,
         },
-        payload=snapshot.model_dump(mode="json"),
+        payload=payload,
     )
 
 

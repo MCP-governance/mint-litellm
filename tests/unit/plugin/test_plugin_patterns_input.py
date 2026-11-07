@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import httpx
 from plugin_helpers import (
+    NOW,
     approval,
     evaluator,
     harness,
@@ -14,11 +15,14 @@ from plugin_helpers import (
 from mint_litellm.plugin.pipeline import evaluate_request
 from mint_litellm.plugin.policy.input import has_only_policy_fields
 from mint_litellm.plugin.policy.opa_client import OPAClient
+from mint_litellm.plugin.snapshot import ToolContractRow
 
 D = "."  # 점 표기 주소를 저장소 위생 시험이 막으므로 나눠 쓴다
 
 
-MANAGED = snapshot(server=server_row(contract_status="managed"))
+MANAGED_SERVER = server_row(contract_status="managed", last_observed_at=NOW)
+CONTRACTS = (ToolContractRow("c1", "server", "search", "none", 1),)
+MANAGED = snapshot(server=MANAGED_SERVER, tool_contracts=CONTRACTS)
 
 
 def decide(h, **hook):
@@ -28,7 +32,8 @@ def decide(h, **hook):
 def sent_patterns(tmp_path, arguments, *, conditions=None, egress=(), markers=None):
     calls = []
     snap = snapshot(
-        server=server_row(contract_status="managed"),
+        server=MANAGED_SERVER,
+        tool_contracts=CONTRACTS,
         approvals=(approval(conditions=conditions or {}),),
         egress_targets=tuple(egress),
     )
@@ -107,7 +112,8 @@ def test_missing_markers_stop_the_call_as_a_policy_engine_failure(tmp_path):
 def test_malformed_pattern_conditions_are_a_schema_error_not_a_crash(tmp_path):
     calls = []
     snap = snapshot(
-        server=server_row(contract_status="managed"),
+        server=MANAGED_SERVER,
+        tool_contracts=CONTRACTS,
         approvals=(approval(conditions={"allowed_hosts": "a.test"}),),
     )
     h = harness(tmp_path, snap, evaluate=evaluator(calls=calls))

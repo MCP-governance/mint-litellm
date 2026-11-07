@@ -44,6 +44,7 @@ from mint_litellm.control.services import allowlists as allowlist_service
 from mint_litellm.control.services import approvals as approval_service
 from mint_litellm.control.services import call_approvals as call_approval_service
 from mint_litellm.control.services import consents as consent_service
+from mint_litellm.control.services import contracts as contract_service
 from mint_litellm.control.services import denials as denial_service
 from mint_litellm.control.services import intakes as intake_service
 from mint_litellm.control.services import operators as operator_service
@@ -528,6 +529,20 @@ def _allowlist_add(run: Run) -> None:
     )
 
 
+def _contract(run: Run) -> None:
+    a = run.args
+    if a.command_name == "contract reapprove":
+        result = contract_service.reapprove(
+            run.context(), a.server_id, a.intake, a.tool_contract,
+            deployment_id=a.deployment_contract, expected_version=a.state_version,
+        )
+    else:
+        fn = contract_service.diff if a.command_name == "contract diff" else contract_service.show
+        result = fn(run.context(), a.server_id)
+    run.data.update(result)
+    run.say(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+
+
 def _json_arg(text: str) -> Any:
     try:
         return json.loads(text)
@@ -590,6 +605,9 @@ def _intake_decide(decision: str) -> Handler:
 
 
 HANDLERS: dict[str, Handler] = {
+    "contract show": _contract,
+    "contract diff": _contract,
+    "contract reapprove": _contract,
     "init": _init,
     "check": _check,
     "status": _status,
@@ -676,6 +694,14 @@ _ALERT_ID = _a("alert_id", help="경보 식별자")
 
 
 ARGUMENTS: dict[str, list[Any]] = {
+    "contract show": [_SERVER_ID],
+    "contract diff": [_SERVER_ID],
+    "contract reapprove": [
+        _SERVER_ID, _a("--intake", required=True, help="재검사 증거가 있는 신청 식별자"),
+        _a("--tool-contract", action="append", default=[], help="후보 도구 계약 식별자(반복 가능)"),
+        _a("--deployment-contract", help="후보 배포 계약 식별자"),
+        _a("--state-version", type=int, help="서버의 상태 버전"),
+    ],
     "alert list": [
         _a("--status", choices=["open", "acknowledged", "resolved"], help="상태로 거른다"),
         _a("--limit", type=int, default=100, help="최대 개수(기본 100)"),
