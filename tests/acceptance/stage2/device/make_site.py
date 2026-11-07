@@ -30,6 +30,7 @@ site["secret_env"] = {
 site["intake"].update(org_id="default", owner_user_id="acc-owner")
 for name, entry in site["servers"].items():
     entry["server_id"] = name
+    entry["url"] = f"http://cnt:8080/{name}/mcp"
     site["counters"][name] = "http://127.0.0.1:4350/" + name
 site["decision_logs"] = [["docker", "logs", "mints2-litellm-1"], ["docker", "logs", "mints2-litellm2-1"]]
 site["artifacts"]["export_dir"] = str(Path.home() / "mint-s2" / "export")

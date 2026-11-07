@@ -316,8 +316,11 @@ class Rig:
         def text(value):
             return "예" if value is True else str(value)
 
+        # 제어 평면 키에는 서버 URL이 응답되지 않으므로 계약 값에 쓸 URL을 함께 지정한다.
+        url = next((e["url"] for e in self.site["servers"].values()
+                    if e["server_id"] == server and e.get("url")), None)
         return self.cli(
-            "intake", "create", server, "--org", s["org_id"], "--purpose", s["purpose"],
+            "intake", "create", server, *(["--url", url] if url else []), "--org", s["org_id"], "--purpose", s["purpose"],
             "--data-grade", s["data_grade"],
             "--allowed-resources", json.dumps(s["allowed_resources"]),
             "--provider", s["provider"], "--owner", s["owner_user_id"],

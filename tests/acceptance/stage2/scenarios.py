@@ -613,6 +613,8 @@ def create_intake(server_id, url=None):
             "--revocation-record", text(r["revocation_record"]),
             "--audit-access-days", str(r["audit_access_days"]),
             "--data-return-terms", s["data_return_terms"]]
+    url = url or next((e["url"] for e in site()["servers"].values()
+                       if e["server_id"] == server_id and e.get("url")), None)
     if url:
         args += ["--url", url]
     return cli(*args)[1]["id"]
