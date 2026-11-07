@@ -1192,3 +1192,40 @@ def test_an_oauth2_submission_is_a_server_scope_only_with_a_confirmed_client_cre
     if expected == "indeterminate":
         assert by_check["oauth_issuer_allowlist"]["reason_code"] == "OAUTH2_FLOW_UNCONFIRMED"
         assert world.intake(intake_id)["status"] == "indeterminate"
+
+
+def test_a_lost_approval_response_still_closes_the_server_or_isolates_it(world, monkeypatch):
+    """승인이 반영된 뒤 응답이 유실돼도 닫기·reject 경로로 간다(사전 닫기가 실패한 경우 포함)."""
+    from mint_litellm.control.litellm_admin import LiteLLMError
+    from mint_litellm.control.litellm_control import LiteLLMControl
+
+    real = LiteLLMControl.approve_submission
+
+    def lost(self, server_id):
+        real(self, server_id)  # 승인은 반영된다
+        raise LiteLLMError("response lost")
+
+    monkeypatch.setattr(LiteLLMControl, "approve_submission", lost)
+    world.stub.close_works = False  # 사전 닫기도, 승인 뒤 닫기도 반영되지 않는다
+    intake_id = registry_first_with_all_keys(world)
+    writes = world.stub.writes()
+    assert ("PUT", "/v1/mcp/server/sub-1/approve") in writes
+    assert writes[-1] == ("PUT", "/v1/mcp/server/sub-1/reject")  # 열린 채 남지 않는다
+    assert world.stub.submissions[0]["approval_status"] == "rejected"
+    assert world.intake(intake_id)["status"] == "indeterminate"
+
+
+def test_a_lost_approval_response_with_a_working_close_ends_closed_and_active(world, monkeypatch):
+    from mint_litellm.control.litellm_admin import LiteLLMError
+    from mint_litellm.control.litellm_control import LiteLLMControl
+
+    real = LiteLLMControl.approve_submission
+
+    def lost(self, server_id):
+        real(self, server_id)
+        raise LiteLLMError("response lost")
+
+    monkeypatch.setattr(LiteLLMControl, "approve_submission", lost)
+    registry_first_with_all_keys(world)
+    assert world.stub.submissions[0]["allow_all_keys"] is False
+    assert world.stub.submissions[0]["approval_status"] == "active"

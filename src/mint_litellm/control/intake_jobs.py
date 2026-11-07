@@ -111,6 +111,16 @@ def _isolate_submission(job: JobContext, client: Any, server_id: str) -> None:
         _alert_divergence(job, server_id, "submission_isolation_failed", result=done)
 
 
+def _status_after_lost_approval(client: Any, server_id: str) -> str | None:
+    """승인 응답이 유실된 뒤 서버의 ``approval_status``. 다시 읽지 못하면 None(불확실)."""
+    try:
+        item = next((i for i in client.list_submissions() if i.get("server_id") == server_id),
+                    None) or client.get_server(server_id)
+    except LiteLLMError:
+        return None
+    return (item or {}).get("approval_status")
+
+
 def _gate(job: JobContext, client: Any, server_id: str, mode: str) -> str | None:
     """연결 검사 직전에 LiteLLM 서버 상태를 맞춘다. 사유 코드가 돌아오면 검사를 하지 않는다.
 
@@ -130,8 +140,17 @@ def _gate(job: JobContext, client: Any, server_id: str, mode: str) -> str | None
                 client.close_all_keys(server_id)
             except LiteLLMError:
                 pass
-            if client.approve_submission(server_id) == "refused":
+            lost: LiteLLMError | None = None
+            try:
+                approved = client.approve_submission(server_id)
+            except LiteLLMError as error:  # 응답이 유실됐어도 승인은 반영됐을 수 있다
+                approved, lost = "unknown", error
+            if approved == "refused":
                 return "APPROVE_REFUSED"
+            if lost is not None and _status_after_lost_approval(client, server_id) not in (
+                "active", None
+            ):
+                raise lost  # 반영되지 않았다: 재시도한다(닫기는 이미 시도했다)
         try:
             _close_all_keys(job, client, server_id)
         except AllKeysNotClosed:

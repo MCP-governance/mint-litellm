@@ -1,5 +1,7 @@
 """2단계 보강: 복원 요청의 외부 기준 결속과 부정 상태 행 내용 대조. 실 Postgres."""
 
+import uuid
+
 import pytest
 from ctl_fixtures import make_ctx
 
@@ -18,9 +20,9 @@ world = base.world  # 같은 시험 세계(픽스처)를 쓴다
 
 psycopg = pytest.importorskip("psycopg")
 
-from mint_litellm.control import exports, seal  # noqa: E402
+from mint_litellm.control import exports  # noqa: E402
 from mint_litellm.control.context import Operator  # noqa: E402
-from mint_litellm.control.db.connection import fetchone  # noqa: E402
+from mint_litellm.control.db.connection import fetchall, fetchone  # noqa: E402
 from mint_litellm.control.errors import ControlError  # noqa: E402
 from mint_litellm.control.services import restore  # noqa: E402
 from mint_litellm.restore import files, judge  # noqa: E402
@@ -192,47 +194,100 @@ def test_a_version_overtake_that_leaves_the_negative_state_is_a_mismatch(world):
     assert first.state == judge.HOLD and second.blocked
 
 
-def _lift_denial(conn, denial_id, sealed_release):
-    conn.execute("UPDATE mint.denials SET lifted_at = now(), lifted_by = 'root'"
-                 " WHERE id = %s", (denial_id,))
-    if sealed_release:
-        version = fetchone(conn, "SELECT state_version FROM mint.denials WHERE id = %s",
-                           (denial_id,))["state_version"]
-        conn.execute(
-            "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload)"
-            " VALUES (gen_random_uuid(), %s, 'denial_lifted', %s, 'root', '{}')",
-            (INSTANCE, f"denial:{denial_id}:{version}:denial_lifted"))
-        old = seal.SETTLE_SECONDS
-        seal.SETTLE_SECONDS = -1
-        try:
-            seal.seal_once(conn, INSTANCE)
-        finally:
-            seal.SETTLE_SECONDS = old
+def _release_event(conn, kind, entity, version):
+    conn.execute(
+        "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload)"
+        " VALUES (gen_random_uuid(), %s, %s, %s, 'root', '{}')",
+        (INSTANCE, kind, f"{kind.split('_')[0]}:{entity}:{version}:{kind}"))
 
 
-@pytest.mark.parametrize("sealed_release", [True, False])
-def test_a_lifted_denial_needs_a_sealed_release_event_after_the_file(
-    world, sealed_release
-):
+def _denial_world(world):
     with psycopg.connect(world["live"], autocommit=True) as conn:
         denial = fetchone(conn, "INSERT INTO mint.denials (id, instance_id, org_id, scope_type,"
                           " scope_id, reason, created_by) VALUES (gen_random_uuid(), %s, 'acme',"
                           " 'org', 'acme', '유출 의심', 'root') RETURNING id", (INSTANCE,))["id"]
-        old = seal.SETTLE_SECONDS
-        seal.SETTLE_SECONDS = -1
-        try:
-            seal.seal_once(conn, INSTANCE)
-        finally:
-            seal.SETTLE_SECONDS = old
         exports.write_export(conn, INSTANCE, world["settings"], "negative_state")
         exports.write_export(conn, INSTANCE, world["settings"], "checkpoint")
         assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK
-        _lift_denial(conn, denial, sealed_release)
-    first, second = _verdicts(world["live"], world["settings"])
-    if sealed_release:
+        conn.execute("UPDATE mint.denials SET lifted_at = now(), lifted_by = 'root'"
+                     " WHERE id = %s", (denial,))
+        version = fetchone(conn, "SELECT state_version FROM mint.denials WHERE id = %s",
+                           (denial,))["state_version"]
+    return denial, version
+
+
+@pytest.mark.parametrize("case", ["unsealed_event", "no_event", "old_version", "other_id"])
+def test_a_lifted_denial_needs_a_release_event_bound_to_its_id_and_version(world, case):
+    denial, version = _denial_world(world)
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        if case == "unsealed_event":
+            _release_event(conn, "denial_lifted", denial, version)
+        elif case == "old_version":
+            _release_event(conn, "denial_lifted", denial, 1)  # 파일 판본 이전의 사건
+        elif case == "other_id":
+            _release_event(conn, "denial_lifted", uuid.uuid4(), version)
+    first, second = _verdicts(world["live"], world["settings"])  # 두 판정기: 재시작해도 같다
+    if case == "unsealed_event":  # 봉인 전이어도 재시작 직후 보류가 남지 않는다
         assert first.state == judge.OK and second.state == judge.OK
     else:
         assert first.state == judge.HOLD and second.blocked
+
+
+@pytest.mark.parametrize("key", ["uuid", "server_id"])
+def test_a_resumed_server_is_matched_by_the_servers_uuid_in_the_event_key(world, key):
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256, transport,"
+            " auth_type, registered_by) VALUES (gen_random_uuid(), %s, 'srv-1',"
+            " 'awaiting_approval', repeat('a', 64), 'http', 'none', 'x')", (INSTANCE,))
+        conn.execute("UPDATE mint.servers SET status = 'approved'")
+        conn.execute("UPDATE mint.servers SET status = 'suspended'")
+        exports.write_export(conn, INSTANCE, world["settings"], "negative_state")
+        exports.write_export(conn, INSTANCE, world["settings"], "checkpoint")
+        assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK
+        conn.execute("UPDATE mint.servers SET status = 'approved'")
+        row = fetchone(conn, "SELECT id, state_version FROM mint.servers")
+        _release_event(conn, "server_resumed", row["id"] if key == "uuid" else "srv-1",
+                       row["state_version"])
+    first, second = _verdicts(world["live"], world["settings"])
+    if key == "uuid":
+        assert first.state == judge.OK and second.state == judge.OK
+    else:
+        assert first.state == judge.HOLD and second.blocked
+
+
+def test_an_old_archived_request_is_rejected_after_another_restore_finished(
+    world, monkeypatch
+):
+    """A 요청이 보관하다 중단 -> B 복원 완료 -> A 재실행은 보관본 해시가 맞아도 거부한다."""
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)  # A
+    settings = world["settings"]
+
+    def dying(*args, **kwargs):
+        raise OSError("killed")
+
+    monkeypatch.setattr(exports, "write_export", dying)
+    run_worker(world)  # A: 보관은 끝났고 새 파일은 없다
+    monkeypatch.undo()
+    add_admins(world["restored"])
+    with psycopg.connect(world["restored"]) as conn:
+        restore.accept_stale(make_ctx(conn), settings, "B 복원",
+                             Operator("second", "admin", "u2"))
+        conn.commit()
+    assert run_worker(world).state == judge.OK  # B가 끝난다(A 작업은 재시도 대기)
+    latest = files.latest_path(settings.export_dir, INSTANCE)
+    after_b = latest.read_bytes()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'"
+                     " WHERE status = 'pending'")
+    run_worker(world)
+    assert latest.read_bytes() == after_b  # 최신 증거를 다시 덮지 않았다
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        statuses = [r["status"] for r in fetchall(
+            conn, "SELECT status FROM mint.restore_requests ORDER BY created_at")]
+        assert statuses == ["rejected", "published"]
 
 
 def test_attest_refuses_a_content_difference_without_a_second_admin_and_accepts_with_two(

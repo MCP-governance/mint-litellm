@@ -56,3 +56,54 @@ END $$;
 -- 행 내용 대조 함수는 판정을 하는 역할만 실행한다(직원 로그인은 공개 직원 함수만 실행한다).
 REVOKE ALL ON FUNCTION mint.row_json(anyelement) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION mint.row_json(anyelement) TO mint_plugin, mint_control, mint_worker;
+
+-- 직원 쓰기의 소속 팀은 잠근 세션 행의 team_ids만 쓴다(요청이 읽은 값이나 연결 설정은 쓰지 않는다).
+-- 재확인이 세션 팀을 바꾸면 그 뒤의 쓰기는 새 팀으로 판정된다.
+CREATE OR REPLACE FUNCTION mint.staff_check_target(p_org_id text, p_server_id text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, mint, pg_temp AS $$
+DECLARE
+    uid text := mint.staff_user();
+    iid text := mint.staff_instance();
+    s mint.console_sessions := mint.staff_active_session();
+    teams jsonb := s.team_ids;
+    member_orgs text[];
+BEGIN
+    IF teams IS NULL OR jsonb_typeof(teams) <> 'array'
+       OR EXISTS (SELECT FROM jsonb_array_elements(teams) v WHERE jsonb_typeof(v) <> 'string') THEN
+        RAISE EXCEPTION 'verified staff teams are not set'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM 1 FROM mint.orgs WHERE instance_id = iid AND org_id = p_org_id
+        AND status = 'active' FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no active organization' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    -- 사용자 바인딩이 있으면 팀·기본 조직으로 넓히지 않는다.
+    SELECT array_agg(b.org_id) INTO member_orgs FROM (
+        SELECT org_id FROM mint.org_bindings
+        WHERE instance_id = iid AND subject_type = 'user' AND subject_id = uid FOR SHARE
+    ) b;
+    IF member_orgs IS NULL THEN
+        SELECT array_agg(b.org_id) INTO member_orgs FROM (
+            SELECT org_id FROM mint.org_bindings WHERE instance_id = iid AND subject_type = 'team'
+              AND subject_id IN (SELECT jsonb_array_elements_text(teams)) FOR SHARE
+        ) b;
+    END IF;
+    IF member_orgs IS NULL THEN
+        SELECT ARRAY[default_org_id::text] INTO member_orgs FROM mint.settings
+        WHERE instance_id = iid FOR SHARE;
+    END IF;
+    IF coalesce(p_org_id = ANY(member_orgs), false) IS NOT TRUE THEN
+        RAISE EXCEPTION 'not a member of the organization' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM 1 FROM mint.servers WHERE instance_id = iid AND server_id = p_server_id
+        AND status = 'approved' FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'server is not approved' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM 1 FROM mint.usage_relations WHERE instance_id = iid AND org_id = p_org_id
+        AND server_id = p_server_id AND status = 'active' FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no active usage relation' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+END $$;

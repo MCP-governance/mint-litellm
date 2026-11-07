@@ -66,11 +66,15 @@ def verify_pin(desired: dict, response: dict) -> str:
 
 
 def _requester_valid(conn, instance_id: str, saved: dict) -> bool:
-    """재승인을 요청한 운영자가 지금도 유효한 승인자인가(삭제·만료·역할 변경·사용자 결속 변경)."""
+    """재승인을 요청한 운영자가 지금도 유효한 승인자인가(삭제·만료·역할 변경·사용자 결속 변경).
+
+    운영자 행을 ``FOR SHARE``로 잠가 읽는다: 호출한 트랜잭션이 끝날 때까지 그 승인자의 권한을
+    철회하는 변경이 기다린다(확인 뒤 철회된 승인자의 승인본 교체가 커밋되지 않는다)."""
     return fetchone(
         conn,
         "SELECT 1 AS ok FROM mint.operators WHERE instance_id=%s AND name=%s AND user_id=%s"
-        " AND role IN ('admin','approver') AND (expires_at IS NULL OR expires_at > now())",
+        " AND role IN ('admin','approver') AND (expires_at IS NULL OR expires_at > now())"
+        " FOR SHARE",
         (instance_id, saved["requested_by"], saved["requested_user_id"]),
     ) is not None
 

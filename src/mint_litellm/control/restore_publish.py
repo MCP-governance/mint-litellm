@@ -12,6 +12,7 @@ DB에서 ``pending``으로 되살아나도 다시 게시하지 않는다(최신 
 """
 
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,14 +52,39 @@ def archive(settings, instance_id: str, request_id: str) -> None:
     (dest / _MOVED).write_text(files.now(), encoding="utf-8")
 
 
+def _done_at(path: Path) -> datetime | None:
+    try:
+        return datetime.strptime(path.read_text(encoding="utf-8").strip(), "%Y-%m-%dT%H:%M:%SZ"
+                                 ).replace(tzinfo=UTC)
+    except (OSError, ValueError):
+        return datetime.max.replace(tzinfo=UTC)  # 읽을 수 없는 표지는 가장 나중으로 본다(거부)
+
+
+def _later_restore_done(settings, instance_id: str, request: dict[str, Any]) -> bool:
+    """이 요청이 만들어진 뒤에 다른 복원이 게시를 끝냈는가(``restored/*/.done``)."""
+    root = settings.export_dir / instance_id / "restored"
+    created = request["created_at"].astimezone(UTC).replace(microsecond=0)
+    mine = str(request["id"])
+    for done in root.glob(f"*/{_DONE}") if root.is_dir() else ():
+        if done.parent.name != mine and _done_at(done) >= created:
+            return True
+    return False
+
+
 def _bound_ok(settings, instance_id: str, request: dict[str, Any]) -> bool:
-    """게시 직전의 ``latest.json``(보관했다면 보관본)이 요청에 결속한 해시와 같은가."""
+    """게시 직전의 ``latest.json``이 요청에 결속한 해시와 같은가.
+
+    보관을 시작한 요청은 보관본이 결속값과 같아야 하고(파일이 없던 요청은 보관 뒤 새 파일이 생기는
+    것이 정상), 그 사이에 다른 복원이 끝났다면 거부한다(옛 요청이 최신 증거를 덮지 못한다).
+    """
+    if _later_restore_done(settings, instance_id, request):
+        return False
     dest = _dest(settings, instance_id, str(request["id"]))
     kept = dest / "latest.json"
     if kept.exists():
         current = files.file_sha256(kept)
     elif (dest / _MOVED).exists():
-        current = "absent"  # 파일이 없던 요청: 보관 뒤에는 새 파일이 생기는 것이 정상이다
+        current = "absent"
     else:
         current = files.file_sha256(files.latest_path(settings.export_dir, instance_id))
     return current == request["bound_latest"]

@@ -49,7 +49,7 @@ class StaffContext:
 
 @contextmanager
 def _staff_transaction(
-    sctx: StaffContext, session_id_hash: str = "", team_ids: Sequence[str] | None = None,
+    sctx: StaffContext, session_id_hash: str = "",
 ) -> Iterator[psycopg.Connection]:
     """직원 함수가 읽는 설정을 이 트랜잭션에만 걸고 연결을 내준다."""
     # 바깥 트랜잭션 안이면 세이브포인트가 되어 설정이 바깥 끝까지 남는다. 유휴 연결만 받는다.
@@ -60,11 +60,9 @@ def _staff_transaction(
             "SELECT set_config('mint.staff_user_id', %s, true),"
             " set_config('mint.staff_instance_id', %s, true),"
             " set_config('mint.staff_session_id_hash', %s, true),"
-            " set_config('mint.staff_team_ids', %s, true),"
             " set_config('mint.staff_consent_max_days', %s, true),"
             " set_config('mint.staff_verify_window_seconds', %s, true)",
             (sctx.user_id, sctx.instance_id, session_id_hash,
-             json.dumps(list(sctx.team_ids if team_ids is None else team_ids)),
              str(sctx.consent_max_days), str(sctx.verify_window_seconds)),
         )
         yield sctx.staff
@@ -278,7 +276,7 @@ def grant_consent(
     _active_session(sctx, session_id_hash)
     _check_consent_target(sctx, org_id, server_id, team_ids)
     consent_id = new_uuid7()
-    with _staff_transaction(sctx, session_id_hash, team_ids) as conn:
+    with _staff_transaction(sctx, session_id_hash) as conn:
         conn.execute(
             "SELECT mint.staff_grant_consent(%s, %s, %s, %s, %s, %s, %s)",
             (consent_id, org_id, server_id, purpose.strip(), data_scope, text_version, valid_until),
