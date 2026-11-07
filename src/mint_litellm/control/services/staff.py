@@ -99,8 +99,9 @@ def start_session(
         raise ControlError("세션 만료 시각이 올바르지 않습니다(현재 < 유휴 만료 <= 절대 만료).")
     with _staff_transaction(sctx) as conn:
         conn.execute(
-            "SELECT mint.staff_start_session(%s, %s, %s, %s)",
-            (session_id_hash, key_token, idle_expiry, absolute_expiry),
+            "SELECT mint.staff_start_session(%s, %s, %s, %s, %s::jsonb)",
+            (session_id_hash, key_token, idle_expiry, absolute_expiry,
+             json.dumps(list(sctx.team_ids))),
         )
 
 
@@ -325,16 +326,6 @@ def find_session(control: psycopg.Connection, instance_id: str, id_hash: str) ->
             " AND revoked_at IS NULL AND idle_expiry > now() AND absolute_expiry > now()",
             (instance_id, id_hash),
         )
-
-
-def attach_teams(
-    control: psycopg.Connection, instance_id: str, id_hash: str, team_ids: Sequence[str]
-) -> None:
-    """로그인 직후 세션에 소속 팀을 적는다(본인 키 정보에서 읽은 값)."""
-    from mint_litellm.control.services import console_sessions
-
-    with control.transaction():
-        console_sessions.set_teams(control, instance_id, id_hash, tuple(team_ids))
 
 
 def requires_separate_key(sctx: StaffContext) -> bool:

@@ -154,7 +154,6 @@ def login_submit(
         now + timedelta(seconds=config.stage2.session_idle_seconds),
         now + timedelta(seconds=config.stage2.session_absolute_seconds),
     )
-    staff.attach_teams(control, config.instance_id, id_hash, identity.team_ids)
     response = RedirectResponse("/staff", status_code=303)
     response.set_cookie(STAFF_COOKIE, session_id, **COOKIE_OPTIONS)
     return response

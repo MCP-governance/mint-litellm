@@ -555,3 +555,27 @@ def test_a_server_without_any_approval_for_the_user_is_not_listed(sworld):
     page = logged_in(sworld).get("/staff")
     assert "쓸 수 있는 서버가 없습니다" in page.text
     assert "srv-ok" in logged_in(sworld).get("/staff/consents").text
+
+
+def test_revoking_a_users_operator_sessions_leaves_their_staff_session_alone(sworld):
+    from mint_litellm.control.services import console_sessions
+
+    sworld.stub.own("sk-both", "human-1")
+    sworld.stub.control("sk-both", "human-1")
+    staff_client_ = logged_in(sworld, "sk-both")
+    admin = sworld.session_client("admin")
+    with psycopg.connect(sworld.admin_url) as conn:
+        count = console_sessions.revoke_user_sessions(
+            conn, INSTANCE, "human-1", actor="root", reason="operator_changed")
+    assert count == 1
+    assert admin.get("/").status_code == 303
+    assert staff_client_.get("/staff").status_code == 200
+    ended = sworld.query("SELECT payload->>'subject' FROM mint.events"
+                         " WHERE kind = 'console_session_ended'")
+    assert ended == [("admin",)]
+
+
+def test_a_staff_session_starts_with_its_team_list_in_one_statement(sworld):
+    sworld.stub.own("sk-team2", STAFFER, team_id="team-z")
+    logged_in(sworld, "sk-team2")
+    assert sworld.query("SELECT team_ids FROM mint.console_sessions") == [(["team-z"],)]

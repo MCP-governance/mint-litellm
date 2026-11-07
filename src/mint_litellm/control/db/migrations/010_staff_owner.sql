@@ -33,7 +33,7 @@ GRANT UPDATE (settings_version) ON mint.settings TO mint_staff_owner;
 -- 직원 세션
 GRANT SELECT ON mint.console_sessions TO mint_staff_owner;
 GRANT INSERT (id_hash, instance_id, subject, user_id, key_token, role, idle_expiry,
-              absolute_expiry) ON mint.console_sessions TO mint_staff_owner;
+              absolute_expiry, team_ids) ON mint.console_sessions TO mint_staff_owner;
 GRANT UPDATE (last_seen_at, idle_expiry, revoked_at) ON mint.console_sessions
     TO mint_staff_owner;
 
@@ -68,6 +68,36 @@ CREATE POLICY console_sessions_staff ON mint.console_sessions TO mint_staff_owne
     WITH CHECK (subject = 'staff'
                 AND instance_id = nullif(current_setting('mint.staff_instance_id', true), '')
                 AND user_id = nullif(current_setting('mint.staff_user_id', true), ''));
+
+-- 세션 시작은 소속 팀을 같은 문장에서 함께 적는다(팀 없이 만들어진 세션이 남지 않는다).
+DROP FUNCTION mint.staff_start_session(text, text, timestamptz, timestamptz);
+CREATE FUNCTION mint.staff_start_session(
+    p_id_hash text, p_key_token text, p_idle_expiry timestamptz, p_absolute_expiry timestamptz,
+    p_team_ids jsonb
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, mint, pg_temp AS $$
+DECLARE uid text := mint.staff_user();
+BEGIN
+    IF p_idle_expiry IS NULL OR p_absolute_expiry IS NULL
+       OR p_idle_expiry <= clock_timestamp() OR p_idle_expiry > p_absolute_expiry THEN
+        RAISE EXCEPTION 'invalid session expiry' USING ERRCODE = 'check_violation';
+    END IF;
+    IF p_team_ids IS NULL OR jsonb_typeof(p_team_ids) <> 'array'
+       OR EXISTS (SELECT FROM jsonb_array_elements(p_team_ids) v WHERE jsonb_typeof(v) <> 'string')
+    THEN
+        RAISE EXCEPTION 'invalid team list' USING ERRCODE = 'check_violation';
+    END IF;
+    INSERT INTO mint.console_sessions (id_hash, instance_id, subject, user_id, key_token, role,
+                                       idle_expiry, absolute_expiry, team_ids)
+    VALUES (p_id_hash, mint.staff_instance(), 'staff', uid, p_key_token, 'staff',
+            p_idle_expiry, p_absolute_expiry, p_team_ids);
+    PERFORM mint.staff_event('console_session_started', 'console_session', p_id_hash, 1, uid,
+                             jsonb_build_object('subject', 'staff'));
+END $$;
+REVOKE ALL ON FUNCTION mint.staff_start_session(text, text, timestamptz, timestamptz, jsonb)
+    FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION mint.staff_start_session(text, text, timestamptz, timestamptz, jsonb)
+    TO mint_staff;
 
 -- 직원 함수(보조 함수 포함)의 소유자를 바꾼다. 이름이 staff_로 시작하는 mint 함수 전부이다.
 -- 슈퍼유저가 아닌 마이그레이션 실행자는 새 소유자가 스키마의 CREATE 권한을 가질 때만 소유자를

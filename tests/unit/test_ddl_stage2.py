@@ -1107,7 +1107,7 @@ def test_staff_sessions_start_and_end_with_events_and_stay_personal(db, base):
     as_role(db, "mint_staff")
     staff_context(db)
     sid = "a" * 64
-    staff_call(db, "SELECT mint.staff_start_session(%s, 'tok', %s, %s)", sid, far, far)
+    staff_call(db, "SELECT mint.staff_start_session(%s, 'tok', %s, %s, '[]'::jsonb)", sid, far, far)
     staff_call(db, "SELECT mint.staff_touch_session(%s, %s)", sid, far)
     staff_context(db, user="u2")
     with fails(db, errors.InsufficientPrivilege):
