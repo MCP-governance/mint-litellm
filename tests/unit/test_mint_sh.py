@@ -83,3 +83,37 @@ def test_missing_env_file_and_unknown_commands_fail_clearly(tmp_path):
     unknown = subprocess.run([BASH, "mint.sh", "restore"], cwd=deploy, capture_output=True,
                              text=True, encoding="utf-8")
     assert unknown.returncode != 0 and "restore" not in unknown.stdout
+
+
+def test_first_run_generates_export_key_and_worker_passwords_once_with_private_env(tmp_path):
+    result, env_file, _ = run(tmp_path, "POSTGRES_PASSWORD=x\nMINT_STAFF_DB_PASSWORD=keep-me\n",
+                              "cli", "status")
+    assert result.returncode == 0, result.stderr
+    values = dict(ln.split("=", 1) for ln in env_file.read_text(encoding="utf-8").splitlines())
+    import base64
+    key = values["MINT_EXPORT_HMAC_KEY"]
+    assert len(base64.urlsafe_b64decode(key + "=" * (-len(key) % 4))) >= 32
+    assert len(values["MINT_WORKER_DB_PASSWORD"]) >= 32
+    assert values["MINT_STAFF_DB_PASSWORD"] == "keep-me"
+    if os.name != "nt":
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    run(tmp_path, env_file.read_text(encoding="utf-8"), "cli", "status")
+    again = dict(ln.split("=", 1) for ln in env_file.read_text(encoding="utf-8").splitlines())
+    assert again["MINT_EXPORT_HMAC_KEY"] == key
+
+
+def test_up_hands_worker_and_staff_passwords_to_init_and_starts_the_worker(tmp_path):
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy" / "litellm.config.example.yaml").write_text("{}\n", encoding="utf-8")
+    result, _, _ = run(tmp_path, "POSTGRES_PASSWORD=x\n", "up")
+    assert result.returncode == 0, result.stderr
+    log = (tmp_path / "docker.log").read_text(encoding="utf-8")
+    assert "MINT_WORKER_DB_PASSWORD=" in log and "MINT_STAFF_DB_PASSWORD=" in log
+    assert "--profile worker up -d worker" in log
+
+
+def test_compose_refuses_to_start_litellm_without_an_export_key():
+    text = (SCRIPT.parent / "compose.yaml").read_text(encoding="utf-8")
+    litellm = text.split("\n  litellm:\n", 1)[1].split("\n  control:\n", 1)[0]
+    assert "MINT_EXPORT_HMAC_KEY: ${MINT_EXPORT_HMAC_KEY:?" in litellm
+    assert "export:/var/lib/mint/export:ro" in litellm
