@@ -34,9 +34,10 @@ docker volume inspect "${COMPOSE_PROJECT_NAME}_export" >/dev/null 2>&1 ||   dock
 ./mint.sh up
 # mint.sh가 올린 LiteLLM의 최초 마이그레이션이 끝나기 전에 오버레이로 다시 만들면 마이그레이션이 끊긴다.
 wait_ready "${MINT_LITELLM_PORT:-4300}" || wait_ready 4300
-# mint.sh가 띄운 작업 실행기는 루트라 루트 소유 파일을 남긴다. 멈추고 비운 뒤 오버레이(비루트)로 다시 올린다.
+# mint.sh가 띄운 작업 실행기는 루트라 루트 소유 파일을 남긴다. 지우면 되돌림 탐지가 막으므로(쓰기 기록이 있는데
+# 파일이 없음) 소유자만 바꾸고 오버레이(비루트) 작업 실행기로 다시 올린다.
 "${C[@]}" --profile worker stop worker
-docker run --rm -v "${COMPOSE_PROJECT_NAME}_export:/x" --entrypoint sh mint-litellm:local -c 'rm -rf /x/* /x/.[!.]*' || true
+docker run --rm -v "${COMPOSE_PROJECT_NAME}_export:/x" --entrypoint sh mint-litellm:local -c 'chown -R 1000:1000 /x' || true
 "${C[@]}" up -d cnt fixture pgproxy
 set -a; . ./.env; set +a
 "${C[@]}" exec -T postgres psql -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='litellm_plain'" | grep -q 1 \
