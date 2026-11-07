@@ -60,9 +60,28 @@ def build_conditions(
     allowed_hosts: list[str] | None = None,
     allowed_paths: list[str] | None = None,
     allowed_arg_keys: list[str] | None = None,
+    confirm_tools: list[str] | None = None,
+    confirm_purpose: str | None = None,
+    confirm_fields: list[str] | None = None,
 ) -> dict:
     """정책이 읽는 승인 조건. 지정하지 않은 조건은 키를 넣지 않는다."""
     conditions: dict = {}
+    if confirm_tools:
+        purpose = (confirm_purpose or "").strip()
+        if not 1 <= len(purpose) <= 128:
+            raise ControlError(
+                "--confirm-tool에는 1자 이상 128자 이하의 --confirm-purpose가 필요합니다."
+            )
+        fields = sorted({f.strip() for f in confirm_fields or []})
+        if not all(fields):
+            raise ControlError("--confirm-field 값이 비어 있습니다.")
+        conditions["require_user_confirmation"] = {
+            "tools": sorted({t.strip() for t in confirm_tools}),
+            "purpose": purpose,
+            "display_fields": fields,
+        }
+    elif confirm_purpose is not None or confirm_fields is not None:
+        raise ControlError("--confirm-purpose·--confirm-field는 --confirm-tool과 함께 써야 합니다.")
     if high_risk_tools:
         conditions["high_risk_tools"] = sorted(set(high_risk_tools))
     if business_hours and not business_hours_only:
