@@ -15,7 +15,9 @@ services:
     environment:
       <<: *acc-env
       MINT_LOG_LEVEL: DEBUG
+  # 이미지는 루트로 동작한다. 어댑터(export_unwritable)와 호스트 쪽 파일 정리가 맞도록 시험에서만 비루트로 둔다.
   worker:
+    user: "1000:1000"
     environment:
       <<: *acc-env
   console:
