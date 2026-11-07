@@ -345,7 +345,8 @@ def _finalize_plan(ctx: JobContext, client: LiteLLMSync, server_id: str) -> None
     key = f"sync_divergence:reapproval:{server_id}"
     ctx.checkpoint()
     try:
-        finalize_reapproval(ctx.conn, ctx.instance_id, server_id, client)
+        finalize_reapproval(
+            ctx.conn, ctx.instance_id, server_id, client, guard=ctx.external_write)
     except AdminError as error:
         if "진행 중" in error.message:
             raise  # 다른 실행기가 같은 서버를 확정하는 중이다. 재시도로 푼다.

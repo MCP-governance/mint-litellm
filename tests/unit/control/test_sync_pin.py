@@ -356,6 +356,10 @@ def test_the_activation_rechecks_the_pin_inside_its_transaction(
 
 
 def reapproval_world(admin, fake, tools):
+    admin.execute(  # 재승인을 요청한 승인자는 확정 때도 유효해야 한다
+        "INSERT INTO mint.operators (instance_id, name, role, token_hash, user_id)"
+        " VALUES (%s, 'reviewer', 'approver', repeat('c', 64), 'reviewer')"
+        " ON CONFLICT DO NOTHING", (INSTANCE,))
     add_server(admin, status="approved")
     admin.execute("UPDATE mint.servers SET contract_status = 'managed'")
     fake.add_server("srv-1", tools=tools)
@@ -471,3 +475,18 @@ def test_the_deployment_candidate_is_recorded_through_the_worker_login(url, admi
             contracts.request_deployment(ctx, "srv-1", str(ids[1]))
     assert fetchone(admin, "SELECT deployment_drift FROM mint.servers")["deployment_drift"] is True
     assert len(events(admin, "deployment_drift_detected")) == 1
+
+
+def test_a_reapproval_whose_requester_was_removed_is_cancelled_and_keeps_the_block(
+    url, admin, fake, worker
+):
+    old, candidate, iid = reapproval_world(admin, fake, {"read": NEW})
+    request_reapproval(url, candidate, iid)
+    admin.execute("DELETE FROM mint.operators WHERE name = 'reviewer'")
+    drain(worker)
+    status = {str(i): st for i, st in admin.execute(
+        "SELECT id, status FROM mint.tool_contracts").fetchall()}
+    assert status == {old: "approved", candidate: "candidate"}
+    assert fetchone(admin, "SELECT status FROM mint.contract_reapproval_plans"
+                    )["status"] == "cancelled"
+    assert fetchone(admin, "SELECT deployment_drift FROM mint.servers")["deployment_drift"] is True
