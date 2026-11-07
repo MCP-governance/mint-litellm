@@ -52,6 +52,14 @@
 | `mint-litellm alert list` | 모든 역할 | 경보를 상태(`--status`)별로 조회한다. | - | - |
 | `mint-litellm alert ack` | `admin` | 열린 경보(`alert_id`)를 확인 처리한다. 확인한 운영자 이름이 남는다. | - | `alert_acknowledged` |
 | `mint-litellm alert resolve` | `admin` | 경보(`alert_id`)를 해결됨으로 닫는다. 같은 원인이 다시 생기면 새 경보가 열린다. | - | `alert_resolved` |
+| `mint-litellm intake list` | 모든 역할 | 수용검증 신청을 상태(`--status`)별로 조회한다. | - | - |
+| `mint-litellm intake show` | 모든 역할 | 신청 한 건과 검사 결과, 도구 계약 후보를 보인다. | - | - |
+| `mint-litellm intake create` | `admin` | 서버의 수용검증 신청을 만든다(아래 「수용검증 신청」). | `/v1/mcp/server/{server_id}` | `intake_received` |
+| `mint-litellm intake recheck` | `admin` | 검사를 다시 한다. | - | - |
+| `mint-litellm intake assign` | `admin` | 신청자가 비어 있는 제출 신청에 사람 사용자를 신청자로 지정한다. | `/user/info` | `intake_requester_assigned` |
+| `mint-litellm intake approve` | `admin`, `approver` | 모든 검사를 통과한 신청을 승인한다. | - | `intake_decided`, `contract_approved` |
+| `mint-litellm intake reject` | `admin`, `approver` | 신청을 거절한다. | - | `intake_decided` |
+| `mint-litellm intake except` | `admin`, `approver` | 판별 불가가 있는 신청을 예외 승인한다. | - | `intake_decided`, `contract_approved` |
 
 ## 정책 활성화 실패와 복원
 
@@ -81,7 +89,7 @@
 
 - 주기가 된 일정(`schedules`)을 한 주기에 한 번 작업으로 등록하고, 임대가 만료된 `running` 작업을 `pending`으로 되돌리고(시도 한 번으로 센다), 대기 작업을 하나씩 임대해 실행한다. 실행 중에는 임대(`MINT_WORKER_LEASE_SECONDS`, 기본 60초)를 1/3마다 연장하고, 연장에 실패하면 그 작업의 외부 호출을 멈춘다.
 - 실패한 작업은 `min(2^시도 횟수 × 5초, 10분)` 뒤에 다시 시도하고, 시도 8번째 실패에서 `failed`가 되며 경보 `job_failed`(같은 종류·대상은 한 건으로 묶고 횟수만 올린다)를 남긴다. 오류 메시지는 저장하지 않고 오류 코드만 남긴다.
-- 이 판본에서 처리기가 있는 작업은 `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시), `session_verify`(콘솔 세션 재확인), `seal`(1분마다 미봉인 사건을 해시 연쇄로 봉인), `export_negative_state`(부정 상태 전이가 커밋될 때 등록), `export_checkpoint`(10분마다, 기동 직후 한 번)이다. 나머지 종류는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
+- 이 판본에서 처리기가 있는 작업은 `submission_poll`(`MINT_SUBMISSION_POLL_SECONDS`마다 LiteLLM 제출을 신청으로 만든다), `intake_run`(수용검증), `session_verify`(콘솔 세션 재확인), `evidence_expiry_scan`(1시간마다 증거 만료 7일 전 경보와 재검사 등록), `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시), `seal`(1분마다 미봉인 사건을 해시 연쇄로 봉인), `export_negative_state`(부정 상태 전이가 커밋될 때 등록), `export_checkpoint`(10분마다, 기동 직후 한 번)이다. 나머지 종류는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
 - 60초마다 내보내기 파일과 DB를 대조해 되돌림을 판정한다. 처음 어긋나면 봉인·내보내기를 보류하고, 두 번 연속 어긋나거나 파일이 없거나 검증되지 않으면 외부 쓰기를 모두 멈춘다(`restore_blocked`로 대기, 시도 횟수 불변). 외부 쓰기 직전마다 같은 판정과 임대 유효성을 다시 확인한다.
 - SIGTERM·SIGINT를 받으면 실행 중인 작업에 취소를 알린다. 작업이 그대로 끝나면 완료로 기록하고, 취소를 받아 멈추면 시도 횟수를 올리지 않고 임대를 놓은 뒤 종료한다.
 
@@ -106,6 +114,20 @@
 봉인 해시·HMAC·내용 해시가 쓰는 정규 JSON은 `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`를 UTF-8로 인코딩한 것이며(코드의 `restore.files.canonical_json` 한 곳), 실수 값은 거부한다. 서명 입력은 `hmac` 필드를 뺀 본문 전체(`key_id` 포함), 배열은 저장 순서이며 시각은 UTC ISO 8601 초 단위 `Z`다. 허용 자료형은 문자열·정수·참거짓·null·배열·객체뿐이고 사건 본문에도 실수를 넣을 수 없다. 시험 벡터는 `tests/unit/control/test_export.py`에 있다.
 
 HMAC 키를 교체하려면 새 키를 `MINT_EXPORT_HMAC_KEY`, 옛 키를 `MINT_EXPORT_HMAC_KEY_PREVIOUS`에 두고 다시 기동한다. 작업 실행기가 새 키로 체크포인트를 쓰고 최신 부정 상태 파일을 다시 서명하면 `export status`가 옛 키를 빼도 된다고 알려 준다.
+
+## 수용검증 신청 `mint-litellm intake`
+
+`intake` 명령은 신청 → 검사 → 승인을 다룬다. 검사는 작업 실행기가 한다(`intake_run`). 제어 평면 키(`MINT_LITELLM_KEY`)는 `allowed_routes`에 `/key/update`, `/team/update`, `/mcp-rest/test/connection`, `/mcp-rest/test/tools/list`를 더해야 한다.
+
+- `mint-litellm intake list [--status <상태>]`, `mint-litellm intake show <신청>`: 신청, 검사 결과(검사마다 최근 시도), 도구 계약 후보를 본다.
+- `mint-litellm intake create <server_id> --purpose … --data-grade … --allowed-resources <JSON> --provider … --owner … --credential-notice … --revocation-record … --audit-access-days … --data-return-terms …`: 신청을 만든다. 같은 서버에 LiteLLM 제출에서 온 `received` 신청이 있으면 그 신청의 필수 입력을 채운다. 필수 입력이 모두 있고 신청자가 있어야 검사가 시작된다.
+- `mint-litellm intake assign <신청> --requester <사용자>`: 제출의 `submitted_by`가 비어 있을 때(서비스 계정 제출) 사람 사용자를 신청자로 지정한다. 지정한 운영자는 그 신청을 결정할 수 없다.
+- `mint-litellm intake recheck <신청> [--registry-first]`: 검사를 다시 한다. `--registry-first`는 연결 검사가 `CREDENTIALS_REQUIRED`로 판별 불가였던 제출 서버를 LiteLLM 레지스트리에 올리고(승인은 제출의 `allow_all_keys`를 그대로 두므로, 켜진 제출은 승인 직후 같은 작업에서 `allow_all_keys=false`로 고치고 다시 읽어 확인한다. 끄지 못하면 신청은 더 진행하지 않고 경보 `sync_divergence`가 열린다) 저장된 자격으로 연결·정의 검사를 다시 한다. 키·팀 권한은 주지 않는다.
+- `mint-litellm intake approve <신청> [--valid-until <시각>] [--scope key|user|team --scope-id <식별자> --team <팀>]`: 모든 검사가 통과한 신청을 승인한다. 신청자와 같은 사용자는 승인할 수 없고, 연결·정의 증거는 24시간 안이어야 한다(아니면 `MINT-ADMIN-STALE-EVIDENCE`, 재검사). 승인은 도구 계약 후보와 배포 계약 후보를 승인하고 서버 행에 계약 값을 복사하고(`contract_status=managed`) 이용 관계와 `pending` 승인을 만들며 동기화 작업을 등록한다. 승인 범위의 기본은 책임자 사용자이고, 유효 기간의 기본은 90일(high·critical 도구가 있으면 30일)이다.
+- `mint-litellm intake except <신청> --reason … --second-approver … [--valid-until …]`: 판별 불가가 있는 신청의 예외 승인. 사유와 두 번째 승인자가 필요하고 유효 기간의 기본은 30일, 상한은 90일이다.
+- `mint-litellm intake reject <신청> --reason …`: 거절한다. 제출에서 온 신청은 LiteLLM 제출도 거절된다.
+
+검사가 하나라도 실패하면 신청은 자동으로 거절된다. `MINT_INTAKE_ALLOWED_PORTS`(기본 `443,8443`)는 URL 검사가 허용하는 포트이다. 정책 번들 데이터(`description_markers`, `risk`)는 작업 실행기가 `MINT_OPA_URL`의 정책 엔진에서 활성 번들로 읽고(판본별 캐시, 엔진이 돌려준 판본·해시가 활성 판본과 다르거나 읽을 수 없으면) 해당 검사는 판별 불가이다. 제어 평면 키의 `allowed_routes`에는 서버 수정 경로가 `/v1/mcp/server` 접두로 이미 들어 있다.
 
 ## 서버를 LiteLLM에서 삭제하는 순서
 

@@ -19,16 +19,20 @@ from typing import Any
 import psycopg
 from psycopg.errors import UniqueViolation
 
-from mint_litellm.control import alerts, exports, jobs, ledger
+from mint_litellm.control import alerts, exports, intake_jobs, jobs, ledger
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.db.connection import connect, fetchone
 from mint_litellm.control.errors import ControlError
-from mint_litellm.control.litellm_write import LiteLLMSync
+from mint_litellm.control.intake_checks import PolicyDataSource
+from mint_litellm.control.litellm_control import LiteLLMControl
 from mint_litellm.control.stage2_config import Stage2Settings
 from mint_litellm.restore import judge as restore_judge
 from mint_litellm.types.events import EventKind
 
 log = logging.getLogger("mint_litellm.worker")
+
+# 처리기가 붙은 작업 종류(이 모듈을 부르는 실행기가 쓰는 처리기를 등록한다)
+jobs.HANDLERS.update(intake_jobs.HANDLERS)
 
 POLL_SECONDS = 1.0
 # 되돌림 상태에서 외부 쓰기 작업을 다시 시도하기까지의 간격(초)
@@ -75,7 +79,10 @@ class Worker:
         | None = None,
         owner: str | None = None,
         litellm: Any = None,
+        policy_data: Any = None,
     ) -> None:
+        self.litellm = litellm
+        self.policy_data = policy_data
         self.database_url = database_url
         self.instance_id = instance_id
         self.settings = settings
@@ -224,7 +231,7 @@ class Worker:
             return
         ctx = jobs.JobContext(
             conn, self.instance_id, job, self.settings, litellm=self.litellm,
-            verdict=lambda: self.verdict,
+            policy_data=self.policy_data, verdict=lambda: self.verdict,
         )
         self.current = ctx
         if self.stop.is_set():
@@ -286,8 +293,11 @@ def main(environ: Mapping[str, str] | None = None) -> int:
     settings = Stage2Settings.from_env(environ)
     litellm = None
     if config.litellm_url and config.litellm_key:
-        litellm = LiteLLMSync(config.litellm_url, config.litellm_key)
-    worker = Worker(config.require_database(), config.instance_id, settings, litellm=litellm)
+        litellm = LiteLLMControl(config.litellm_url, config.litellm_key)
+    worker = Worker(
+        config.require_database(), config.instance_id, settings, litellm=litellm,
+        policy_data=PolicyDataSource(environ.get("MINT_OPA_URL")),
+    )
     worker.open()
     worker.enqueue_startup_checkpoint()
     restore = install_signals(worker)
