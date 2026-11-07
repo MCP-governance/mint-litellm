@@ -603,7 +603,7 @@ def test_the_record_section_never_shows_operator_actions_with_the_same_name(swor
     event("consent_granted", f"consent:{uuid.uuid4()}:1:consent_granted")
     event("console_session_started", f"console_session:{'44' * 32}:1:console_session_started",
           '{"subject": "admin"}')
-    records = logged_in(sworld).get("/staff/consents").text.split("내 기록")[1]
+    records = logged_in(sworld).get("/staff/consents").text.rsplit("<h2>내 기록", 1)[1]
     for label in ("승인", "서버 중지", "동의 부여", "콘솔 로그인"):
         assert label not in records, label
     assert "직원 화면 로그인" in records

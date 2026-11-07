@@ -1129,12 +1129,16 @@ def test_staff_sessions_start_and_end_with_events_and_stay_personal(db, base):
 
 
 def test_staff_event_listing_is_personal(db, base):
+    # 행위자 이름이 같아도 운영자 행위는 보이지 않고, 본인이 주체인 사건만 보인다.
     add_event(db, key="approval:a1:1:approval_granted", actor="u1")
-    add_event(db, key="approval:a2:1:approval_granted", actor="u2")
+    add_event(db, key="decision:d1:1:decision_evaluated", kind="decision_evaluated",
+              actor="u1", subject='{"principal_id": "u1"}')
+    add_event(db, key="decision:d2:1:decision_evaluated", kind="decision_evaluated",
+              actor="x", subject='{"principal_id": "u2"}')
     as_role(db, "mint_staff")
     staff_context(db)
     rows = staff_call(db, "SELECT source_key FROM mint.staff_list_events(10)")
-    assert [r[0] for r in rows] == ["approval:a1:1:approval_granted"]
+    assert [r[0] for r in rows] == ["decision:d1:1:decision_evaluated"]
 
 
 def test_the_search_path_of_staff_functions_is_pinned(db):
