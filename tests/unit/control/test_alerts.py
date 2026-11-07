@@ -103,6 +103,35 @@ def test_each_open_alert_gets_one_delivery_and_job_per_url_once(admin):
     assert len(keys.fetchall()) == 2
 
 
+def test_a_failed_delivery_is_retried_only_when_the_count_moves(admin, monkeypatch):
+    raise_one(admin)
+    alerts.enqueue_deliveries(admin, INSTANCE, [URL_A])
+    outcomes = iter([(False, 3), (True, 1)])
+    monkeypatch.setattr(webhook, "post", lambda *a, **k: next(outcomes))
+    settings = replace(SETTINGS, webhook_urls=(URL_A,))
+
+    def run_pending():
+        for (target,) in admin.execute(
+            "SELECT delivery_id FROM mint.alert_deliveries WHERE status = 'pending'"
+        ).fetchall():
+            jobs.HANDLERS["alert_deliver"](
+                jobs.JobContext(admin, INSTANCE, {"target_ref": str(target)}, settings)
+            )
+
+    run_pending()  # 수신기 장애: 횟수 1의 전송이 failed
+    assert admin.execute("SELECT status FROM mint.alert_deliveries").fetchall() == [("failed",)]
+    # 같은 횟수에서는 다시 보내지 않는다
+    assert alerts.enqueue_deliveries(admin, INSTANCE, [URL_A]) == 0
+    raise_one(admin)  # 횟수 2
+    assert alerts.enqueue_deliveries(admin, INSTANCE, [URL_A]) == 1
+    assert alerts.enqueue_deliveries(admin, INSTANCE, [URL_A]) == 0
+    run_pending()  # 새 전송 한 건이 성공한다
+    rows = admin.execute(
+        "SELECT alert_count, status FROM mint.alert_deliveries ORDER BY alert_count"
+    ).fetchall()
+    assert rows == [(1, "failed"), (2, "sent")]
+
+
 def test_resolved_alerts_get_no_deliveries(admin):
     raise_one(admin)
     alerts.resolve(admin, INSTANCE, "job_failed:x:y")
@@ -266,6 +295,21 @@ def test_the_response_body_is_never_kept(fake):
     assert "secret-marker" not in repr(result)
 
 
+def test_one_request_is_capped_by_the_total_deadline(fake):
+    server = fake([], delay=2.0)
+    started = time.monotonic()
+    with httpx.Client(timeout=5) as http:
+        assert webhook.post(http, server.url, KEY, "d", BODY, deadline=0.2) == (False, 3)
+    assert time.monotonic() - started < 3 * 2.0
+
+
+def test_a_signature_header_with_repeated_fields_is_refused():
+    header = webhook.sign(KEY, BODY, 1_800_000_000)
+    assert webhook.verify(KEY, header, BODY, now=1_800_000_000)
+    assert not webhook.verify(KEY, header + ",v1=00", BODY, now=1_800_000_000)
+    assert not webhook.verify(KEY, header + ",t=1800000000", BODY, now=1_800_000_000)
+
+
 def test_the_default_client_does_not_follow_redirects_and_uses_the_limit():
     with webhook.client() as http:
         assert http.follow_redirects is False
@@ -308,3 +352,29 @@ def test_opening_and_auto_resolving_write_their_events_in_the_same_transaction(a
         "SELECT source_key FROM mint.events WHERE source_key = %s",
         (f"alert:{alert_id}:2:alert_resolved",),
     ).fetchone()
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "localhost",
+        "api.localhost",
+        "10." "0.0.1",
+        "172.16." "0.1",
+        "192.168." "1.1",
+        "127." "0.0.1",
+        "169.254." "1.1",
+        "[::1]",
+        "[fe80::1]",
+    ],
+)
+def test_literal_internal_hosts_are_refused_in_the_webhook_list(host):
+    with pytest.raises(ControlError):
+        Stage2Settings.from_env({**ENV, "MINT_WEBHOOK_URLS": "https://" + host + "/hook"})
+
+
+def test_a_public_literal_address_is_accepted_in_the_webhook_list():
+    settings = Stage2Settings.from_env(
+        {**ENV, "MINT_WEBHOOK_URLS": "https://" + "8.8.8." + "8/hook"}
+    )
+    assert settings.webhook_urls == ("https://" + "8.8.8." + "8/hook",)

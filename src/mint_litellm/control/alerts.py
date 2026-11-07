@@ -97,16 +97,20 @@ def channel_for(url: str) -> str:
 def enqueue_deliveries(conn: psycopg.Connection, instance_id: str, urls: Sequence[str]) -> int:
     """아직 전송 행이 없는 미해결 경보마다 주소별 전송 행과 ``alert_deliver`` 작업을 만든다.
 
-    작업 등록은 전송 행과 같은 문장 묶음이며, 멱등 키 ``alert_deliver:<delivery_id>``로 중복이 없다.
+    전송 행은 (경보, 주소, 경보 횟수)마다 하나다. 횟수가 올라가면 새 전송이 생기고, 같은 횟수에서
+    실패한 전송은 다시 만들지 않는다(매 반복마다 재시도하지 않도록). 작업 등록은 전송 행과 같은
+    문장 묶음이며, 멱등 키 ``alert_deliver:<delivery_id>``로 중복이 없다.
     """
     made = 0
     for url in urls:
         channel = channel_for(url)
         pending = fetchall(
             conn,
-            "SELECT a.id FROM mint.alerts a WHERE a.instance_id = %s AND a.status <> 'resolved'"
+            "SELECT a.id, a.count FROM mint.alerts a WHERE a.instance_id = %s"
+            " AND a.status <> 'resolved'"
             " AND NOT EXISTS (SELECT 1 FROM mint.alert_deliveries d"
-            "  WHERE d.instance_id = a.instance_id AND d.alert_id = a.id AND d.channel = %s)"
+            "  WHERE d.instance_id = a.instance_id AND d.alert_id = a.id AND d.channel = %s"
+            "  AND d.alert_count = a.count)"
             " ORDER BY a.first_at LIMIT %s",
             (instance_id, channel, DELIVERY_BATCH),
         )
@@ -114,8 +118,9 @@ def enqueue_deliveries(conn: psycopg.Connection, instance_id: str, urls: Sequenc
             delivery_id = new_uuid7()
             conn.execute(
                 "INSERT INTO mint.alert_deliveries"
-                " (id, instance_id, alert_id, channel, delivery_id) VALUES (%s, %s, %s, %s, %s)",
-                (new_uuid7(), instance_id, row["id"], channel, delivery_id),
+                " (id, instance_id, alert_id, channel, delivery_id, alert_count)"
+                " VALUES (%s, %s, %s, %s, %s, %s)",
+                (new_uuid7(), instance_id, row["id"], channel, delivery_id, row["count"]),
             )
             conn.execute(
                 "INSERT INTO mint.jobs (id, instance_id, kind, target_ref, idempotency_key)"

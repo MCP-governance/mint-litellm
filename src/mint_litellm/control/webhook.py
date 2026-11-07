@@ -10,7 +10,8 @@ import hmac
 import json
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -25,6 +26,9 @@ DELIVERY_HEADER = "X-MINT-Delivery"
 TOLERANCE_SECONDS = 300
 ATTEMPTS = 3
 TIMEOUT_SECONDS = 5.0
+# 한 번의 요청 전체 상한(연결·쓰기·읽기 단계를 합친 값)
+DEADLINE_SECONDS = 5.0
+_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="mint-webhook")
 
 
 def check_url(url: str, allowed_hosts: Sequence[str]) -> None:
@@ -50,16 +54,20 @@ def verify(
     tolerance: int = TOLERANCE_SECONDS,
 ) -> bool:
     """수신 쪽 검증. 형식이 틀리거나, 시각 차이가 ``tolerance``를 넘거나, 서명이 다르면 거짓이다."""
-    fields = dict(part.split("=", 1) for part in header.split(",") if "=" in part)
+    parts = header.split(",")
+    stamps = [part[2:] for part in parts if part.startswith("t=")]
+    signatures = [part[3:] for part in parts if part.startswith("v1=")]
+    if len(stamps) != 1 or len(signatures) != 1:
+        return False
     try:
-        timestamp = int(fields["t"])
-    except (KeyError, ValueError):
+        timestamp = int(stamps[0])
+    except ValueError:
         return False
     current = int(time.time()) if now is None else now
     if abs(current - timestamp) > tolerance:
         return False
     expected = sign(key, body, timestamp).rsplit("v1=", 1)[1]
-    return hmac.compare_digest(expected, fields.get("v1", ""))
+    return hmac.compare_digest(expected, signatures[0])
 
 
 def build_body(row: Mapping[str, Any], console_url: str | None) -> bytes:
@@ -77,10 +85,23 @@ def build_body(row: Mapping[str, Any], console_url: str | None) -> bytes:
     )
 
 
+def _within(call: Callable[[], int], seconds: float) -> int:
+    """호출을 상한 안에서 기다린다. 넘으면 ``TimeoutError``(남은 호출은 자체 제한으로 끝난다)."""
+    return _POOL.submit(call).result(timeout=seconds)
+
+
 def post(
-    client: httpx.Client, url: str, key: bytes, delivery_id: str, body: bytes
+    client: httpx.Client,
+    url: str,
+    key: bytes,
+    delivery_id: str,
+    body: bytes,
+    deadline: float = DEADLINE_SECONDS,
 ) -> tuple[bool, int]:
-    """최대 ``ATTEMPTS``번 보낸다. 2xx면 성공. (성공 여부, 보낸 횟수)를 돌려준다."""
+    """최대 ``ATTEMPTS``번 보낸다. 2xx면 성공. (성공 여부, 보낸 횟수)를 돌려준다.
+
+    한 번의 요청은 ``deadline`` 초를 넘기지 않는다.
+    """
     for attempt in range(1, ATTEMPTS + 1):
         headers = {
             "Content-Type": "application/json",
@@ -88,8 +109,11 @@ def post(
             DELIVERY_HEADER: delivery_id,
         }
         try:
-            status = client.post(url, content=body, headers=headers).status_code
-        except httpx.HTTPError as error:
+            status = _within(
+                lambda h=headers: client.post(url, content=body, headers=h).status_code,
+                deadline,
+            )
+        except (httpx.HTTPError, TimeoutError) as error:
             log.warning("웹훅 전송 %d회째 실패: %s", attempt, type(error).__name__)
             continue
         if 200 <= status < 300:

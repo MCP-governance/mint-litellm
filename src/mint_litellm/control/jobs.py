@@ -84,7 +84,8 @@ def _alert_deliver(job: JobContext) -> None:
     """경보 전송 한 건(주소 하나). 응답 본문은 읽어 버리고 상태와 보낸 횟수만 남긴다."""
     row = fetchone(
         job.conn,
-        "SELECT d.id, d.status, d.channel, a.kind, a.severity, a.subject, a.count,"
+        "SELECT d.id, d.status, d.channel, d.alert_count AS count, a.kind, a.severity,"
+        " a.subject,"
         " a.first_at, a.last_at FROM mint.alert_deliveries d JOIN mint.alerts a"
         " ON a.instance_id = d.instance_id AND a.id = d.alert_id"
         " WHERE d.instance_id = %s AND d.delivery_id = %s::uuid",
