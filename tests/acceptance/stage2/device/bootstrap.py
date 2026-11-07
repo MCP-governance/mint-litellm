@@ -49,11 +49,13 @@ def main():
     user("acc-control", "proxy_admin")
     out["ACC_CONTROL_KEY"] = key("mint", user_id="acc-control", key_alias="acc-control", allowed_routes=ROUTES)
     out["ACC_CALLER_KEY"] = "sk-acc-caller-" + secrets.token_urlsafe(24)
-    key("mint", user_id="acc-caller", key_alias="acc-caller", key=out["ACC_CALLER_KEY"])
+    # 호출 키는 사람(관리자)이 미리 서버 접근을 준 상태로 둔다. LiteLLM 접근 검사를 지나야 MINT 판정(미승인 차단)에 닿는다.
+    key("mint", user_id="acc-caller", key_alias="acc-caller", key=out["ACC_CALLER_KEY"],
+        object_permission={"mcp_servers": ["playwright", "context7", "grafana", "synthetic"]})
     # 대조(plain) 구성에도 같은 호출 키를 만든다(지연 RTT 비교용)
     lite("plain", "/user/new", {"user_id": "acc-caller", "user_role": "internal_user", "auto_create_key": False})
     key("plain", user_id="acc-caller", key_alias="acc-caller", key=out["ACC_CALLER_KEY"],
-        object_permission={"mcp_servers": ["synthetic"]})
+        object_permission={"mcp_servers": ["playwright", "context7", "grafana", "synthetic"]})
     team = lite("mint", "/team/new", {"team_alias": "acc-submit", "members_with_roles": [
         {"user_id": "acc-submitter", "role": "user"}]}).json()["team_id"]
     out["ACC_SUBMIT_KEY"] = key("mint", user_id="acc-submitter", team_id=team, key_alias="acc-submit")
