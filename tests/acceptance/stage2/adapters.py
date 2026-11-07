@@ -160,7 +160,7 @@ def db_backup(ctx):
 
 
 @adapter("db_restore")
-def db_restore(ctx):
+def db_restore(ctx, restart=True):
     """직전 db_backup(없으면 snapshot)으로 되돌린다. 복제본·작업 실행기는 멈춘 상태에서 복원한다."""
     marker = state_file("last-backup")
     source = marker.read_text(encoding="utf-8") if marker.exists() else "baseline"
@@ -169,7 +169,7 @@ def db_restore(ctx):
     # 덤프가 없으면 아무것도 멈추거나 지우기 전에 중단한다(지운 뒤 복원이 실패하면 빈 DB가 남는다).
     for database in ("mint", "litellm"):
         compose("exec", "-T", pg, "test", "-s", f"/tmp/{source}-{database}.dump")
-    services = [s for s in ("litellm", "worker", "console") if running(s)]
+    services = [s for s in restore_services() if running(s)]
     if services:
         compose("stop", *services)
     try:
@@ -182,8 +182,10 @@ def db_restore(ctx):
             compose("exec", "-T", pg, "pg_restore", "-U", user, "--single-transaction",
                     "--exit-on-error", "-d", database, f"/tmp/{source}-{database}.dump")
     finally:
-        if services:
+        if services and restart:
             compose("start", *services)
+            wait_ready()
+    return services
 
 
 @adapter("snapshot")
@@ -191,6 +193,26 @@ def snapshot(ctx):
     ctx.run_id = "baseline"
     db_backup(ctx)
     state_file("last-backup").unlink(missing_ok=True)
+
+
+def restore_services():
+    """DB를 쓰는 프로세스. 복제본이 둘이면 둘 다 멈춰야 한다(ACC_RESTORE_SERVICES로 바꾼다)."""
+    return (os.environ.get("ACC_RESTORE_SERVICES") or "litellm litellm2 worker console").split()
+
+
+def wait_ready(seconds=300):
+    """복제본이 요청을 받을 때까지 기다린다. 주소는 ACC_READY_URLS(쉼표)이며 없으면 ACC_LITELLM_ADMIN_URL."""
+    urls = [u for u in (os.environ.get("ACC_READY_URLS") or env("ACC_LITELLM_ADMIN_URL", "")).split(",") if u]
+    deadline = time.monotonic() + seconds
+    for url in urls:
+        while True:
+            try:
+                with urllib.request.urlopen(url.rstrip("/") + "/health/readiness", timeout=5):
+                    break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise SystemExit(f"준비 시간 초과: {url}") from None
+                time.sleep(3)
 
 
 def running(service):
@@ -450,11 +472,16 @@ for _name in SCENARIOS:
 # ---------------------------------------------------------------- 진입점
 
 def case_setup(case):
-    """시험 사례 직전의 깨끗한 상태: 기준 스냅숏 복원, 내보내기 비움, 합성 서버·공개 판본 원복."""
+    """시험 사례 직전의 깨끗한 상태: 기준 스냅숏 복원, 내보내기 비움, 합성 서버·공개 판본 원복.
+
+    프로세스는 멈춘 채로 복원하고 내보내기를 비운 뒤 한꺼번에 올린다(작업 실행기가 살아 있을 때 파일을
+    지우면 `export_missing` 차단이 걸린다).
+    """
     class Ctx:
         run_id = "baseline"
     state_file("last-backup").unlink(missing_ok=True)
-    db_restore(Ctx)
+    present = set(compose("ps", "-a", "--services", check=False).stdout.split())
+    db_restore(Ctx, restart=False)
     fixture = os.environ.get("ACC_FIXTURE_URL")
     if fixture:
         http("POST", fixture.rstrip("/") + "/control", {"mode": "base"})
@@ -465,6 +492,14 @@ def case_setup(case):
     for server, (new, old) in SWAPS.items():
         if state_file(server + "-swapped").exists():
             swap(server, new, old)[1](None)
+    compose("start", *[s for s in restore_services() if s in present])
+    wait_ready()
+    if os.environ.get("ACC_EXPORT_HOST_DIR"):  # 작업 실행기의 첫 체크포인트까지
+        deadline = time.monotonic() + 120
+        while not (export_dir() / "latest.json").is_file():
+            if time.monotonic() > deadline:
+                raise SystemExit("작업 실행기가 첫 체크포인트를 쓰지 않았습니다")
+            time.sleep(2)
 
 
 def emit_site(ssh=None, repo="."):

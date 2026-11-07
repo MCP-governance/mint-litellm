@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """장비에서 실행: site.example.json을 바탕으로 이 장비의 site.json을 만든다(.runtime, 커밋하지 않음).
 
 환경변수는 acc.env를 읽은 상태에서 실행한다. 사용: python make_site.py > tests/acceptance/stage2/.runtime/site.json

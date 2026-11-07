@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """계수 역프록시 접근 기록(/__log)에서 서버별 tools/call 누적 수를 JSON으로 내는 작은 서버(표준 라이브러리).
 
 GET /<서버 이름> -> {"tools/call": n}. 사용: counter_service.py <로그 주소> <포트>

@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """장비에서 실행: LiteLLM 사용자·키·팀과 운영자 토큰을 만들어 ~/mint-s2/acc.env(0600)에만 쓴다.
 
 마스터 키는 사용자·키를 만드는 데만 쓰고, 제어 평면 키는 proxy_admin 사용자 키에 allowed_routes를 제한해 발급한다.
