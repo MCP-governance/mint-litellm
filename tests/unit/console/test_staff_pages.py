@@ -579,3 +579,31 @@ def test_a_staff_session_starts_with_its_team_list_in_one_statement(sworld):
     sworld.stub.own("sk-team2", STAFFER, team_id="team-z")
     logged_in(sworld, "sk-team2")
     assert sworld.query("SELECT team_ids FROM mint.console_sessions") == [(["team-z"],)]
+
+
+def test_staff_pages_are_not_kept_in_the_browser_history_cache(sworld):
+    add_confirmation(sworld, display='{"받는 사람": "a@example.com"}')
+    client = logged_in(sworld)
+    for path in ("/staff", "/staff/confirmations", "/staff/consents"):
+        response = client.get(path)
+        assert 'hx-history="false"' in response.text, path
+        assert response.headers["cache-control"] == "no-store", path
+
+
+def test_the_record_section_never_shows_operator_actions_with_the_same_name(sworld):
+    def event(kind, source_key, payload="{}", actor=STAFFER):
+        sworld.query(
+            "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload)"
+            " VALUES (gen_random_uuid(), %s, %s, %s, %s, %s::jsonb)",
+            INSTANCE, kind, source_key, actor, payload)
+
+    event("approval_granted", f"approval:{uuid.uuid4()}:1:approval_granted")
+    event("server_suspended", f"server:{uuid.uuid4()}:2:server_suspended")
+    event("call_approval_approved", f"call_approval:{uuid.uuid4()}:2:call_approval_approved")
+    event("consent_granted", f"consent:{uuid.uuid4()}:1:consent_granted")
+    event("console_session_started", f"console_session:{'44' * 32}:1:console_session_started",
+          '{"subject": "admin"}')
+    records = logged_in(sworld).get("/staff/consents").text.split("내 기록")[1]
+    for label in ("승인", "서버 중지", "동의 부여", "콘솔 로그인"):
+        assert label not in records, label
+    assert "직원 화면 로그인" in records

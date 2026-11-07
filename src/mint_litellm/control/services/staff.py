@@ -353,6 +353,7 @@ def list_available(sctx: StaffContext) -> list[dict]:
     denied = (
         "EXISTS (SELECT 1 FROM mint.denials d WHERE d.instance_id = s.instance_id"
         " AND d.lifted_at IS NULL AND (d.server_id IS NULL OR d.server_id = s.server_id)"
+        " AND (d.org_id IS NULL OR d.org_id = r.org_id)"
         " AND ((d.scope_type = 'user' AND d.scope_id = %(user)s)"
         "   OR (d.scope_type = 'team' AND d.scope_id = ANY(%(teams)s))"
         "   OR (d.scope_type = 'org' AND d.scope_id = r.org_id)"
