@@ -88,6 +88,7 @@ class Worker:
         self.settings = settings
         self.lease_seconds = lease_seconds or settings.worker_lease_seconds
         self.restore_check = restore_check or RestoreCheck(settings)
+        self.litellm = litellm
         self.verdict = restore_judge.Verdict(restore_judge.SKIP)
         self._reported_blocks: set[int] = set()
         self._alerted: set[tuple] = set()

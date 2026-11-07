@@ -940,6 +940,12 @@ def build_parser() -> argparse.ArgumentParser:
     # 작업 실행기는 운영자 명령이 아니라 상주 프로세스라 명령 표(COMMANDS)에 없다.
     tree[()].add_parser("worker", help="작업 실행기를 기동한다").set_defaults(
         process="worker")
+    serve = tree[()].add_parser("console", help="관리자 콘솔을 기동한다")
+    serve.set_defaults(process="console")
+    serve.add_argument("--host", default="localhost", help="수신 주소(기본 localhost)")
+    serve.add_argument("--port", type=int, default=8080, help="수신 포트(기본 8080)")
+    serve.add_argument("--ssl-certfile", help="TLS 인증서 파일(앞단에서 TLS를 끝내면 생략)")
+    serve.add_argument("--ssl-keyfile", help="TLS 개인 키 파일")
     return root
 
 
@@ -1012,6 +1018,10 @@ def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = Non
     try:
         if getattr(args, "process", None) == "worker":
             return worker.main(environ)
+        if getattr(args, "process", None) == "console":
+            from mint_litellm.console.server import serve
+
+            return serve(args, environ)
         run_command(args, environ)
     except ControlError as error:
         print(str(error), file=sys.stderr)

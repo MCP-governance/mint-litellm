@@ -1,0 +1,16 @@
+{% extends "base.html" %}{% import "macros.html" as m %}
+{% block title %}MCP 서버 · MINT{% endblock %}
+{% block body %}
+<h1>MCP 서버</h1>
+{% if rows %}
+<table><thead><tr><th>서버</th><th>상태</th><th>전송</th><th>인증</th><th class="num">이용 관계</th><th class="num">유효 승인</th><th class="num">도구</th><th>계약</th></tr></thead><tbody>
+{% for s in rows %}<tr>
+<td><a href="/servers/{{ s.server_id | urlencode }}">{{ s.server_id }}</a></td>
+<td>{{ m.badge(L.SERVER, s.status) }}</td>
+<td>{{ L.pick(L.TRANSPORT, s.transport) }}</td><td>{{ L.pick(L.AUTH_TYPE, s.auth_type) }}</td>
+<td class="num">{{ s.relations }}</td><td class="num">{{ s.approvals }}</td><td class="num">{{ s.tools }}</td>
+<td>{% if s.deployment_drift or s.drifted %}<span class="badge error"><span class="icon" aria-hidden="true">▲</span>변경됨</span>{% elif s.contract_status == 'managed' %}<span class="badge ok"><span class="icon" aria-hidden="true">✓</span>일치</span>{% else %}—{% endif %}</td>
+</tr>{% endfor %}
+</tbody></table>
+{% else %}{{ m.empty('등록된 MCP 서버가 없습니다', '/', '개요로 이동') }}{% endif %}
+{% endblock %}
