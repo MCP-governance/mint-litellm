@@ -1,6 +1,6 @@
 # source로 읽는다. acc.json(비밀)·deploy/.env에서 시험 실행기 환경을 만든다. 값은 출력하지 않는다.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-STATE=${ACC_STATE_DIR:-$HOME/mint-s2}
+STATE=${ACC_HOME:-$HOME/mint-s2}
 getenv() { grep -E "^$1=" "$REPO/deploy/.env" | head -n1 | cut -d= -f2-; }
 getjson() { python3 -c "import json,sys;print(json.load(open('$STATE/acc.json')).get('$1',''))"; }
 export DOCKER_CONFIG=$HOME/.docker-acc COMPOSE_PROJECT_NAME=mints2

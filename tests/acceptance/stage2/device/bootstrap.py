@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 
 REPO = Path(__file__).resolve().parents[4]
-STATE = Path(os.environ.get("ACC_STATE_DIR", Path.home() / "mint-s2"))
+STATE = Path(os.environ.get("ACC_HOME", Path.home() / "mint-s2"))
 ENV = {}
 for line in (REPO / "deploy" / ".env").read_text().splitlines():
     if "=" in line and not line.startswith("#"):

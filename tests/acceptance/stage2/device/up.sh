@@ -6,7 +6,7 @@ export DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker-acc}
 export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-mints2}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
-STATE=${ACC_STATE_DIR:-$HOME/mint-s2}
+STATE=${ACC_HOME:-$HOME/mint-s2}
 cd "$REPO/deploy"
 OVERLAY="$HERE/acc.yaml"
 C=(docker compose --env-file .env -f compose.yaml -f "$OVERLAY")
