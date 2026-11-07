@@ -29,6 +29,7 @@ class FakeLiteLLM:
         self.servers: dict[str, dict] = {}
         self.requests: list[tuple[str, str, object]] = []
         self.before_write = None  # 쓰기를 처리하기 전에 부르는 함수(동시 수정 흉내)
+        self.after_write = None  # 쓰기를 처리한 뒤 부르는 함수(응답 직후 덮어쓰는 흉내)
         self.fail_writes: dict[str, int] = {}  # 경로 -> 강제로 낼 상태 코드
         fake = self
 
@@ -124,7 +125,10 @@ class FakeLiteLLM:
                 server["approval_status"] = "active"
                 return 200, copy.deepcopy(server)
         if method == "POST" and path in ("/key/update", "/team/update"):
-            return self._update(path, body)
+            result = self._update(path, body)
+            if self.after_write is not None:
+                self.after_write(method, path, body)
+            return result
         return 404, {"error": "no route"}
 
     def _update(self, path: str, body: dict):

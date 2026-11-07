@@ -135,7 +135,7 @@ def test_command_roles_follow_the_operator_role_model():
             assert OperatorRole.APPROVER in command.roles, command.name
             assert OperatorRole.VIEWER not in command.roles
         elif command.roles == frozenset(OperatorRole):
-            assert command.name in {"check", "status", "ledger list"}
+            assert command.name in {"check", "status", "ledger list", "sync status"}
         else:
             assert command.roles == frozenset({OperatorRole.ADMIN}), command.name
 
