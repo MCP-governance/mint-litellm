@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -190,8 +191,20 @@ def db_restore(ctx, restart=True):
 
 @adapter("snapshot")
 def snapshot(ctx):
+    """DB 덤프와 내보내기 파일을 한 쌍으로 보관한다(DB만 되돌리면 파일 세대와 어긋나 되돌림 차단이 걸린다)."""
     ctx.run_id = "baseline"
+    host = os.environ.get("ACC_EXPORT_HOST_DIR")
+    if host:
+        deadline = time.monotonic() + 180
+        while not (export_dir() / "latest.json").is_file():
+            if time.monotonic() > deadline:
+                raise SystemExit("기준 내보내기 체크포인트(latest.json)가 없습니다: 작업 실행기 확인")
+            time.sleep(2)
     db_backup(ctx)
+    if host:
+        saved = state_file("baseline-export")
+        shutil.rmtree(saved, ignore_errors=True)
+        shutil.copytree(export_dir(), saved)
     state_file("last-backup").unlink(missing_ok=True)
 
 
@@ -489,6 +502,9 @@ def case_setup(case):
         for path in export_dir().rglob("*"):
             if path.is_file():
                 path.unlink()
+        saved = state_file("baseline-export")
+        if saved.is_dir():  # 기준 DB와 같은 세대의 파일로 되돌린다
+            shutil.copytree(saved, export_dir(), dirs_exist_ok=True)
     for server, (new, old) in SWAPS.items():
         if state_file(server + "-swapped").exists():
             swap(server, new, old)[1](None)
