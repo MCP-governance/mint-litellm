@@ -1,0 +1,57 @@
+"""2. 공개 서버 판본 변경, 합성 서버의 설명·도구 추가·삭제·배포 변경."""
+
+import pytest
+
+
+@pytest.mark.parametrize("name", ["playwright", "context7", "grafana"])
+def test_version_drift_and_reapproval(rig, name):
+    rig.require("contract reapprove", handlers=("contract_observe", "sync_server"))
+    fixture = rig.active(name)
+    server = fixture["server_id"]
+    rig.fault(name + "_upgrade")
+    rig.wait(lambda: rig.rows("tool_contracts", "server_id=%s AND drift='input_schema'", [server]),
+             120, "입력 스키마 관측")
+    for tool, args in fixture["changed_tools"].items():
+        rig.call(server, tool, args, allowed=False, code="MINT-CONTRACT-DRIFT-input-schema")
+    rig.call(server, fixture["unchanged_tool"], fixture["unchanged_arguments"])
+    contracts = rig.rows("tool_contracts", "server_id=%s AND drift='input_schema'", [server])
+    window = rig.begin("reapproval", entities=[row["id"] for row in contracts], server=server)
+    rig.versioned(f"/servers/{server}/contracts", "reapprove", {}, role="approver")
+    rig.wait(lambda: not rig.rows("tool_contracts", "server_id=%s AND status='approved' "
+                                "AND drift <> 'none'", [server]), 120, "재승인·재pin")
+    for tool, args in fixture["changed_tools"].items():
+        rig.call(server, tool, args)
+    rig.check_events(window, changed_count=len(fixture["changed_tools"]))
+
+
+@pytest.mark.parametrize("mutation", ["description", "added", "removed", "deployment"])
+def test_synthetic_contract_changes(rig, mutation):
+    rig.require("contract reapprove", handlers=("contract_observe",))
+    fixture = rig.active("synthetic")
+    server = fixture["server_id"]
+    window = rig.begin("drift_" + mutation, server=server)
+    rig.fault("contract_" + mutation)
+    if mutation == "description":
+        rig.wait(lambda: rig.rows("tool_contracts", "server_id=%s AND drift='description'",
+                                  [server]), 120, "설명 변경")
+        rig.call(server, fixture["tool"], fixture["arguments"])
+    elif mutation == "added":
+        rig.wait(lambda: rig.rows("tool_contracts", "server_id=%s AND status='candidate'",
+                                  [server]), 120, "추가 도구")
+        rig.call(server, fixture["added_tool"], {}, allowed=False,
+                 code="MINT-CONTRACT-DRIFT-unapproved-tool")
+    elif mutation == "removed":
+        rig.wait(lambda: rig.rows("tool_contracts", "server_id=%s AND tool=%s "
+                                  "AND status='superseded'", [server, fixture["tool"]]),
+                 120, "삭제 계약 폐기")
+    else:
+        # 호출을 보내지 않은 채 두 복제본이 각각 불일치를 관측해야 한다.
+        rig.wait(lambda: rig.rows("servers", "server_id=%s AND deployment_drift", [server]),
+                 120, "배포 변경")
+        rig.check_events(window, worker_count=2)
+        rig.versioned(f"/servers/{server}/contracts", "reapprove", {}, role="approver")
+        rig.wait(lambda: not rig.rows("servers", "server_id=%s AND deployment_drift", [server]),
+                 120, "배포 재승인")
+        rig.call(server, fixture["tool"], fixture["arguments"])
+        return
+    rig.check_events(window)

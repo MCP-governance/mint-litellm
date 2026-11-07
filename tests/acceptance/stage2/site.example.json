@@ -1,0 +1,103 @@
+{
+  "instance_id": "acceptance",
+  "api": "https://solution.invalid",
+  "litellm_admin": "https://solution.invalid",
+  "litellm": ["https://replica-one.invalid", "https://replica-two.invalid"],
+  "plain": "https://plain.invalid",
+  "clients": {
+    "pj1": ["ssh", "pj1", "python", "acceptance/remote_client.py"],
+    "pj3": ["ssh", "pj3", "python", "acceptance/remote_client.py"]
+  },
+  "cli": [".venv/bin/python", "-m", "mint_litellm.cli"],
+  "secret_env": {
+    "admin": "ACC_ADMIN_TOKEN",
+    "approver": "ACC_APPROVER_TOKEN",
+    "caller": "ACC_CALLER_KEY",
+    "control": "ACC_CONTROL_KEY",
+    "db": "ACC_DATABASE_URL",
+    "export_hmac": "MINT_EXPORT_HMAC_KEY"
+  },
+  "intake": {
+    "org_id": "acceptance",
+    "purpose": "acceptance",
+    "data_grade": "public",
+    "allowed_resources": [],
+    "provider": "registered-provider",
+    "owner_user_id": "requester-user-id",
+    "readiness": {"credential_notice": true, "revocation_record": true, "audit_access_days": 365},
+    "data_return_terms": "시험 자료만 사용하며 종료 시 파기"
+  },
+  "servers": {
+    "playwright": {
+      "client_tool_prefix": "mcp__acceptance__",
+      "server_id": "replace-with-registered-id",
+      "tool_count": 25,
+      "tool": "browser_tabs",
+      "arguments": {"action": "list"},
+      "changed_tools": {
+        "browser_tabs": {"action": "list"},
+        "browser_find": {},
+        "browser_network_requests": {},
+        "browser_wait_for": {"time": 1}
+      },
+      "unchanged_tool": "browser_snapshot",
+      "unchanged_arguments": {}
+    },
+    "context7": {
+      "client_tool_prefix": "mcp__acceptance__",
+      "server_id": "replace-with-registered-id",
+      "tool_count": 2,
+      "tool": "resolve-library-id",
+      "arguments": {"libraryName": "react", "query": "react useState"},
+      "changed_tools": {"query-docs": {"libraryId": "/facebook/react", "query": "useState"}},
+      "unchanged_tool": "resolve-library-id",
+      "unchanged_arguments": {"libraryName": "react", "query": "react useState"}
+    },
+    "grafana": {
+      "client_tool_prefix": "mcp__acceptance__",
+      "server_id": "replace-with-registered-id",
+      "tool_count": 73,
+      "tool": "list_datasources",
+      "arguments": {},
+      "changed_tools": {
+        "find_error_pattern_logs": {"labelSelector": "{}"},
+        "find_slow_requests": {"labelSelector": "{}"}
+      },
+      "unchanged_tool": "list_datasources",
+      "unchanged_arguments": {}
+    },
+    "synthetic": {
+      "server_id": "replace-with-registered-id",
+      "tool_count": 3,
+      "tool": "mutable",
+      "arguments": {},
+      "added_tool": "added",
+      "performance_tool": "large"
+    }
+  },
+  "counters": {},
+  "settle_seconds": 2,
+  "decision_logs": [
+    ["docker", "logs", "acceptance-litellm-one"],
+    ["docker", "logs", "acceptance-litellm-two"]
+  ],
+  "faults": {
+    "playwright_upgrade": {
+      "apply": ["bash", "tests/oss/stack.sh", "swap", "playwright", "0.0.84"],
+      "undo": ["bash", "tests/oss/stack.sh", "swap", "playwright", "0.0.83"]
+    },
+    "context7_upgrade": {
+      "apply": ["bash", "tests/oss/stack.sh", "swap", "context7", "2.2.2"],
+      "undo": ["bash", "tests/oss/stack.sh", "swap", "context7", "2.2.1"]
+    },
+    "grafana_upgrade": {
+      "apply": ["bash", "tests/oss/stack.sh", "swap", "grafana", "1.4.1"],
+      "undo": ["bash", "tests/oss/stack.sh", "swap", "grafana", "1.4.0"]
+    }
+  },
+  "artifacts": {
+    "export_dir": "/run/acceptance/exports",
+    "client_pj1": "/run/acceptance/client-pj1.json",
+    "client_pj3": "/run/acceptance/client-pj3.json"
+  }
+}

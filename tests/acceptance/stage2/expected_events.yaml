@@ -1,0 +1,242 @@
+# 기대값 정본. 숫자는 격리된 엔터티/호출 구간의 정확한 건수이다.
+schema_version: 1
+interpretations:
+  - 사건 57종은 배포 계약의 별도 사건 3종을 포함한다.
+  - 재승인 사건은 서버가 아니라 변경된 도구마다 센다.
+  - 배포 변경의 재승인 필요 표시는 deployment_drift_detected 본문에 둔다.
+  - 봉인은 seal_batches로 검증하며 봉인 사건은 만들지 않는다.
+  - 준비 사건은 행동 구간에서 제외하고 비동기 작업은 read-back 뒤 계수한다.
+  - 동기화 작업 전체 건수는 권한 수에 따라 달라지므로 대상 grant 한 개로 범위를 좁힌다.
+  - UI 수동 검수와 pj1/pj3 실제 클라이언트 증거는 별도 원시 파일의 해시로 결속한다.
+  - 상한을 넘는 대형 문자열은 패턴이 참이므로 enforce 차단 판정도 성능 표본에 포함한다.
+  - 장비별 백업/복원과 DB 역할 장애 주입은 이전 장비 도구를 argv 픽스처로 연결한다.
+  - 외부 호출 반환 상한은 정상 장비의 판정 예산과 전송 여유를 합쳐 1500ms로 둔다.
+  - pin JSON 해시는 지정 세 판본의 정수/문자열 스키마에 키 정렬 JSON을 적용한다.
+limits:
+  call_ms: 1500
+  observe_seconds: 60
+  sync_seconds: 360
+  decision_ms: {p50: 30, p95: 100, p99: 300}
+intake_checks:
+  - url_guard
+  - oauth_issuer_allowlist
+  - connection
+  - definitions
+  - description_scan
+  - risk_grade
+  - termination_readiness
+  - supply_chain
+event_catalog:
+  - decision_evaluated
+  - discovery_evaluated
+  - call_response_received
+  - call_outcome_unknown
+  - enforcement_unverified
+  - enforcement_verified
+  - server_identity_mismatch_observed
+  - buffer_overflow
+  - buffer_replayed
+  - server_registered
+  - server_approved
+  - server_suspended
+  - server_resumed
+  - relation_created
+  - relation_terminating
+  - approval_granted
+  - approval_revoked
+  - denial_created
+  - denial_lifted
+  - call_approval_requested
+  - call_approval_approved
+  - call_approval_rejected
+  - call_approval_cancelled
+  - consent_granted
+  - consent_revoked
+  - allowlist_added
+  - allowlist_lifted
+  - org_created
+  - org_closed
+  - org_binding_created
+  - org_binding_removed
+  - policy_activated
+  - settings_changed
+  - operator_added
+  - intake_received
+  - intake_requester_assigned
+  - intake_checked
+  - intake_decided
+  - contract_approved
+  - contract_drift_detected
+  - contract_superseded
+  - reapproval_requested
+  - sync_applied
+  - sync_held
+  - export_written
+  - export_failed
+  - restore_blocked
+  - restore_attested
+  - restore_stale_accepted
+  - alert_opened
+  - alert_acknowledged
+  - alert_resolved
+  - console_session_started
+  - console_session_ended
+  - deployment_contract_approved
+  - deployment_drift_detected
+  - deployment_contract_superseded
+required_flows: [activation, reapproval, revocation, sync_hold, export, restore_attest]
+capabilities:
+  test_01_activation.py:
+    commands: [intake create, intake approve]
+    handlers: [submission_poll, intake_run, sync_server, sync_target, activation_finalize]
+  test_02_contracts.py:
+    commands: [contract reapprove]
+    handlers: [contract_observe, sync_server]
+  test_03_unobserved.py:
+    commands: [contract show]
+    handlers: [contract_observe]
+  test_04_sync.py:
+    commands: [sync status, sync resume]
+    handlers: [sync_target, sync_server, sync_reconcile]
+  test_05_exports.py:
+    commands: [export status, seal verify]
+    handlers: [export_negative_state, export_checkpoint, seal]
+  test_06_restore.py:
+    commands: [restore check, restore attest, restore accept-stale]
+    handlers: [export_negative_state, export_checkpoint, sync_target]
+  test_07_intake_negative.py:
+    commands: [intake create, intake approve, intake except]
+    handlers: [intake_run]
+  test_08_confirmation.py: {commands: [console], handlers: [approval_expiry_scan]}
+  test_09_auth_ui.py: {commands: [console], handlers: [session_verify]}
+  test_10_performance.py: {commands: [contract show], handlers: [contract_observe]}
+  test_11_availability.py: {commands: [console, worker], handlers: [contract_observe, sync_target]}
+  test_12_migration.py: {commands: [intake create], handlers: [intake_run]}
+required_scripts:
+  test_01_activation.py: 3
+  test_02_contracts.py: 7
+  test_03_unobserved.py: 1
+  test_04_sync.py: 8
+  test_05_exports.py: 1
+  test_06_restore.py: 8
+  test_07_intake_negative.py: 7
+  test_08_confirmation.py: 16
+  test_09_auth_ui.py: 10
+  test_10_performance.py: 1
+  test_11_availability.py: 1
+  test_12_migration.py: 1
+flows:
+  call: {decision_evaluated: 1}
+  allowed_call: {decision_evaluated: 1, call_response_received: 1, call_outcome_unknown: 0}
+  blocked_call: {decision_evaluated: 1, call_response_received: 0, call_outcome_unknown: 0}
+  activation:
+    intake_received: 1
+    intake_checked: 8
+    intake_decided: 1
+    contract_approved: tool_count
+    deployment_contract_approved: 1
+    approval_granted: 1
+    server_approved: 1
+    approval_revoked: 0
+    reapproval_requested: 0
+  reapproval:
+    contract_approved: changed_count
+    contract_superseded: changed_count
+    deployment_contract_approved: 0
+    approval_revoked: 0
+  revocation: {approval_revoked: 1, approval_granted: 0}
+  sync_hold: {sync_held: 1, sync_applied: 0}
+  export: {export_written: 1, export_failed: 0}
+  restore_attest: {restore_attested: 1, restore_stale_accepted: 0}
+  drift_description: {contract_drift_detected: 1, reapproval_requested: 1, alert_opened: 1}
+  drift_added: {contract_drift_detected: 1, reapproval_requested: 1, alert_opened: 1}
+  drift_removed: {contract_superseded: 1, alert_opened: 1}
+  drift_deployment:
+    server_identity_mismatch_observed: worker_count
+    deployment_drift_detected: 1
+    reapproval_requested: 0
+    alert_opened: 1
+auxiliary_events:
+  activation: [server_registered, relation_created, sync_applied, export_written,
+               decision_evaluated, call_response_received, discovery_evaluated]
+  reapproval: [intake_checked, sync_applied, alert_resolved,
+               decision_evaluated, call_response_received, discovery_evaluated]
+  drift_description: [decision_evaluated, call_response_received]
+  drift_added: [decision_evaluated]
+observations:
+  sync_team_order: {team_before_key: true, key_first_status: 403, converged: true}
+  sync_preexisting: {preexisting_after_revoke: 1, owned_after_revoke: 0}
+  sync_pin_mismatch: {key_grants: 0, team_grants: 0, approval_status: pending,
+                      unpin_calls: 1, events.reapproval_requested: 1}
+  sync_race_30: {rounds: 30, owned_missing: 0, foreign_change_without_alert: 0}
+  sync_dedup: {pending_per_target: 1, requests: 2}
+  sync_lease_reclaim: {reexecutions: 1, duplicate_writes: 0, converged: true}
+  sync_revoke_race: {overlap: true, remaining_owned: 0, elapsed_seconds: {max: 60}}
+  restore_backup_before_revoke: &restore
+    upstream_calls: 0
+    worker_external_writes: 0
+    elapsed_seconds: {max: 60}
+    events.restore_blocked: 1
+  restore_epoch_caught_up:
+    <<: *restore
+    db_epoch_at_least_file: true
+    consumption_after_restore: 1
+    confirmation_after_restore: 1
+    observation_after_restore: 1
+  restore_consent: {<<: *restore, consent_reapplied: true}
+  restore_latest_missing: {upstream_calls: 0, cause: export_missing}
+  restore_hmac_changed: {upstream_calls: 0, cause: export_unverified}
+  restore_previous_key: {upstream_calls: 1, restore_blocked: 0}
+  restore_accept_stale: {first_operator_released: false, distinct_operators: 2,
+                         released: true, events.restore_stale_accepted: 1}
+  restore_steady_24h: {duration_seconds: {min: 86400}, restore_false_positives: 0,
+                       max_sampling_gap_seconds: {max: 60}}
+  intake_provider_denied: &negative
+    test_route_calls: 0
+    reject_calls: 1
+    resubmissions: 0
+    failed_checks: 1
+  intake_private_literal: {<<: *negative}
+  intake_allow_all_keys: {<<: *negative, submitted_allow_all_keys: true}
+  intake_definitions_limit: {result: indeterminate, distinct_approvers: 2,
+                            exception_days: {max: 90}, day_91_rejected: true}
+  intake_same_requester: {decision_writes: 0}
+  intake_stale_evidence: {evidence_age_hours: {min: 24.001}, decision_writes: 0}
+  intake_credentials_required: {upstream_status: 401, test_http_status: 200,
+                                test_body_status: error, result: indeterminate}
+  confirmation_same_key: {http_status: 403, consumed: 0}
+  confirmation_other_key_once: {upstream_calls: 1, consumed: 1, second_upstream_calls: 0}
+  confirmation_changed_args: {upstream_calls: 0, code: MINT-CONFIRMATION-REQUIRED}
+  confirmation_stale_policy: {upstream_calls: 0, code: MINT-CONFIRMATION-STALE}
+  confirmation_concurrent: {submissions: 2, consumed: 1, upstream_calls: 1}
+  confirmation_both_atomic: {call_approvals_consumed: 1, confirmations_consumed: 1, upstream_calls: 1}
+  confirmation_both_rollback: {call_approvals_consumed: 0, confirmations_consumed: 0, upstream_calls: 0}
+  confirmation_limit_20: {pending: 20, attempt_21_inserted: 0, upstream_calls: 0}
+  confirmation_expiry_10m: {ttl_seconds: 600, expiry_delay_seconds: {max: 60}, display: null}
+  confirmation_team_no_row: {inserted: 0, upstream_calls: 0}
+  confirmation_replica_unique: {replicas: 2, inserted: 1, consumed: 1}
+  confirmation_plugin_insert: {sqlstate: '42501', inserted: 0}
+  confirmation_plugin_confirm: {sqlstate: '42501', confirmed: 0}
+  confirmation_freeze_columns: {changed_columns: 0, rejected: true}
+  confirmation_call_approval_only: {upstream_calls: 0, code: MINT-CALL-APPROVAL-REQUIRED}
+  confirmation_v001_isolation: {confirmation_rows_seen: 0, confirmation_rows_consumed: 0,
+                                stage1_call_approval_consumed: 1}
+  auth_no_plaintext: {matches: 0, search_complete: true}
+  auth_blocked_key: &session_end {ended_seconds: {max: 300}, active_sessions: 0}
+  auth_deleted_key: {<<: *session_end}
+  auth_unbound_viewer: {http_status: 403, sessions_created: 0}
+  auth_viewer_write: {http_status: 403, mutations: 0}
+  auth_staff_write: {api_mutations: 0, db_mutations: 0, forbidden_operations_tested: 4}
+  auth_plugin_control_event: {sqlstate: '42501', inserted: 0}
+  auth_csrf: {http_status: 403, mutations: 0}
+  auth_escape: {executed_scripts: 0, escaped: true}
+  auth_screens_13: {screen_count: 13, explanatory_paragraphs: 0, english_enums: 0,
+                    contrast_min: {min: 4.5}, keyboard_failures: 0}
+  migration_v001: {legacy_allow_calls: 1, legacy_deny_calls: 0,
+                    pending_intake_server_approve_exit: 1, blanket_blocks: 0}
+  client_flow:
+    before_upstream: 0
+    active_upstream: 1
+    drift_upstream: 0
+    reapproved_upstream: 1
+    revoked_upstream: 0
