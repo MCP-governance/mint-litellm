@@ -12,7 +12,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from mint_litellm.types.decision import DecisionSnapshot, OperationType, RevocationCheck
-from mint_litellm.types.frozen import json_value
+from mint_litellm.types.frozen import json_value, no_floats
 from mint_litellm.types.ids import new_uuid7
 
 
@@ -211,6 +211,8 @@ class Event(BaseModel):
     @field_validator("subject", "payload", mode="after")
     @classmethod
     def _json_only(cls, value: dict[str, Any] | None) -> Any:
+        if value is not None:
+            no_floats(value)
         return None if value is None else json_value(value)
 
     @model_validator(mode="after")
