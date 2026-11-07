@@ -10,6 +10,7 @@ STATE=${ACC_HOME:-$HOME/mint-s2}
 cd "$REPO/deploy"
 OVERLAY="$HERE/acc.yaml"
 C=(docker compose --env-file .env -f compose.yaml -f "$OVERLAY")
+wait_ready() { for _ in $(seq 1 90); do curl -fs "http://127.0.0.1:$1/health/readiness" >/dev/null && return 0; sleep 5; done; echo "준비 안 됨: $1" >&2; return 1; }
 rand() { head -c 24 /dev/urandom | base64 | tr -d '/+=\n' | head -c "${1:-32}"; }
 
 docker network inspect mint-g10_mcp >/dev/null
@@ -28,20 +29,19 @@ mkdir -p config
 cp "$HERE/litellm.config.yaml" config/litellm.config.yaml
 cp "$HERE/litellm.plain.yaml" config/litellm.plain.yaml
 # 내보내기 볼륨은 호스트 디렉터리에 바인드한다(어댑터가 파일을 직접 읽고 쓴다). 컨테이너 사용자가 쓰도록 777.
-mkdir -p "$STATE/export" "$STATE/dumps" && chmod 777 "$STATE/export" "$STATE/dumps"
-export ACC_DUMP_DIR="$STATE/dumps"
+mkdir -p "$STATE/export" && chmod 777 "$STATE/export"
 docker volume inspect "${COMPOSE_PROJECT_NAME}_export" >/dev/null 2>&1 ||   docker volume create --driver local --opt type=none --opt o=bind --opt "device=$STATE/export" "${COMPOSE_PROJECT_NAME}_export" >/dev/null
 ./mint.sh up
+# mint.sh가 올린 LiteLLM의 최초 마이그레이션이 끝나기 전에 오버레이로 다시 만들면 마이그레이션이 끊긴다.
+wait_ready "${MINT_LITELLM_PORT:-4300}" || wait_ready 4300
 # mint.sh가 띄운 작업 실행기는 루트라 루트 소유 파일을 남긴다. 멈추고 비운 뒤 오버레이(비루트)로 다시 올린다.
 "${C[@]}" --profile worker stop worker
 docker run --rm -v "${COMPOSE_PROJECT_NAME}_export:/x" --entrypoint sh mint-litellm:local -c 'rm -rf /x/* /x/.[!.]*' || true
-"${C[@]}" up -d --wait postgres
-"${C[@]}" up -d cnt fixture
+"${C[@]}" up -d cnt fixture pgproxy
 set -a; . ./.env; set +a
 "${C[@]}" exec -T postgres psql -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='litellm_plain'" | grep -q 1 \
   || "${C[@]}" exec -T postgres psql -U postgres -d postgres -c "CREATE DATABASE litellm_plain"
 # LiteLLM 복제본이 같은 DB에 동시에 마이그레이션하면 교착으로 마이그레이션 기록이 어긋나므로 하나씩 올린다.
-wait_ready() { for _ in $(seq 1 90); do curl -fs "http://127.0.0.1:$1/health/readiness" >/dev/null && return 0; sleep 5; done; echo "준비 안 됨: $1" >&2; return 1; }
 "${C[@]}" up -d litellm
 wait_ready 4300
 "${C[@]}" up -d litellm2
