@@ -20,7 +20,8 @@ class FakeDatabase:
 
     def __init__(self, applied=True, facts=None):
         self.applied = applied
-        self.facts = facts or {"epoch": 5, "has_written": True, "missing": 0, "anchor_ok": True}
+        self.facts = facts or {"epoch": 5, "has_written": True, "has_negative_written": False,
+            "missing": 0, "anchor_ok": True}
         self.queries: list[str] = []
 
 
@@ -82,6 +83,7 @@ def test_missing_export_config_on_a_two_stage_database_blocks(tmp_path):
 
 def test_a_healthy_export_does_not_block_and_a_first_install_is_not_judged(tmp_path):
     watch = Watch(cfg(tmp_path), FakeDatabase(facts={"epoch": 5, "has_written": False,
+                                                      "has_negative_written": False,
                                                       "missing": 0, "anchor_ok": True}))
     run(watch.refresh())
     assert watch.verdict.state == judge.SKIP and watch.blocked_cause is None
@@ -93,7 +95,8 @@ def test_a_healthy_export_does_not_block_and_a_first_install_is_not_judged(tmp_p
 
 def test_causes_follow_the_table(tmp_path):
     write_latest(tmp_path)
-    ok = {"epoch": 5, "has_written": True, "missing": 0, "anchor_ok": True}
+    ok = {"epoch": 5, "has_written": True, "has_negative_written": False,
+            "missing": 0, "anchor_ok": True}
     bad = {**ok, "missing": 1}
     watch = Watch(cfg(tmp_path), FakeDatabase(facts=bad))
     run(watch.refresh())
@@ -114,9 +117,38 @@ def test_causes_follow_the_table(tmp_path):
     assert watch.blocked_cause is None  # 키 교체 중에는 이전 키로 검증된다
 
 
+def test_the_first_judgement_failing_starts_blocked_and_later_errors_keep_the_verdict(tmp_path):
+    watch = Watch(cfg(tmp_path), FakeDatabase())
+
+    async def broken(sql, params):
+        raise OSError("db down")
+
+    watch._row = broken
+    run(watch.refresh())
+    assert watch.blocked_cause == "export_unverified" and watch.evaluated is False
+
+
+def test_the_startup_retry_does_not_rejudge_after_the_first_judgement(tmp_path):
+    from mint_litellm.plugin.selfcheck import PluginRuntime
+
+    watch = Watch(cfg(tmp_path), FakeDatabase(applied=False))
+    runtime = PluginRuntime(config=cfg(tmp_path), database=None, recorder=None, evaluate=None,
+                            restore_watch=watch,
+                            view_collector=lambda: (_ for _ in ()).throw(RuntimeError))
+    run(watch.refresh())
+    assert watch.evaluated
+    before = len(watch.database.queries)
+    try:
+        run(runtime.verify())
+    except RuntimeError:
+        pass  # 점검 항목 수집은 시험 대상이 아니다
+    assert len(watch.database.queries) == before  # 30초 재시도가 판정 주기를 앞지르지 않는다
+
+
 def test_a_database_error_keeps_the_previous_verdict(tmp_path):
     write_latest(tmp_path)
     watch = Watch(cfg(tmp_path), FakeDatabase(facts={"epoch": 5, "has_written": True,
+                                                      "has_negative_written": False,
                                                       "missing": 1, "anchor_ok": True}))
     run(watch.refresh())
     run(watch.refresh())

@@ -25,6 +25,7 @@ class RestoreWatch:
     blocked_cause: str | None = None
     verdict: judge.Verdict | None = None
     judge: judge.Judge = field(default_factory=judge.Judge)
+    evaluated: bool = False  # 한 번이라도 판정을 끝냈는가
 
     @property
     def keys(self) -> list[bytes]:
@@ -47,6 +48,7 @@ class RestoreWatch:
             applied = await self._row("SELECT to_regclass('mint.exports') IS NOT NULL AS ok", ())
             if not applied or not applied["ok"]:
                 self.blocked_cause, self.verdict = None, None  # 1단계: 판정 대상이 아니다
+                self.evaluated = True
                 return None
             c = self.config
             if c.export_dir is None or not c.export_hmac_key:
@@ -61,8 +63,11 @@ class RestoreWatch:
                     facts = await self._row(judge.FACTS_SQL, params)
                 self.verdict = self.judge.decide(state, facts)
             self.blocked_cause = self.verdict.cause if self.verdict.blocked else None
+            self.evaluated = True
         except Exception as error:
             log.error("되돌림 판정 오류: %s", type(error).__name__)
+            if not self.evaluated:  # 첫 판정이 실패하면 통과가 아니라 차단으로 시작한다
+                self.blocked_cause = judge.EXPORT_UNVERIFIED
         return self.verdict
 
     async def run(self) -> None:

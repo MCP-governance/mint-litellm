@@ -108,7 +108,21 @@ def _request(
     return request_id
 
 
-def attest(ctx: Context, settings: Stage2Settings, reason: str) -> dict[str, Any]:
+def _second_admin(ctx: Context, second: Operator | None) -> Operator:
+    if (
+        second is None
+        or second.role != "admin"
+        or second.user_id in (None, ctx.operator.user_id)
+    ):
+        raise separation_of_duties(
+            "다른 사용자에 결속된 admin의 두 번째 승인(--second-approver)이 필요합니다."
+        )
+    return second
+
+
+def attest(
+    ctx: Context, settings: Stage2Settings, reason: str, second: Operator | None = None
+) -> dict[str, Any]:
     _admin(ctx)
     if not reason.strip():
         raise ControlError("--reason이 필요합니다.")
@@ -121,9 +135,15 @@ def attest(ctx: Context, settings: Stage2Settings, reason: str) -> dict[str, Any
     items = (state.negative or {}).get("items") or []
     rank = {kind: i for i, kind in enumerate(restore_rows.ORDER)}
     reapplied, failed = [], []
+    pending = compare(ctx.conn, ctx.instance_id, items)
+    cause, second_name = None, None
+    if not pending:  # 되돌릴 부정 상태가 없으면 봉인 앵커 불일치를 인정하는 일뿐이므로 2인이다
+        facts = fetchone(ctx.conn, judge.FACTS_SQL, judge.facts_params(state, ctx.instance_id))
+        if not facts["anchor_ok"]:
+            second_name = _second_admin(ctx, second).name
+            cause = "anchor"
     with ctx.conn.transaction():
-        for problem in sorted(compare(ctx.conn, ctx.instance_id, items),
-                              key=lambda p: rank[p["kind"]]):
+        for problem in sorted(pending, key=lambda p: rank[p["kind"]]):
             try:
                 with ctx.conn.transaction():
                     restore_rows.restore_item(ctx.conn, ctx.instance_id, problem)
@@ -148,7 +168,7 @@ def attest(ctx: Context, settings: Stage2Settings, reason: str) -> dict[str, Any
             ctx.conn.execute(
                 "SELECT mint.restore_attest_epoch(%s, %s)", (ctx.instance_id, current)
             )
-        request_id = _request(ctx, "attest", reason, file_epoch, current, None, None)
+        request_id = _request(ctx, "attest", reason, file_epoch, current, cause, second_name)
         ctx.emit(EventKind.RESTORE_ATTESTED, file_epoch,
                  _sequence(ctx.conn, ctx.instance_id, file_epoch, EventKind.RESTORE_ATTESTED),
                  {"reason": reason, "file_epoch": file_epoch, "db_epoch": current,
@@ -163,15 +183,7 @@ def accept_stale(
     _admin(ctx)
     if not reason.strip():
         raise ControlError("--reason이 필요합니다.")
-    if (
-        second is None
-        or second.role != "admin"
-        or second.user_id in (None, ctx.operator.user_id)
-    ):
-        raise separation_of_duties(
-            "accept-stale은 다른 사용자에 결속된 admin의 두 번째 승인"
-            "(--second-approver)이 필요합니다."
-        )
+    second = _second_admin(ctx, second)
     state = _read(settings, ctx.instance_id)
     if state.error not in ("missing", "unverified"):
         raise ControlError(
@@ -179,9 +191,12 @@ def accept_stale(
             "내용 불일치는 restore attest를 쓰십시오."
         )
     with ctx.conn.transaction():
-        epoch = fetchone(
+        current = fetchone(
             ctx.conn, "SELECT coalesce(max(epoch), 0) AS e FROM mint.state_epoch"
             " WHERE instance_id = %s", (ctx.instance_id,))["e"]
+        # 세대를 올려 새 게시가 새 ``exports`` 행(새 해시·봉인 끝)을 갖게 한다
+        epoch = current + 1
+        ctx.conn.execute("SELECT mint.restore_attest_epoch(%s, %s)", (ctx.instance_id, epoch))
         request_id = _request(ctx, "stale_accepted", reason, None, epoch, state.error, second.name)
         ctx.emit(EventKind.RESTORE_STALE_ACCEPTED, epoch,
                  _sequence(ctx.conn, ctx.instance_id, epoch, EventKind.RESTORE_STALE_ACCEPTED),

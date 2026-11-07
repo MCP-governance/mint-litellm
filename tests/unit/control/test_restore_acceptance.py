@@ -124,6 +124,15 @@ def operator(name="root", user="root-user", role="admin"):
     return Operator(name, role, user)
 
 
+def add_admins(url):
+    """게시 직전 확인이 읽는 운영자(서로 다른 사용자의 admin 둘)."""
+    with psycopg.connect(url, autocommit=True) as conn:
+        for name, user, digit in (("root", "root-user", "1"), ("second", "u2", "2")):
+            conn.execute("INSERT INTO mint.operators (instance_id, name, role, token_hash, user_id)"
+                         " VALUES (%s, %s, 'admin', repeat(%s, 64), %s) ON CONFLICT DO NOTHING",
+                         (INSTANCE, name, digit, user))
+
+
 def run_worker(world, which="restored", settings=None):
     """작업 실행기를 한 번 돌려 대기 작업이 없을 때까지 처리한다(되돌림 판정 포함)."""
     from mint_litellm.control.worker import RestoreCheck, Worker
@@ -343,9 +352,9 @@ def test_a_publish_that_dies_midway_keeps_the_block_and_converges_on_rerun(world
     calls = []
 
     def dying(*args, **kwargs):
-        if kwargs.get("republish"):
+        if kwargs.get("write_latest") is False and args[3] == "negative_state":
             calls.append(1)
-        if kwargs.get("republish") and len(calls) == 1:
+        if kwargs.get("write_latest") is False and args[3] == "negative_state" and len(calls) == 1:
             raise OSError("killed")  # 보관은 끝났고 새 파일은 아직 없다
         return real(*args, **kwargs)
 
@@ -373,7 +382,7 @@ def test_a_lost_lease_stops_the_publish_and_a_second_run_finishes_it(world, monk
     state = {"first": True}
 
     def losing(*args, **kwargs):
-        if state["first"] and kwargs.get("republish"):
+        if state["first"] and kwargs.get("write_latest") is False:
             state["first"] = False
             raise jobs.Cancelled  # 임대를 잃어 외부 쓰기를 멈춘다
         return real(*args, **kwargs)
@@ -412,6 +421,7 @@ def test_accept_stale_needs_two_admins_and_a_missing_or_unverified_file(world):
     revoke_and_export(world)
     settings = world["settings"]
     latest = files.latest_path(settings.export_dir, INSTANCE)
+    add_admins(world["live"])
     with psycopg.connect(world["live"]) as conn:
         ctx = make_ctx(conn)
         with pytest.raises(ControlError, match="없거나 검증되지"):
@@ -441,6 +451,7 @@ def test_unverifiable_files_are_set_aside_by_the_published_accept_stale(world):
     other = Stage2Settings.from_env(
         {"MINT_EXPORT_DIR": str(settings.export_dir), "MINT_EXPORT_HMAC_KEY": "B" * 43})
     assert verdict_of(world["live"], other).cause == "export_unverified"
+    add_admins(world["live"])
     with psycopg.connect(world["live"]) as conn:
         out = restore.accept_stale(make_ctx(conn), other, "키 분실", operator("second", "u2"))
         conn.commit()
@@ -457,3 +468,64 @@ def test_the_first_checkpoint_after_release_leaves_the_exports_row(world):
     with psycopg.connect(world["restored"], autocommit=True) as conn:
         rows = fetchall(conn, "SELECT kind, status FROM mint.exports WHERE status = 'written'")
     assert {"negative_state", "checkpoint"} <= {r["kind"] for r in rows}
+
+
+def test_a_noop_update_after_the_rollback_does_not_hide_the_revocation(world):
+    """되돌린 뒤 값이 안 바뀐 UPDATE로 state_version만 올려도 상태 열이 달라 막힌다."""
+    file_epoch = revoke_and_export(world)
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        for _ in range(3):  # 버전은 파일 값(2)을 넘는다
+            conn.execute("UPDATE mint.orgs SET name = name WHERE org_id = 'acme'")
+        row = fetchone(conn, "SELECT state, state_version FROM (SELECT status AS state,"
+                       " state_version FROM mint.orgs) t")
+        assert row["state"] == "active" and row["state_version"] >= 2
+    overtake_epoch(world["restored"], file_epoch)
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        j = judge.Judge()
+        keys = exports.keys(world["settings"])
+        first = j.evaluate(conn, world["settings"].export_dir, INSTANCE, keys)
+        second = j.evaluate(conn, world["settings"].export_dir, INSTANCE, keys)
+    assert first.state == judge.HOLD and second.blocked
+    assert second.detail["missing_items"] == 1
+
+
+def test_a_hand_made_request_cannot_release_the_block(world):
+    """요청 행과 작업 행을 직접 넣어도 게시 직전 확인이 막는다."""
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    settings = world["settings"]
+    latest = files.latest_path(settings.export_dir, INSTANCE)
+    before = latest.read_bytes()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        for kind, key in (("attest", "a"), ("stale_accepted", "b")):
+            rid = fetchone(conn, "INSERT INTO mint.restore_requests (id, instance_id, kind,"
+                           " reason, requested_by, second_approver, file_epoch, target_epoch)"
+                           " VALUES (gen_random_uuid(), %s, %s, 'x', 'root', 'second', %s, %s)"
+                           " RETURNING id", (INSTANCE, kind, file_epoch, file_epoch + 1))["id"]
+            conn.execute("INSERT INTO mint.jobs (id, instance_id, kind, target_ref,"
+                         " idempotency_key) VALUES (gen_random_uuid(), %s, 'restore_publish',"
+                         " %s, %s)", (INSTANCE, str(rid), f"restore_publish:{key}"))
+    run_worker(world)
+    assert latest.read_bytes() == before  # 보관도 게시도 일어나지 않았다
+    assert not (settings.export_dir / INSTANCE / "restored").exists()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert {r["status"] for r in fetchall(
+            conn, "SELECT status FROM mint.restore_requests")} == {"pending"}
+
+
+def test_attest_that_only_accepts_a_seal_anchor_mismatch_needs_two_admins(world):
+    revoke_and_export(world)
+    settings = world["settings"]
+    path = files.latest_path(settings.export_dir, INSTANCE)
+    doc = files.read_verified(path, exports.keys(settings))
+    doc.update(to_seal_seq=1, tail_hash="00" * 32)  # 앵커만 어긋난 파일
+    files.atomic_write(path, files.sign(doc, settings.export_hmac_key))
+    add_admins(world["live"])
+    with psycopg.connect(world["live"]) as conn:
+        ctx = make_ctx(conn)
+        with pytest.raises(ControlError, match="두 번째 승인"):
+            restore.attest(ctx, settings, "앵커 인정")
+        out = restore.attest(ctx, settings, "앵커 인정", operator("second", "u2"))
+        conn.commit()
+    assert out["reapplied"] == []
+    assert run_worker(world, "live").state == judge.OK

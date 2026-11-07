@@ -281,6 +281,21 @@ def test_no_file_and_no_written_row_is_not_judged_but_a_written_row_blocks(
     assert verdict.blocked and verdict.cause == judge.EXPORT_MISSING
 
 
+def test_a_missing_negative_file_with_a_written_negative_row_is_export_missing(
+    admin, worker_conn, settings
+):
+    add_org(admin, "a")
+    close_org(admin, "a")
+    exports.write_export(worker_conn, INSTANCE, settings, "negative_state")
+    j = judge.Judge()
+    assert evaluate(j, worker_conn, settings).state == judge.OK
+    import shutil
+
+    shutil.rmtree(settings.export_dir / INSTANCE / "negative")  # latest.json은 남아 있다
+    verdict = evaluate(j, worker_conn, settings)
+    assert verdict.blocked and verdict.cause == judge.EXPORT_MISSING
+
+
 def test_unreadable_unknown_key_or_bad_hmac_blocks_at_once(admin, worker_conn, settings, tmp_path):
     exports.write_export(worker_conn, INSTANCE, settings, "checkpoint")
     path = files.latest_path(settings.export_dir, INSTANCE)

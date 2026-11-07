@@ -406,7 +406,8 @@ class PluginRuntime:
         return results
 
     async def verify(self) -> bool:
-        if self.restore_watch is not None:
+        # 기동 점검의 재시도(30초)가 판정 주기(60초)를 앞지르지 않도록 첫 판정만 여기서 한다.
+        if self.restore_watch is not None and not self.restore_watch.evaluated:
             await self.restore_watch.refresh()
         results = await self.run_checks()
         self.verified = all(r.ok for r in results)

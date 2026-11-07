@@ -24,32 +24,40 @@ EXPORT_MISSING = "export_missing"
 EXPORT_UNVERIFIED = "export_unverified"
 EXPORT_CONFIG_MISSING = "export_config_missing"
 
-# 부정 상태 항목은 행이 있고 state_version이 파일 값 이상이어야 한다(정상 해제·변경은 값을 올린다).
+# 부정 상태 항목은 행이 있고 state_version이 파일 값 이상이며 상태 열도 파일과 같아야 한다.
+# (값이 안 바뀐 UPDATE도 버전을 올리므로 버전만으로는 되돌림을 가릴 수 있다. 정상 해제·변경은
+# 새 부정 상태 파일을 내므로 파일이 따라온다.)
 FACTS_SQL = """
 WITH f AS (
-  SELECT * FROM jsonb_to_recordset(%(items)s::jsonb) AS x(kind text, id text, state_version bigint)
+  SELECT * FROM jsonb_to_recordset(%(items)s::jsonb)
+    AS x(kind text, id text, state_version bigint, state text)
 ), rows AS (
-  SELECT 'approval' AS kind, id::text AS id, state_version FROM mint.approvals
+  SELECT 'approval' AS kind, id::text AS id, state_version, status AS state FROM mint.approvals
     WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'approval')
-  UNION ALL SELECT 'denial', id::text, state_version FROM mint.denials
+  UNION ALL SELECT 'denial', id::text, state_version,
+      CASE WHEN lifted_at IS NULL THEN 'active' ELSE 'lifted' END FROM mint.denials
     WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'denial')
-  UNION ALL SELECT 'server', server_id, state_version FROM mint.servers
+  UNION ALL SELECT 'server', server_id, state_version, status FROM mint.servers
     WHERE instance_id = %(i)s AND server_id IN (SELECT id FROM f WHERE kind = 'server')
-  UNION ALL SELECT 'relation', id::text, state_version FROM mint.usage_relations
+  UNION ALL SELECT 'relation', id::text, state_version, status FROM mint.usage_relations
     WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'relation')
-  UNION ALL SELECT 'org', org_id, state_version FROM mint.orgs
+  UNION ALL SELECT 'org', org_id, state_version, status FROM mint.orgs
     WHERE instance_id = %(i)s AND org_id IN (SELECT id FROM f WHERE kind = 'org')
-  UNION ALL SELECT 'allowlist', id::text, state_version FROM mint.allowlists
+  UNION ALL SELECT 'allowlist', id::text, state_version, status FROM mint.allowlists
     WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'allowlist')
-  UNION ALL SELECT 'consent', id::text, state_version FROM mint.consents
+  UNION ALL SELECT 'consent', id::text, state_version,
+      CASE WHEN revoked_at IS NULL THEN 'active' ELSE 'revoked' END FROM mint.consents
     WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'consent')
 )
 SELECT (SELECT epoch FROM mint.state_epoch WHERE instance_id = %(i)s) AS epoch,
   EXISTS (SELECT 1 FROM mint.exports WHERE instance_id = %(i)s AND status = 'written')
     AS has_written,
+  EXISTS (SELECT 1 FROM mint.exports WHERE instance_id = %(i)s AND status = 'written'
+          AND kind = 'negative_state') AS has_negative_written,
   (SELECT count(*) FROM f WHERE NOT EXISTS (
      SELECT 1 FROM rows r
      WHERE r.kind = f.kind AND r.id = f.id AND r.state_version >= f.state_version
+       AND r.state = f.state
   )) AS missing,
   CASE WHEN %(seq)s::bigint IS NULL THEN true ELSE EXISTS (
     SELECT 1 FROM mint.seal_batches WHERE instance_id = %(i)s AND to_seal_seq = %(seq)s::bigint
@@ -125,6 +133,9 @@ class Judge:
                 return Verdict(BLOCKED, EXPORT_MISSING)
             return Verdict(SKIP)
         assert state.latest is not None
+        if state.negative is None and facts["has_negative_written"]:
+            self.misses = 0  # 부정 상태 파일이 사라졌다(볼륨 누락·디렉터리 교체)
+            return Verdict(BLOCKED, EXPORT_MISSING)
         file_epoch = int(state.latest["state_epoch"])
         epoch = facts["epoch"] if facts["epoch"] is not None else 0
         detail = {

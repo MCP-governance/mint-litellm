@@ -25,3 +25,15 @@ CREATE TRIGGER restore_requests_2_frozen BEFORE UPDATE ON mint.restore_requests
 
 GRANT SELECT, INSERT ON mint.restore_requests TO mint_control;
 GRANT SELECT, UPDATE (status, published_at) ON mint.restore_requests TO mint_worker;
+
+-- 부정 상태에서 벗어나는 정상 전이(서버 재개·거부 해제)도 부정 상태 파일을 새로 내게 한다.
+-- 판정이 상태 열까지 파일과 대조하므로 파일이 DB를 따라와야 한다.
+CREATE CONSTRAINT TRIGGER servers_zz_export_release AFTER UPDATE ON mint.servers
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+    WHEN (OLD.status IN ('rejected', 'suspended', 'terminating', 'terminated')
+          AND NEW.status NOT IN ('rejected', 'suspended', 'terminating', 'terminated'))
+    EXECUTE FUNCTION mint.enqueue_export_negative();
+CREATE CONSTRAINT TRIGGER denials_zz_export_release AFTER UPDATE ON mint.denials
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+    WHEN (OLD.lifted_at IS NULL AND NEW.lifted_at IS NOT NULL)
+    EXECUTE FUNCTION mint.enqueue_export_negative();

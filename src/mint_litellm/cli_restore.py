@@ -35,7 +35,10 @@ _REASON = (("--reason",), {"required": True, "help": "사유"})
 ARGUMENTS: dict[str, list[Any]] = {
     "seal verify": [(("--from",), {"dest": "from_seq", "type": int}),
                     (("--to",), {"dest": "to_seq", "type": int})],
-    "restore attest": [_REASON],
+    "restore attest": [
+        _REASON,
+        (("--second-approver",), {"help": "봉인 앵커만 어긋난 경우의 다른 사용자 admin 토큰"}),
+    ],
     "restore accept-stale": [
         _REASON,
         (("--second-approver",), {"help": "다른 사용자의 admin 토큰(@파일 가능)"}),
@@ -128,7 +131,8 @@ def _restore_check(run) -> None:
 
 
 def _restore_attest(run) -> None:
-    out = restore_service.attest(run.context(), _settings(run), run.args.reason)
+    out = restore_service.attest(
+        run.context(), _settings(run), run.args.reason, _second(run))
     run.data.update(out)
     run.say(f"복원을 확인했습니다. 세대 {out['db_epoch']}, 되돌린 항목 {len(out['reapplied'])}건. "
             "새 파일은 작업 실행기가 게시하면(최대 1분) 차단이 풀립니다.")

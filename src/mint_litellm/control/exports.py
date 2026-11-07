@@ -114,6 +114,7 @@ def write_export(
     force_latest: bool = False,
     actor: str = "worker",
     guard: Callable[[], None] = lambda: None,
+    write_latest: bool = True,
     republish: bool = False,
 ) -> dict[str, Any] | None:
     """``kind``(``negative_state``|``checkpoint``) 파일을 쓰고 수령을 확인한다.
@@ -152,13 +153,14 @@ def write_export(
     sha = files.content_sha256({k: v for k, v in body.items() if k != "written_at"})
     relative = str(path.relative_to(export_dir)).replace("\\", "/")
     if republish and row is not None and row["status"] == "written":
-        # 복원 게시: 보관으로 사라진 파일을 다시 쓴다. 행은 이미 확정되어 있다.
+        # 복원 게시: 보관으로 사라진 파일을 다시 쓴다. 봉인 끝은 행에 적힌 값을 그대로 써서 행의
+        # 해시·봉인 끝과 파일이 계속 일치한다(같은 세대의 항목은 같다).
+        if row["payload_sha256"] != sha:
+            raise ExportFailed("같은 세대의 부정 상태 내용이 행과 다릅니다.")
         guard()
-        path_signed = files.sign(body, settings.export_hmac_key)
-        files.atomic_write(path, path_signed)
+        files.atomic_write(path, files.sign(body, settings.export_hmac_key))
         again = files.read_verified(path, keys(settings))
-        latest_written = _write_latest(settings, instance_id, again, force_latest)
-        return {**again, "path": relative, "latest_written": latest_written}
+        return {**again, "path": relative, "latest_written": False}
     if row is None:
         row = fetchone(
             conn,
@@ -183,7 +185,9 @@ def write_export(
         again_content = {k: v for k, v in again.items() if k != "written_at"}
         if files.content_sha256(again_content) != row["payload_sha256"]:
             raise files.ExportUnverified("content changed")
-        latest_written = _write_latest(settings, instance_id, again, force_latest)
+        latest_written = (
+            _write_latest(settings, instance_id, again, force_latest) if write_latest else False
+        )
     except (OSError, files.ExportUnverified) as error:
         conn.execute("UPDATE mint.exports SET status = 'failed' WHERE id = %s", (row["id"],))
         _event(conn, instance_id, EventKind.EXPORT_FAILED, row,
@@ -202,6 +206,13 @@ def write_export(
            {"kind": kind, "state_epoch": epoch, "to_seal_seq": seq, "path": relative,
             "payload_sha256": row["payload_sha256"], "latest_written": latest_written}, actor)
     return {**again, "path": relative, "latest_written": latest_written}
+
+
+def write_latest_file(
+    settings: Stage2Settings, instance_id: str, document: dict[str, Any], force: bool
+) -> bool:
+    """``latest.json``만 쓴다(복원 게시가 마지막에 부른다)."""
+    return _write_latest(settings, instance_id, document, force)
 
 
 def _write_latest(
