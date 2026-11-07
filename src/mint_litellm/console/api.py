@@ -1,0 +1,513 @@
+"""HTTP API ``/api/v1/<자원>``. 상태 변경은 서비스 함수 하나를 부르고, 조회는 ``reads``를 부른다.
+
+인증은 세션 쿠키(+``X-CSRF-Token``) 또는 운영자 토큰(``Authorization: Bearer``)이다.
+변경 요청은 대상의
+``state_version``을 보내야 하며 다르면 ``409 MINT-ADMIN-CONFLICT``이다. 오류 본문은
+``{code, message, reference}``이다.
+"""
+
+import csv
+import io
+import json
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
+
+from mint_litellm.console.core import Actor, api_actor, public, require_csrf
+from mint_litellm.control import operators
+from mint_litellm.control.context import Operator
+from mint_litellm.control.errors import AdminCode, AdminError, AuthError, ControlError
+from mint_litellm.control.services import allowlists as allowlist_service
+from mint_litellm.control.services import approvals as approval_service
+from mint_litellm.control.services import call_approvals as call_approval_service
+from mint_litellm.control.services import denials as denial_service
+from mint_litellm.control.services import operators as operator_service
+from mint_litellm.control.services import orgs as org_service
+from mint_litellm.control.services import reads
+from mint_litellm.control.services import relations as relation_service
+from mint_litellm.control.services import servers as server_service
+from mint_litellm.control.services import settings as settings_service
+from mint_litellm.types.cli_commands import OperatorRole
+from mint_litellm.types.identity import SubjectType
+from mint_litellm.types.settings import Mode
+
+router = APIRouter(dependencies=[Depends(require_csrf)])
+
+STANDARD_DAYS = 90
+STRICT_DAYS = 30  # 높음·심각 도구를 포함한 승인과 예외 승인의 기본 기간
+EXCEPTION_MAX_DAYS = 90
+CALL_APPROVAL_DEFAULT_HOURS = 24
+CALL_APPROVAL_MAX_DAYS = 7
+
+
+def approval_days(approval_class: str, tools: list[str], high_risk: list[str]) -> int:
+    """승인 유효 기간 기본값(일): 일반 90, 높음·심각 도구를 포함하거나 예외이면 30."""
+    if approval_class == "exception" or set(tools) & set(high_risk):
+        return STRICT_DAYS
+    return STANDARD_DAYS
+
+
+def window(
+    valid_days: int | None, approval_class: str, default_days: int
+) -> tuple[datetime, datetime]:
+    days = default_days if valid_days is None else valid_days
+    if days < 1:
+        raise ControlError("유효 기간은 1일 이상이어야 합니다.")
+    if approval_class == "exception" and days > EXCEPTION_MAX_DAYS:
+        raise ControlError(f"예외 승인의 유효 기간은 {EXCEPTION_MAX_DAYS}일을 넘을 수 없습니다.")
+    now = datetime.now(UTC)
+    return now, now + timedelta(days=days)
+
+
+def second_approver(actor: Actor, token: str | None) -> Operator | None:
+    if not token:
+        return None
+    try:
+        return operators.authenticate(actor.conn, actor.instance, token)
+    except AuthError as error:
+        raise AdminError(AdminCode.SEPARATION_OF_DUTIES, str(error)) from None
+
+
+def confirm(actual: str, typed: str, what: str) -> None:
+    if typed != actual:
+        raise ControlError(f"{what} 이름을 정확히 입력해야 합니다.")
+
+
+def approval_conditions(body: "ApprovalBody") -> dict[str, Any]:
+    """승인 조건. 경로는 지정(listed)·제한 없음(unrestricted)·미지정(unset)을 구분해 담는다."""
+    conditions: dict[str, Any] = {}
+    if body.allowed_hosts:
+        conditions["allowed_hosts"] = body.allowed_hosts
+    if body.allowed_arg_keys:
+        conditions["allowed_arg_keys"] = body.allowed_arg_keys
+    if body.paths_mode == "listed":
+        if not body.allowed_paths:
+            raise ControlError("허용 경로를 하나 이상 입력하거나 다른 옵션을 선택하십시오.")
+        conditions["allowed_paths"] = body.allowed_paths
+    elif body.paths_mode == "unrestricted":
+        conditions["allowed_paths_unrestricted"] = True
+    return conditions
+
+
+def safe_cell(value: Any) -> str:
+    """스프레드시트가 수식으로 읽는 칸(``=``·``+``·``-``·``@`` 등으로 시작)에 ``'``를 붙인다."""
+    text = str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", chr(9), chr(13)) else text
+
+
+def done(actor: Actor, **extra: Any) -> dict[str, Any]:
+    return {"ok": True, **extra, "events": [e.source_key for e in actor.ctx.emitted]}
+
+
+class Versioned(BaseModel):
+    state_version: int
+
+
+class SuspendBody(Versioned):
+    confirm_name: str
+
+
+class RevokeBody(Versioned):
+    reason: str
+    deny: bool = False
+
+
+class ApprovalBody(Versioned):
+    """``state_version``은 이용 관계의 값이다."""
+
+    relation_id: str
+    scope_type: Literal["key", "user", "team"]
+    scope_id: str
+    tools: list[str] = Field(min_length=1)
+    approval_class: Literal["standard", "exception"] = Field("standard", alias="class")
+    basis: str
+    requested_by: str
+    valid_days: int | None = None
+    allowlist_ids: list[str] = []
+    second_approver_token: str | None = None
+    allowed_hosts: list[str] = []
+    allowed_arg_keys: list[str] = []
+    # unset: 경로 이탈만 막음, listed: allowed_paths만 허용, unrestricted: 제한 없음(명시 선택)
+    paths_mode: Literal["unset", "listed", "unrestricted"] = "unset"
+    allowed_paths: list[str] = []
+
+    model_config = {"populate_by_name": True}
+
+
+class ApproveCallBody(Versioned):
+    second_approver_token: str | None = None
+
+
+class DenialBody(BaseModel):
+    scope_type: Literal["key", "user", "team", "org", "server"]
+    scope_id: str
+    server_id: str | None = None
+    tools: list[str] | None = None
+    reason: str
+    org_id: str | None = None
+
+
+class OrgBody(BaseModel):
+    org_id: str
+    name: str
+
+
+class CloseOrgBody(Versioned):
+    confirm_name: str
+
+
+class BindingBody(BaseModel):
+    subject_type: SubjectType
+    subject_id: str
+
+
+class RelationBody(BaseModel):
+    org_id: str
+    server_id: str
+    purpose: str
+    team_id: str | None = None
+
+
+class AllowlistBody(BaseModel):
+    kind: Literal["provider", "auth_server", "egress_target", "registry_source"]
+    value: str
+    valid_until: datetime
+    valid_from: datetime | None = None
+    org_id: str | None = None
+    note: str | None = None
+
+
+class ModeBody(Versioned):
+    mode: Mode
+
+
+class DefaultOrgBody(Versioned):
+    org_id: str | None
+
+
+class OperatorBody(BaseModel):
+    name: str
+    role: OperatorRole
+    user_id: str | None = None
+    expires_in_days: int | None = None
+
+
+class RegisterBody(BaseModel):
+    server_id: str
+    url: str | None = None
+
+
+# --- 조회 -----------------------------------------------------------------------------------
+
+
+@router.get("/overview")
+def get_overview(actor: Actor = Depends(api_actor)):
+    return public(reads.overview(actor.conn, actor.instance))
+
+
+@router.get("/servers")
+def list_servers(actor: Actor = Depends(api_actor)):
+    return {"items": public(reads.servers(actor.conn, actor.instance))}
+
+
+@router.get("/servers/{server_id}")
+def get_server(server_id: str, actor: Actor = Depends(api_actor)):
+    row = reads.server(actor.conn, actor.instance, server_id)
+    if row is None:
+        raise AdminError(AdminCode.NOT_FOUND, f"서버 {server_id}을(를) 찾을 수 없습니다.")
+    return public(row)
+
+
+@router.get("/relations")
+def list_relations(server_id: str | None = None, actor: Actor = Depends(api_actor)):
+    return {"items": public(reads.relations(actor.conn, actor.instance, server_id))}
+
+
+@router.get("/approvals")
+def list_approvals(
+    status: str | None = None,
+    server_id: str | None = None,
+    page: int = 1,
+    actor: Actor = Depends(api_actor),
+):
+    rows = reads.approvals(
+        actor.conn, actor.instance, server_id=server_id, status=status, page=page
+    )
+    return {"items": public(rows)}
+
+
+@router.get("/approvals/queue")
+def approval_queue(actor: Actor = Depends(api_actor)):
+    return {"items": public(reads.queue(actor.conn, actor.instance))}
+
+
+@router.get("/denials")
+def list_denials(actor: Actor = Depends(api_actor)):
+    return {"items": public(reads.denials(actor.conn, actor.instance))}
+
+
+@router.get("/call-approvals")
+def list_call_approvals(
+    status: str | None = None, page: int = 1, actor: Actor = Depends(api_actor)
+):
+    rows = reads.call_approvals(actor.conn, actor.instance, status=status, page=page)
+    return {"items": public(rows)}
+
+
+@router.get("/orgs")
+def list_orgs(actor: Actor = Depends(api_actor)):
+    return {
+        "items": public(reads.orgs(actor.conn, actor.instance)),
+        "bindings": public(reads.bindings(actor.conn, actor.instance)),
+    }
+
+
+@router.get("/operators")
+def list_operators(actor: Actor = Depends(api_actor)):
+    if actor.role == "viewer":
+        raise AdminError(AdminCode.FORBIDDEN, "조회자는 운영자 목록을 볼 수 없습니다.")
+    return {"items": public(reads.operators(actor.conn, actor.instance))}
+
+
+@router.get("/allowlists")
+def list_allowlists(actor: Actor = Depends(api_actor)):
+    return {"items": public(reads.allowlists(actor.conn, actor.instance))}
+
+
+@router.get("/settings")
+def get_settings(actor: Actor = Depends(api_actor)):
+    return public(reads.settings(actor.conn, actor.instance))
+
+
+@router.get("/policy/versions")
+def list_policy_versions(actor: Actor = Depends(api_actor)):
+    return {"items": public(reads.policy_versions(actor.conn, actor.instance))}
+
+
+@router.get("/ledger")
+def get_ledger(
+    since: datetime | None = None,
+    until: datetime | None = None,
+    kind: str | None = None,
+    actor_name: str | None = Query(None, alias="actor"),
+    server_id: str | None = None,
+    result: str | None = None,
+    page: int = 1,
+    actor: Actor = Depends(api_actor),
+):
+    rows = reads.ledger(
+        actor.conn, actor.instance, since=since, until=until, kind=kind, actor=actor_name,
+        server_id=server_id, result=result, page=page,
+    )
+    return {"items": public(rows), "page": page}
+
+
+@router.get("/ledger/export")
+def export_ledger(
+    format: Literal["csv", "json"] = "csv",
+    since: datetime | None = None,
+    until: datetime | None = None,
+    kind: str | None = None,
+    actor_name: str | None = Query(None, alias="actor"),
+    server_id: str | None = None,
+    result: str | None = None,
+    actor: Actor = Depends(api_actor),
+):
+    rows = reads.ledger(
+        actor.conn, actor.instance, since=since, until=until, kind=kind, actor=actor_name,
+        server_id=server_id, result=result, limit=reads.EXPORT_LIMIT,
+    )
+    if format == "json":
+        return Response(
+            json.dumps(public(rows), ensure_ascii=False),
+            media_type="application/json",
+            headers={"Content-Disposition": 'attachment; filename="ledger.json"'},
+        )
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(
+        ["event_id", "inserted_at", "kind", "actor", "server_id", "result", "source_key"]
+    )
+    for row in rows:
+        writer.writerow([
+            safe_cell(c) for c in (
+                row["event_id"], row["inserted_at"].isoformat(), row["kind"], row["actor"] or "",
+                row["server_id"] or "", row["result"] or "", row["source_key"],
+            )
+        ])
+    return Response(
+        "﻿" + out.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="ledger.csv"'},
+    )
+
+
+# --- 변경 -----------------------------------------------------------------------------------
+
+
+@router.post("/servers")
+def register_server(body: RegisterBody, actor: Actor = Depends(api_actor)):
+    server_service.register(actor.ctx, actor.litellm(), body.server_id, body.url)
+    return done(actor, id=body.server_id)
+
+
+@router.post("/servers/{server_id}/suspend")
+def suspend_server(server_id: str, body: SuspendBody, actor: Actor = Depends(api_actor)):
+    confirm(server_id, body.confirm_name, "서버")
+    server_service.suspend(actor.ctx, server_id, expected_version=body.state_version)
+    return done(actor, id=server_id)
+
+
+@router.post("/servers/{server_id}/resume")
+def resume_server(server_id: str, body: Versioned, actor: Actor = Depends(api_actor)):
+    server_service.resume(actor.ctx, server_id, expected_version=body.state_version)
+    return done(actor, id=server_id)
+
+
+@router.post("/relations")
+def add_relation(body: RelationBody, actor: Actor = Depends(api_actor)):
+    rid = relation_service.add(actor.ctx, body.org_id, body.server_id, body.purpose, body.team_id)
+    return done(actor, id=rid)
+
+
+@router.post("/relations/{relation_id}/terminate")
+def terminate_relation(relation_id: str, body: Versioned, actor: Actor = Depends(api_actor)):
+    relation_service.terminate(actor.ctx, relation_id, expected_version=body.state_version)
+    return done(actor, id=relation_id)
+
+
+@router.post("/approvals")
+def grant_approval(body: ApprovalBody, actor: Actor = Depends(api_actor)):
+    relation = reads.relation(actor.conn, actor.instance, body.relation_id)
+    if relation is None:
+        raise AdminError(AdminCode.NOT_FOUND, f"이용 관계 {body.relation_id}이(가) 없습니다.")
+    high = reads.high_risk_tools(actor.conn, actor.instance, relation["server_id"])
+    valid_from, valid_until = window(
+        body.valid_days, body.approval_class, approval_days(body.approval_class, body.tools, high)
+    )
+    approval_id, _ = approval_service.approve(
+        actor.ctx,
+        actor.litellm(),
+        relation_id=body.relation_id,
+        scope_type=body.scope_type,
+        scope_id=body.scope_id,
+        tools=body.tools,
+        valid_from=valid_from,
+        valid_until=valid_until,
+        approval_class=body.approval_class,
+        basis_text=body.basis,
+        requested_by=body.requested_by,
+        allowlist_ids=body.allowlist_ids,
+        second=second_approver(actor, body.second_approver_token),
+        conditions=approval_conditions(body),
+        expected_version=body.state_version,
+    )
+    return done(actor, id=approval_id)
+
+
+@router.post("/approvals/{approval_id}/revoke")
+def revoke_approval(approval_id: str, body: RevokeBody, actor: Actor = Depends(api_actor)):
+    approval_service.revoke(
+        actor.ctx, approval_id, body.reason, body.deny, expected_version=body.state_version
+    )
+    return done(actor, id=approval_id)
+
+
+@router.post("/denials")
+def create_denial(body: DenialBody, actor: Actor = Depends(api_actor)):
+    did = denial_service.deny(
+        actor.ctx, scope_type=body.scope_type, scope_id=body.scope_id, server_id=body.server_id,
+        tools=body.tools, reason=body.reason, org_id=body.org_id,
+    )
+    return done(actor, id=did)
+
+
+@router.post("/denials/{denial_id}/lift")
+def lift_denial(denial_id: str, body: Versioned, actor: Actor = Depends(api_actor)):
+    denial_service.lift(actor.ctx, denial_id, expected_version=body.state_version)
+    return done(actor, id=denial_id)
+
+
+@router.post("/call-approvals/{call_id}/approve")
+def approve_call(call_id: str, body: ApproveCallBody, actor: Actor = Depends(api_actor)):
+    call_approval_service.approve(
+        actor.ctx, call_id, second_approver(actor, body.second_approver_token),
+        expected_version=body.state_version,
+    )
+    return done(actor, id=call_id)
+
+
+@router.post("/call-approvals/{call_id}/reject")
+def reject_call(call_id: str, body: Versioned, actor: Actor = Depends(api_actor)):
+    call_approval_service.reject(actor.ctx, call_id, expected_version=body.state_version)
+    return done(actor, id=call_id)
+
+
+@router.post("/call-approvals/{call_id}/cancel")
+def cancel_call(call_id: str, body: Versioned, actor: Actor = Depends(api_actor)):
+    call_approval_service.cancel(actor.ctx, call_id, expected_version=body.state_version)
+    return done(actor, id=call_id)
+
+
+@router.post("/orgs")
+def add_org(body: OrgBody, actor: Actor = Depends(api_actor)):
+    org_service.add(actor.ctx, body.org_id, body.name)
+    return done(actor, id=body.org_id)
+
+
+@router.post("/orgs/{org_id}/close")
+def close_org(org_id: str, body: CloseOrgBody, actor: Actor = Depends(api_actor)):
+    confirm(org_id, body.confirm_name, "조직")
+    org_service.close(actor.ctx, org_id, expected_version=body.state_version)
+    return done(actor, id=org_id)
+
+
+@router.post("/orgs/{org_id}/bindings")
+def bind_org(org_id: str, body: BindingBody, actor: Actor = Depends(api_actor)):
+    org_service.bind(actor.ctx, org_id, body.subject_type, body.subject_id)
+    return done(actor, id=org_id)
+
+
+@router.post("/orgs/bindings/remove")
+def unbind_org(body: BindingBody, actor: Actor = Depends(api_actor)):
+    org_service.unbind(actor.ctx, body.subject_type, body.subject_id)
+    return done(actor)
+
+
+@router.post("/allowlists")
+def add_allowlist(body: AllowlistBody, actor: Actor = Depends(api_actor)):
+    aid = allowlist_service.add(
+        actor.ctx, body.kind, body.value, body.valid_from or datetime.now(UTC), body.valid_until,
+        body.org_id, body.note,
+    )
+    return done(actor, id=aid)
+
+
+@router.post("/allowlists/{allowlist_id}/lift")
+def lift_allowlist(allowlist_id: str, body: Versioned, actor: Actor = Depends(api_actor)):
+    allowlist_service.lift(actor.ctx, allowlist_id, expected_version=body.state_version)
+    return done(actor, id=allowlist_id)
+
+
+@router.post("/settings/mode")
+def set_mode(body: ModeBody, actor: Actor = Depends(api_actor)):
+    ceiling = actor.config.control.mode_ceiling
+    settings_service.set_mode(actor.ctx, body.mode, ceiling, expected_version=body.state_version)
+    return done(actor)
+
+
+@router.post("/settings/default-org")
+def set_default_org(body: DefaultOrgBody, actor: Actor = Depends(api_actor)):
+    settings_service.set_default_org(actor.ctx, body.org_id, expected_version=body.state_version)
+    return done(actor)
+
+
+@router.post("/operators")
+def add_operator(body: OperatorBody, actor: Actor = Depends(api_actor)):
+    token = operator_service.add(
+        actor.ctx, actor.litellm(), body.name, body.role, body.user_id, body.expires_in_days
+    )
+    return done(actor, id=body.name, token=token)
