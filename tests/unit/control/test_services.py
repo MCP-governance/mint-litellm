@@ -377,6 +377,7 @@ def test_every_state_changing_command_has_a_service():
         "settings default-org", "settings mode", "settings observable", "policy activate",
         "contract reapprove", "sync resume", "alert ack", "alert resolve", "intake create",
         "intake recheck", "intake assign", "intake approve", "intake reject", "intake except",
+        "operator remove", "operator set-role",
     }
     assert stateful <= set(cli.HANDLERS)
     assert stateful <= set(base._COMMANDS)

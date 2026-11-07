@@ -127,3 +127,7 @@ pre.json { background: var(--bg-subtle); border: 1px solid var(--border); border
 h1 .badge { font-size: 14px; margin-left: var(--s2); vertical-align: middle; }
 fieldset.form { border: 1px solid var(--border); border-radius: 6px; padding: var(--s3); }
 label.radio { flex-direction: row; align-items: baseline; gap: var(--s2); color: var(--text); font-size: 14px; }
+pre.diff { padding: var(--s2) 0; }
+pre.diff code { display: block; padding: 0 var(--s3); white-space: pre-wrap; word-break: break-all; }
+pre.diff code.changed { background: #fff8c5; font-weight: 600; }
+tr.selected td { background: #ddf4ff; }
