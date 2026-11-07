@@ -16,12 +16,15 @@ SUFFIXES = {".py", ".sql", ".md", ".toml", ".yml", ".yaml", ".txt", ".cfg", ".in
 SKIP_DIRS = {
     ".git",
     ".venv",
+    ".pyhome",
+    ".uv-cache",
     "venv",
     "__pycache__",
     ".pytest_cache",
     ".ruff_cache",
     "dist",
     "build",
+    "tmp",
 }
 
 

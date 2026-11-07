@@ -154,6 +154,10 @@ def _minimal_argv(path):
         "--data-scope": "d", "--text-version": "v", "--evidence-ref": "e",
         "--evidence-sha256": "0" * 64, "--kind": "provider", "--value": "v", "--name": "n",
         "--team": "t", "--catalog-sha256": "0" * 64, "--bundle-sha256": "0" * 64,
+        "--intake": "i",
+        "--data-grade": "internal", "--allowed-resources": "[]", "--provider": "p",
+        "--owner": "o", "--credential-notice": "n", "--revocation-record": "r",
+        "--audit-access-days": "1", "--data-return-terms": "t", "--requester": "u",
     }
     argv = list(path)
     leaf = parser

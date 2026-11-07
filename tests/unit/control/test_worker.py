@@ -161,14 +161,30 @@ def test_job_kinds_follow_the_registration_rules(url, all_handlers):
             base.enqueue_job(ctx, "seal", "x")  # 예약·키 작업은 키가 있다
 
 
-def test_a_kind_without_a_handler_cannot_be_registered(url):
+def test_a_known_kind_without_a_handler_is_registered_but_never_leased(
+    make_worker, admin, url, monkeypatch
+):
+    """처리기가 없는 알려진 종류도 등록은 받고, 실행기는 처리기가 붙기 전까지 임대하지 않는다."""
+    monkeypatch.delitem(jobs.HANDLERS, "sync_server", raising=False)
     with psycopg.connect(url) as conn:
         ensure(conn, INSTANCE)
         ctx = make_ctx(conn)
-        for kind, key in (("sync_server", None), ("session_verify", "s:x")):
-            with pytest.raises(ControlError, match="처리기가 없습니다"):
-                base.enqueue_job(ctx, kind, "x", key)
-        assert base.enqueue_job(ctx, "approval_expiry_scan", "x", "approval_expiry_scan:t")
+        job_id = base.enqueue_job(ctx, "sync_server", "x")
+        assert base.enqueue_job(ctx, "sync_server", "x") == job_id  # 수렴
+        conn.commit()
+    worker = make_worker()
+    assert worker.step() is False
+    assert job(admin, job_id)["status"] == "pending"
+    monkeypatch.setitem(jobs.HANDLERS, "sync_server", lambda ctx: None)  # 처리기가 붙으면 실행된다
+    assert worker.step() is True
+    assert job(admin, job_id)["status"] == "done"
+
+
+def test_an_unknown_kind_is_still_refused(url):
+    with psycopg.connect(url) as conn:
+        ensure(conn, INSTANCE)
+        with pytest.raises(ValueError, match="알 수 없는"):
+            base.enqueue_job(make_ctx(conn), "nothing", "x", "k")
 
 
 def test_a_pending_job_is_not_leased_while_the_same_target_runs(
@@ -393,6 +409,7 @@ def test_extending_an_expired_lease_fails(make_worker, admin):
 
 def test_a_schedule_registers_one_job_per_period_even_with_two_workers(make_worker, admin):
     first, second = make_worker(schedules=True), make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     admin.execute("UPDATE mint.schedules SET next_run_at = date_trunc('second', now())"
                   " - interval '1 second'")
     start = threading.Barrier(2)
@@ -419,6 +436,7 @@ def test_a_schedule_registers_one_job_per_period_even_with_two_workers(make_work
 
 def test_missed_periods_are_skipped_to_the_current_one_on_the_original_grid(make_worker, admin):
     worker = make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     admin.execute("UPDATE mint.schedules SET next_run_at = now() - interval '605 seconds'")
     before = fetchone(admin, "SELECT next_run_at FROM mint.schedules")["next_run_at"]
     assert jobs.register_due_schedules(worker.conn, INSTANCE) == 1  # 열 번 밀렸어도 한 건
@@ -466,6 +484,7 @@ def test_the_worker_runs_the_approval_expiry_scan_from_its_schedule(
                 " now() + %s::interval)", (INSTANCE, tag, HEX, delta))
         conn.commit()
     worker = make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     assert worker.step()  # 일정 등록 -> 임대 -> 처리
     states = {r["principal_id"]: r["status"]
               for r in fetchall(admin, "SELECT principal_id, status FROM mint.call_approvals")}

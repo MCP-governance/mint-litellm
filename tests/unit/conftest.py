@@ -31,10 +31,10 @@ def migrated_database() -> Iterator[str]:
     url = make_conninfo(**params)
     try:
         with psycopg.connect(url, autocommit=True) as conn:
-            conn.execute(MIGRATION.read_text(encoding="utf-8"))
-            conn.execute(STAGE2.read_text(encoding="utf-8"))
-            conn.execute(STAGE3.read_text(encoding="utf-8"))
-            conn.execute(STAGE8.read_text(encoding="utf-8"))
+            for migration in sorted(MIGRATIONS.glob("*.sql")):
+                if migration.name.startswith("004_"):
+                    continue  # 직원 확인 함수는 그 시험이 직접 적용한다.
+                conn.execute(migration.read_text(encoding="utf-8"))
         yield url
     finally:
         with psycopg.connect(DATABASE_URL, autocommit=True) as admin:

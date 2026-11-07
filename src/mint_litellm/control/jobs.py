@@ -62,6 +62,14 @@ class Cancelled(Exception):
     """작업 코드가 취소 신호를 보고 외부 호출을 멈추고 끝낼 때 낸다."""
 
 
+class PermanentFailure(Exception):
+    """재시도해도 소용없는 실패. 작업을 바로 ``failed``로 끝낸다(경보는 낸 쪽이 이미 열었다)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class RestoreBlocked(Exception):
     """되돌림 상태라 외부 쓰기를 하지 않는다. 작업은 실패가 아니라 대기로 돌아간다."""
 
@@ -82,8 +90,13 @@ class JobContext:
     instance_id: str
     job: dict
     settings: Any = None
+    litellm: Any = None
     cancel: threading.Event = field(default_factory=threading.Event)
     lost: threading.Event = field(default_factory=threading.Event)
+    # 관리 API 클라이언트(쓰기 가능). 설정이 없으면 None이다.
+    litellm: Any = None
+    # 활성 번들 데이터 조회(``PolicyDataSource``). 없으면 번들 데이터가 필요한 검사는 판별 불가
+    policy_data: Any = None
     # 되돌림 판정의 현재 값(작업 실행기가 채운다). 외부 쓰기 경계가 읽는다.
     verdict: Callable[[], Any] = lambda: None
 
@@ -103,6 +116,19 @@ class JobContext:
             return
         if verdict.blocked or (verdict.held and self.job["kind"] in EVIDENCE_KINDS):
             raise RestoreBlocked(verdict.cause)
+
+
+def guard_external_write(ctx: "JobContext") -> None:
+    """LiteLLM 쓰기 직전에 부르는 경계. 임대를 잃었거나 종료 중이거나 되돌림 상태면 쓰지 않는다.
+
+    임시 구현이다. 공용 경계(임대 유효성과 되돌림 상태 확인)는 되돌림 보호 단계가 만들고
+    그때 이 함수를 대신한다. LiteLLM 쓰기는 클라이언트의 쓰기 메서드 한 곳만 이 함수를 부른다.
+    """
+    ctx.checkpoint()
+    if ctx.lost.is_set():
+        raise Cancelled
+    if ctx.restore_check is not None and ctx.restore_check(ctx.conn, ctx.instance_id):
+        raise RestoreBlocked
 
 
 def _approval_expiry_scan(job: JobContext) -> None:
@@ -144,6 +170,23 @@ def _alert_deliver(job: JobContext) -> None:
     )
 
 
+def _contract_observe(job: JobContext) -> None:
+    from mint_litellm.control.contract_observe import handle
+
+    handle(job)
+
+
+def _sync(name: str) -> Callable[[JobContext], None]:
+    """권한 동기화 처리기(``sync_jobs``)를 부를 때 불러온다(모듈 순환을 피한다)."""
+
+    def run(job: JobContext) -> None:
+        from mint_litellm.control import sync_jobs
+
+        getattr(sync_jobs, name)(job)
+
+    return run
+
+
 def _seal(job: JobContext) -> None:
     job.external_write()
     seal.seal_once(job.conn, job.instance_id)
@@ -167,24 +210,38 @@ def _export_checkpoint(job: JobContext) -> None:
     exports.export_checkpoint(job)
 
 
+def _session_verify(job: JobContext) -> None:
+    from mint_litellm.control import session_verify
+
+    session_verify.run(job)
+
+
 # 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
 HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "approval_expiry_scan": _approval_expiry_scan,
+    "contract_observe": _contract_observe,
+    "sync_server": _sync("sync_server"),
+    "sync_target": _sync("sync_target"),
+    "sync_reconcile": _sync("sync_reconcile"),
+    "activation_finalize": _sync("activation_finalize"),
     "seal": _seal,
     "export_negative_state": _export_negative_state,
     "export_checkpoint": _export_checkpoint,
     "restore_publish": _restore_publish,
     "alert_deliver": _alert_deliver,
+    "session_verify": _session_verify,
 }
 
 # 일정(주기 작업): 종류 -> 설정에서 주기(초)를 얻는 함수. 처리기가 있는 종류만 일정을 만든다.
 SCHEDULES: dict[str, Callable[[Any], int]] = {
     "approval_expiry_scan": lambda s: 60,
+    "contract_observe": lambda s: s.observe_seconds,
     "seal": lambda s: 60,
     "submission_poll": lambda s: s.submission_poll_seconds,
     "sync_reconcile": lambda s: s.reconcile_seconds,
     "export_checkpoint": lambda s: s.checkpoint_seconds,
     "session_verify": lambda s: s.session_verify_seconds,
+    "evidence_expiry_scan": lambda s: 3600,  # 1시간(고정)
 }
 
 
@@ -341,6 +398,19 @@ def fail(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> str | 
     return _requeue(conn, job_id, "lease_owner = %s", (owner,), code, count=True)
 
 
+def fail_permanently(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> bool:
+    """재시도 없이 ``failed``로 끝낸다. 임대를 잃었으면 거짓이다."""
+    return (
+        conn.execute(
+            "UPDATE mint.jobs SET status = 'failed', last_error_code = %s, lease_owner = NULL,"
+            " lease_until = NULL, updated_at = now()"
+            " WHERE id = %s AND status = 'running' AND lease_owner = %s",
+            (code, job_id, owner),
+        ).rowcount
+        == 1
+    )
+
+
 def release(
     conn: psycopg.Connection, job_id: Any, owner: str, code: str | None, delay: float = 0
 ) -> str | None:
@@ -408,6 +478,14 @@ def register_due_schedules(conn: psycopg.Connection, instance_id: str) -> int:
         )
         registered = 0
         for row in due:
+            if KINDS[row["kind"]].convergent:
+                registered += conn.execute(
+                    "INSERT INTO mint.jobs (id,instance_id,kind,target_ref) VALUES (%s,%s,%s,%s)"
+                    " ON CONFLICT (instance_id,kind,target_ref)"
+                    " WHERE status='pending' AND idempotency_key IS NULL DO NOTHING",
+                    (new_uuid7(), instance_id, row["kind"], row["kind"]),
+                ).rowcount
+                continue
             registered += conn.execute(
                 "INSERT INTO mint.jobs (id, instance_id, kind, target_ref, idempotency_key)"
                 " VALUES (%s, %s, %s, %s, %s)"

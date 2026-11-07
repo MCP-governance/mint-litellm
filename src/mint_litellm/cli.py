@@ -44,13 +44,16 @@ from mint_litellm.control.services import allowlists as allowlist_service
 from mint_litellm.control.services import approvals as approval_service
 from mint_litellm.control.services import call_approvals as call_approval_service
 from mint_litellm.control.services import consents as consent_service
+from mint_litellm.control.services import contracts as contract_service
 from mint_litellm.control.services import denials as denial_service
+from mint_litellm.control.services import intakes as intake_service
 from mint_litellm.control.services import operators as operator_service
 from mint_litellm.control.services import orgs as org_service
 from mint_litellm.control.services import policy as policy_service
 from mint_litellm.control.services import relations as relation_service
 from mint_litellm.control.services import servers as server_service
 from mint_litellm.control.services import settings as settings_service
+from mint_litellm.control.services import sync as sync_service
 from mint_litellm.types import fingerprint
 from mint_litellm.types.cli_commands import (
     COMMANDS,
@@ -86,6 +89,9 @@ class Run:
 
     def litellm(self) -> LiteLLMAdmin:
         return self.cfg.litellm()
+
+    def litellm_control(self) -> LiteLLMAdmin:
+        return self.cfg.litellm_control()
 
     def say(self, line: str) -> None:
         self.text.append(line)
@@ -373,6 +379,17 @@ def _ledger_list(run: Run) -> None:
         run.say(_ledger_line(row))
 
 
+def _sync_status(run: Run) -> None:
+    rows = sync_service.status(run.context(), held_only=run.args.held)
+    run.data["grants"] = [json.loads(json.dumps(row, default=str)) for row in rows]
+    for row in rows:
+        run.say(
+            f"{row['id']}	{row['target_type']}:{row['target_id']}	{row['item']}	"
+            f"{row['server_id']}	관측 {row['observed']}	외부 삭제 {row['missing_count']}	"
+            f"{'보류' if row['held'] else '-'}"
+        )
+
+
 def _policy_activate(run: Run) -> None:
     a, ctx = run.args, run.context()
     source = policy_versions.PolicySource(
@@ -512,7 +529,85 @@ def _allowlist_add(run: Run) -> None:
     )
 
 
+def _contract(run: Run) -> None:
+    a = run.args
+    if a.command_name == "contract reapprove":
+        result = contract_service.reapprove(
+            run.context(), a.server_id, a.intake, a.tool_contract,
+            deployment_id=a.deployment_contract, expected_version=a.state_version,
+        )
+    else:
+        fn = contract_service.diff if a.command_name == "contract diff" else contract_service.show
+        result = fn(run.context(), a.server_id)
+    run.data.update(result)
+    run.say(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+
+
+def _json_arg(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"JSON 형식이 올바르지 않습니다: {text}") from None
+
+
+def _intake_list(run: Run) -> None:
+    rows = intake_service.list_intakes(run.context(), run.args.status)
+    run.data["intakes"] = json.loads(json.dumps(rows, default=str))
+    for row in rows:
+        run.say(f"{row['id']}	{row['status']}	{row['decision'] or '-'}	{row['server_id']}"
+                f"	{row['source']}	{row['requested_by'] or '-'}")
+
+
+def _intake_show(run: Run) -> None:
+    info = intake_service.show(run.context(), run.args.intake_id)
+    run.data.update(json.loads(json.dumps(info, default=str)))
+    row = info["intake"]
+    run.say(f"{row['id']}	{row['status']}	{row['decision'] or '-'}	{row['server_id']}")
+    for check in info["checks"]:
+        run.say(f"  {check['check']}	{check['result']}	{check['reason_code'] or '-'}"
+                f"	시도 {check['attempt']}")
+    for tool in info["tool_contracts"]:
+        run.say(f"  도구 {tool['tool']}	{tool['status']}	{tool['risk_grade'] or '-'}"
+                f"	{tool['action_type'] or '-'}")
+
+
+def _intake_create(run: Run) -> None:
+    a = run.args
+    _created(
+        run,
+        intake_service.create(
+            run.context(), run.litellm_control(), a.server_id, url=a.url, org_id=a.org,
+            purpose=a.purpose, data_grade=a.data_grade, allowed_resources=a.allowed_resources,
+            provider=a.provider, owner_user_id=a.owner,
+            readiness={"credential_notice": a.credential_notice,
+                       "revocation_record": a.revocation_record,
+                       "audit_access_days": a.audit_access_days},
+            data_return_terms=a.data_return_terms, image_digest=a.image_digest,
+            source_commit=a.source_commit,
+        ),
+    )
+
+
+def _intake_decide(decision: str) -> Handler:
+    def handler(run: Run) -> None:
+        a = run.args
+        result = intake_service.decide(
+            run.context(), a.intake_id, decision, reason=a.reason, valid_until=a.valid_until,
+            scope_type=a.scope, scope_id=a.scope_id, team_id=a.team, second=_second(run),
+        )
+        run.data["id"] = str(result["id"])
+        for key in ("approval_id", "relation_id"):
+            if key in result:
+                run.data[key] = result[key]
+        run.say(str(result["id"]))
+
+    return handler
+
+
 HANDLERS: dict[str, Handler] = {
+    "contract show": _contract,
+    "contract diff": _contract,
+    "contract reapprove": _contract,
     "init": _init,
     "check": _check,
     "status": _status,
@@ -560,12 +655,31 @@ HANDLERS: dict[str, Handler] = {
     ),
     "policy activate": _policy_activate,
     "ledger list": _ledger_list,
+    "sync status": _sync_status,
+    "sync resume": lambda r: sync_service.resume(r.context(), r.args.grant_id),
 }
 
 
 # ---------------------------------------------------------------------------
 # 인자 정의
 # ---------------------------------------------------------------------------
+
+
+INTAKE_HANDLERS: dict[str, Handler] = {
+    "intake list": _intake_list,
+    "intake show": _intake_show,
+    "intake create": _intake_create,
+    "intake recheck": lambda r: _created(
+        r, intake_service.recheck(r.context(), r.args.intake_id,
+                                  registry_first=r.args.registry_first)),
+    "intake assign": lambda r: intake_service.assign_requester(
+        r.context(), r.litellm(), r.args.intake_id, r.args.requester),
+    "intake approve": _intake_decide("approve"),
+    "intake reject": _intake_decide("reject"),
+    "intake except": _intake_decide("except"),
+}
+
+HANDLERS.update(INTAKE_HANDLERS)
 
 
 def _a(*flags: str, **kwargs: Any) -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -580,6 +694,14 @@ _ALERT_ID = _a("alert_id", help="경보 식별자")
 
 
 ARGUMENTS: dict[str, list[Any]] = {
+    "contract show": [_SERVER_ID],
+    "contract diff": [_SERVER_ID],
+    "contract reapprove": [
+        _SERVER_ID, _a("--intake", required=True, help="재검사 증거가 있는 신청 식별자"),
+        _a("--tool-contract", action="append", default=[], help="후보 도구 계약 식별자(반복 가능)"),
+        _a("--deployment-contract", help="후보 배포 계약 식별자"),
+        _a("--state-version", type=int, help="서버의 상태 버전"),
+    ],
     "alert list": [
         _a("--status", choices=["open", "acknowledged", "resolved"], help="상태로 거른다"),
         _a("--limit", type=int, default=100, help="최대 개수(기본 100)"),
@@ -716,6 +838,8 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--opa-url", help="정책 엔진 주소(기본: MINT_OPA_URL)"),
         _a("--timeout", type=float, default=30.0, help="엔진 적재 확인 제한 시간(초)"),
     ],
+    "sync status": [_a("--held", action="store_true", help="보류된 항목만 보인다")],
+    "sync resume": [_a("grant_id", help="동기화 항목 식별자(`sync status`의 첫 열)")],
     "ledger list": [
         _a("--kind"),
         _a("--since", type=_when),
@@ -726,6 +850,52 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--limit", type=int, default=100),
     ],
 }
+
+
+_INTAKE_ID = _a("intake_id", help="신청 식별자")
+_DECISION = [
+    _INTAKE_ID,
+    _a("--reason", help="결정 사유(거절·예외는 필수)"),
+    _a("--valid-until", type=_when, help="승인 유효 기간의 끝(기본 90일, 고위험 도구·예외는 30일)"),
+    _a("--scope", choices=["key", "user", "team"], help="승인 범위(기본: 책임자 사용자)"),
+    _a("--scope-id", help="승인 범위의 식별자(기본: 책임자)"),
+    _a("--team", help="이용 관계의 팀"),
+    _SECOND,
+]
+
+INTAKE_ARGUMENTS: dict[str, list[Any]] = {
+    "intake list": [_a("--status", choices=["received", "checking", "passed", "failed",
+                                            "indeterminate", "decided"])],
+    "intake show": [_INTAKE_ID],
+    "intake create": [
+        _SERVER_ID,
+        _a("--url", help="계약 값에 쓸 서버 URL(제어 평면 키는 레지스트리 URL을 읽을 수 없다)"),
+        _a("--org", help="조직(기본: 운영자 사용자에서 유도)"),
+        _a("--purpose", required=True),
+        _a("--data-grade", required=True, choices=list(intake_service.DATA_GRADES)),
+        _a("--allowed-resources", required=True, type=_json_arg,
+           help="허용 자원(JSON 배열 또는 객체)"),
+        _a("--provider", required=True),
+        _a("--owner", required=True, help="책임자의 LiteLLM 사용자 식별자"),
+        _a("--credential-notice", required=True, help="자격 통지 확보 방법"),
+        _a("--revocation-record", required=True, help="철회 기록 확보 방법"),
+        _a("--audit-access-days", required=True, type=int, help="감사 접근 보장 일수"),
+        _a("--data-return-terms", required=True, help="자료 삭제·반환 조건"),
+        _a("--image-digest", help="자체 배포 서버의 이미지 다이제스트"),
+        _a("--source-commit", help="자체 배포 서버의 소스 커밋"),
+    ],
+    "intake recheck": [
+        _INTAKE_ID,
+        _a("--registry-first", action="store_true",
+           help="제출 서버를 LiteLLM 레지스트리에 올린 뒤 검사(키 권한은 주지 않는다)"),
+    ],
+    "intake assign": [_INTAKE_ID, _a("--requester", required=True, help="신청자 사용자 식별자")],
+    "intake approve": _DECISION,
+    "intake reject": _DECISION,
+    "intake except": _DECISION,
+}
+
+ARGUMENTS.update(INTAKE_ARGUMENTS)
 
 
 def _add_arguments(parser: argparse.ArgumentParser, name: str) -> None:
@@ -770,6 +940,12 @@ def build_parser() -> argparse.ArgumentParser:
     # 작업 실행기는 운영자 명령이 아니라 상주 프로세스라 명령 표(COMMANDS)에 없다.
     tree[()].add_parser("worker", help="작업 실행기를 기동한다").set_defaults(
         process="worker")
+    serve = tree[()].add_parser("console", help="관리자 콘솔을 기동한다")
+    serve.set_defaults(process="console")
+    serve.add_argument("--host", default="localhost", help="수신 주소(기본 localhost)")
+    serve.add_argument("--port", type=int, default=8080, help="수신 포트(기본 8080)")
+    serve.add_argument("--ssl-certfile", help="TLS 인증서 파일(앞단에서 TLS를 끝내면 생략)")
+    serve.add_argument("--ssl-keyfile", help="TLS 개인 키 파일")
     return root
 
 
@@ -842,6 +1018,10 @@ def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = Non
     try:
         if getattr(args, "process", None) == "worker":
             return worker.main(environ)
+        if getattr(args, "process", None) == "console":
+            from mint_litellm.console.server import serve
+
+            return serve(args, environ)
         run_command(args, environ)
     except ControlError as error:
         print(str(error), file=sys.stderr)

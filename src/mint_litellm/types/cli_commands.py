@@ -1,7 +1,7 @@
 """운영자 CLI의 명령 표와 제어 평면의 LiteLLM 접근 범위.
 
 모든 명령은 운영자 토큰으로 인증되며 행위자는 토큰에 결속된 운영자 이름이다. 제어 평면은
-LiteLLM DB를 직접 읽거나 쓰지 않고 관리 API의 읽기 경로만 사용하며, LiteLLM에는 쓰지 않는다.
+LiteLLM에 쓰지 않는다. 확인에 필요한 값은 관리 API로 읽는다.
 """
 
 from enum import StrEnum
@@ -26,6 +26,8 @@ CONTROL_PLANE_ALLOWED_ROUTES: tuple[str, ...] = (
     "/key/list",
     "/team/list",
     "/guardrails/list",
+    "/key/update",
+    "/team/update",
 )
 
 # 관리 API 응답에서 수신 즉시 버리고 저장·기록·표시하지 않는 자격 열.
@@ -61,6 +63,14 @@ class CliCommand(BaseModel):
 _SERVER_GET = "/v1/mcp/server/{server_id}"
 
 COMMANDS: tuple[CliCommand, ...] = (
+    CliCommand(path=("contract", "show"), summary="승인·후보 계약을 조회한다.", roles=ALL_ROLES),
+    CliCommand(path=("contract", "diff"), summary="승인본과 관측본을 비교한다.", roles=ALL_ROLES),
+    CliCommand(
+        path=("contract", "reapprove"),
+        summary="재검사 증거를 확인하고 재승인 계획과 동기화 작업을 등록한다.",
+        roles=APPROVER_UP,
+        events=(EventKind.REAPPROVAL_REQUESTED,),
+    ),
     CliCommand(
         path=("init",),
         summary="LiteLLM 설정 조각(권장 설정 포함)을 만들고 기본 조직을 준비한다. "
@@ -256,6 +266,18 @@ COMMANDS: tuple[CliCommand, ...] = (
         events=(EventKind.POLICY_ACTIVATED,),
     ),
     CliCommand(
+        path=("sync", "status"),
+        summary="LiteLLM에 반영한 키·팀·서버 권한의 확인 상태, 외부 삭제 횟수, 보류 여부를 "
+        "조회한다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("sync", "resume"),
+        summary="반복 외부 삭제로 보류된 항목을 풀고 다시 부여한다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.SYNC_APPLIED,),
+    ),
+    CliCommand(
         path=("alert", "list"),
         summary="경보를 상태별로 조회한다.",
         roles=ALL_ROLES,
@@ -276,5 +298,59 @@ COMMANDS: tuple[CliCommand, ...] = (
         path=("ledger", "list"),
         summary="원장 사건을 종류·기간·호출 식별자로 조회한다.",
         roles=ALL_ROLES,
+    ),
+    # 신청(수용검증) 명령
+    CliCommand(
+        path=("intake", "list"),
+        summary="수용검증 신청을 상태별로 조회한다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("intake", "show"),
+        summary="신청 한 건과 검사 결과, 도구 계약 후보를 보인다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("intake", "create"),
+        summary="서버의 수용검증 신청을 만든다. 제출에서 온 `received` 신청이 있으면 필수 입력을 "
+        "채운다. 필수 입력(목적, 자료 등급, 허용 자원, 제공자, 책임자, 종료 준비도 3항목,"
+        " 자료 삭제·반환 조건)이 모두 있어야 검사가 시작된다.",
+        roles=ADMIN_ONLY,
+        litellm_reads=(_SERVER_GET,),
+        events=(EventKind.INTAKE_RECEIVED,),
+    ),
+    CliCommand(
+        path=("intake", "recheck"),
+        summary="검사를 다시 한다. `--registry-first`는 자격이 필요한 제출 서버를 LiteLLM "
+        "레지스트리에 올린 뒤(키 권한은 주지 않는다) 연결·정의 검사를 다시 한다.",
+        roles=ADMIN_ONLY,
+    ),
+    CliCommand(
+        path=("intake", "assign"),
+        summary="신청자가 비어 있는 제출 신청에 사람 사용자를 신청자로 지정한다. "
+        "지정한 운영자는 그 신청을 결정할 수 없다.",
+        roles=ADMIN_ONLY,
+        litellm_reads=("/user/info",),
+        events=(EventKind.INTAKE_REQUESTER_ASSIGNED,),
+    ),
+    CliCommand(
+        path=("intake", "approve"),
+        summary="모든 검사를 통과한 신청을 승인한다. 신청자와 같은 사용자는 승인할 수 없고, "
+        "연결·정의 증거는 24시간 안이어야 한다. 이용 관계와 `pending` 승인이 만들어진다.",
+        roles=APPROVER_UP,
+        events=(EventKind.INTAKE_DECIDED, EventKind.CONTRACT_APPROVED),
+    ),
+    CliCommand(
+        path=("intake", "reject"),
+        summary="신청을 거절한다. 사유가 필요하며 제출 서버는 LiteLLM 제출도 거절된다.",
+        roles=APPROVER_UP,
+        events=(EventKind.INTAKE_DECIDED,),
+    ),
+    CliCommand(
+        path=("intake", "except"),
+        summary="판별 불가가 있는 신청을 예외 승인한다. 사유 필수, 두 번째 승인자 필수, 유효 기간 "
+        "90일 이내.",
+        roles=APPROVER_UP,
+        events=(EventKind.INTAKE_DECIDED, EventKind.CONTRACT_APPROVED),
     ),
 )

@@ -1652,20 +1652,40 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+console = [
+    { name = "fastapi" },
+    { name = "jinja2" },
+    { name = "python-multipart" },
+    { name = "uvicorn" },
+]
 dev = [
+    { name = "fastapi" },
+    { name = "jinja2" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pyflakes" },
     { name = "pytest" },
+    { name = "python-multipart" },
     { name = "ruff" },
+    { name = "uvicorn" },
 ]
 litellm = [
+    { name = "fastapi" },
+    { name = "jinja2" },
     { name = "litellm", extra = ["proxy"] },
     { name = "psycopg", extra = ["binary", "pool"] },
+    { name = "python-multipart" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "fastapi", marker = "extra == 'console'", specifier = ">=0.115" },
+    { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.115" },
+    { name = "fastapi", marker = "extra == 'litellm'", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "jinja2", marker = "extra == 'console'", specifier = ">=3.1" },
+    { name = "jinja2", marker = "extra == 'dev'", specifier = ">=3.1" },
+    { name = "jinja2", marker = "extra == 'litellm'", specifier = ">=3.1" },
     { name = "litellm", extras = ["proxy"], marker = "extra == 'litellm'", specifier = "==1.106.6" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'dev'", specifier = ">=3.3" },
@@ -1673,11 +1693,17 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pyflakes", marker = "extra == 'dev'", specifier = ">=3.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "python-multipart", marker = "extra == 'console'", specifier = ">=0.0.9" },
+    { name = "python-multipart", marker = "extra == 'dev'", specifier = ">=0.0.9" },
+    { name = "python-multipart", marker = "extra == 'litellm'", specifier = ">=0.0.9" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "tzdata", specifier = ">=2024.1" },
+    { name = "uvicorn", marker = "extra == 'console'", specifier = ">=0.30" },
+    { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30" },
+    { name = "uvicorn", marker = "extra == 'litellm'", specifier = ">=0.30" },
 ]
-provides-extras = ["dev", "litellm"]
+provides-extras = ["console", "dev", "litellm"]
 
 [[package]]
 name = "msal"
