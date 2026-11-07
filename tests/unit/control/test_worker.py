@@ -56,11 +56,13 @@ def admin(url):
 def make_worker(url, admin):
     made: list[Worker] = []
 
-    def make(schedules=False, **kwargs) -> Worker:
+    def make(schedules=False, all_schedules=False, **kwargs) -> Worker:
         worker = Worker(login_url(url), INSTANCE, SETTINGS, **kwargs)
         worker.open()
         if not schedules:  # 일정이 만드는 작업이 시험의 작업과 섞이지 않게 한다
             admin.execute("DELETE FROM mint.schedules")
+        elif not all_schedules:  # 일정 시험은 만료 검사 일정 하나만 둔다
+            admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
         made.append(worker)
         return worker
 
@@ -132,9 +134,13 @@ def test_the_worker_needs_the_worker_login(url):
 
 
 def test_the_worker_login_creates_the_schedules_it_has_handlers_for(make_worker, admin):
-    make_worker(schedules=True)
-    rows = fetchall(admin, "SELECT kind, interval_seconds FROM mint.schedules")
-    assert rows == [{"kind": "approval_expiry_scan", "interval_seconds": 60}]
+    make_worker(schedules=True, all_schedules=True)
+    rows = fetchall(admin, "SELECT kind, interval_seconds FROM mint.schedules ORDER BY kind")
+    assert rows == [
+        {"kind": "approval_expiry_scan", "interval_seconds": 60},
+        {"kind": "evidence_expiry_scan", "interval_seconds": 3600},
+        {"kind": "submission_poll", "interval_seconds": SETTINGS.submission_poll_seconds},
+    ]
 
 
 # --- 수렴 작업 등록 규칙 ----------------------------------------------------------

@@ -16,13 +16,17 @@ from collections.abc import Callable, Mapping
 
 import psycopg
 
-from mint_litellm.control import jobs
+from mint_litellm.control import intake_jobs, jobs
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.db.connection import connect, fetchone
 from mint_litellm.control.errors import ControlError
+from mint_litellm.control.litellm_control import LiteLLMControl
 from mint_litellm.control.stage2_config import Stage2Settings
 
 log = logging.getLogger("mint_litellm.worker")
+
+# 처리기가 붙은 작업 종류(이 모듈을 부르는 실행기가 쓰는 처리기를 등록한다)
+jobs.HANDLERS.update(intake_jobs.HANDLERS)
 
 POLL_SECONDS = 1.0
 # 되돌림 상태에서 외부 쓰기 작업을 다시 시도하기까지의 간격(초)
@@ -193,7 +197,14 @@ def main(environ: Mapping[str, str] | None = None) -> int:
     environ = dict(os.environ) if environ is None else dict(environ)
     config = ControlConfig.from_env(environ)
     settings = Stage2Settings.from_env(environ)
-    worker = Worker(config.require_database(), config.instance_id, settings)
+    litellm = (
+        LiteLLMControl(config.litellm_url, config.litellm_key)
+        if config.litellm_url and config.litellm_key else None
+    )
+    worker = Worker(
+        config.require_database(), config.instance_id, settings, litellm=litellm,
+        policy_root=environ.get("MINT_POLICY_ROOT", "/opt/mint"),
+    )
     worker.open()
     restore = install_signals(worker)
     print(f"작업 실행기 시작: {worker.owner}", file=sys.stderr, flush=True)

@@ -43,6 +43,7 @@ from mint_litellm.control.services import approvals as approval_service
 from mint_litellm.control.services import call_approvals as call_approval_service
 from mint_litellm.control.services import consents as consent_service
 from mint_litellm.control.services import denials as denial_service
+from mint_litellm.control.services import intakes as intake_service
 from mint_litellm.control.services import operators as operator_service
 from mint_litellm.control.services import orgs as org_service
 from mint_litellm.control.services import policy as policy_service
@@ -51,7 +52,7 @@ from mint_litellm.control.services import servers as server_service
 from mint_litellm.control.services import settings as settings_service
 from mint_litellm.types import fingerprint
 from mint_litellm.types.cli_commands import (
-    COMMANDS,
+    ALL_COMMANDS,
     CONTROL_PLANE_ALLOWED_ROUTES,
     CliCommand,
     OperatorRole,
@@ -84,6 +85,9 @@ class Run:
 
     def litellm(self) -> LiteLLMAdmin:
         return self.cfg.litellm()
+
+    def litellm_control(self) -> LiteLLMAdmin:
+        return self.cfg.litellm_control()
 
     def say(self, line: str) -> None:
         self.text.append(line)
@@ -497,6 +501,67 @@ def _allowlist_add(run: Run) -> None:
     )
 
 
+def _json_arg(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"JSON 형식이 올바르지 않습니다: {text}") from None
+
+
+def _intake_list(run: Run) -> None:
+    rows = intake_service.list_intakes(run.context(), run.args.status)
+    run.data["intakes"] = json.loads(json.dumps(rows, default=str))
+    for row in rows:
+        run.say(f"{row['id']}	{row['status']}	{row['decision'] or '-'}	{row['server_id']}"
+                f"	{row['source']}	{row['requested_by'] or '-'}")
+
+
+def _intake_show(run: Run) -> None:
+    info = intake_service.show(run.context(), run.args.intake_id)
+    run.data.update(json.loads(json.dumps(info, default=str)))
+    row = info["intake"]
+    run.say(f"{row['id']}	{row['status']}	{row['decision'] or '-'}	{row['server_id']}")
+    for check in info["checks"]:
+        run.say(f"  {check['check']}	{check['result']}	{check['reason_code'] or '-'}"
+                f"	시도 {check['attempt']}")
+    for tool in info["tool_contracts"]:
+        run.say(f"  도구 {tool['tool']}	{tool['status']}	{tool['risk_grade'] or '-'}"
+                f"	{tool['action_type'] or '-'}")
+
+
+def _intake_create(run: Run) -> None:
+    a = run.args
+    _created(
+        run,
+        intake_service.create(
+            run.context(), run.litellm_control(), a.server_id, url=a.url, org_id=a.org,
+            purpose=a.purpose, data_grade=a.data_grade, allowed_resources=a.allowed_resources,
+            provider=a.provider, owner_user_id=a.owner,
+            readiness={"credential_notice": a.credential_notice,
+                       "revocation_record": a.revocation_record,
+                       "audit_access_days": a.audit_access_days},
+            data_return_terms=a.data_return_terms, image_digest=a.image_digest,
+            source_commit=a.source_commit,
+        ),
+    )
+
+
+def _intake_decide(decision: str) -> Handler:
+    def handler(run: Run) -> None:
+        a = run.args
+        result = intake_service.decide(
+            run.context(), a.intake_id, decision, reason=a.reason, valid_until=a.valid_until,
+            scope_type=a.scope, scope_id=a.scope_id, team_id=a.team, second=_second(run),
+        )
+        run.data["id"] = str(result["id"])
+        for key in ("approval_id", "relation_id"):
+            if key in result:
+                run.data[key] = result[key]
+        run.say(str(result["id"]))
+
+    return handler
+
+
 HANDLERS: dict[str, Handler] = {
     "init": _init,
     "check": _check,
@@ -548,6 +613,21 @@ HANDLERS: dict[str, Handler] = {
 # ---------------------------------------------------------------------------
 # 인자 정의
 # ---------------------------------------------------------------------------
+
+
+INTAKE_HANDLERS: dict[str, Handler] = {
+    "intake list": _intake_list,
+    "intake show": _intake_show,
+    "intake create": _intake_create,
+    "intake recheck": lambda r: _created(
+        r, intake_service.recheck(r.context(), r.args.intake_id,
+                                  registry_first=r.args.registry_first)),
+    "intake assign": lambda r: intake_service.assign_requester(
+        r.context(), r.litellm(), r.args.intake_id, r.args.requester),
+    "intake approve": _intake_decide("approve"),
+    "intake reject": _intake_decide("reject"),
+    "intake except": _intake_decide("except"),
+}
 
 
 def _a(*flags: str, **kwargs: Any) -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -700,8 +780,52 @@ ARGUMENTS: dict[str, list[Any]] = {
 }
 
 
+_INTAKE_ID = _a("intake_id", help="신청 식별자")
+_DECISION = [
+    _INTAKE_ID,
+    _a("--reason", help="결정 사유(거절·예외는 필수)"),
+    _a("--valid-until", type=_when, help="승인 유효 기간의 끝(승인·예외 필수)"),
+    _a("--scope", choices=["key", "user", "team"], help="승인 범위(기본: 책임자 사용자)"),
+    _a("--scope-id", help="승인 범위의 식별자(기본: 책임자)"),
+    _a("--team", help="이용 관계의 팀"),
+    _SECOND,
+]
+
+INTAKE_ARGUMENTS: dict[str, list[Any]] = {
+    "intake list": [_a("--status", choices=["received", "checking", "passed", "failed",
+                                            "indeterminate", "decided"])],
+    "intake show": [_INTAKE_ID],
+    "intake create": [
+        _SERVER_ID,
+        _a("--url", help="계약 값에 쓸 서버 URL(제어 평면 키는 레지스트리 URL을 읽을 수 없다)"),
+        _a("--org", help="조직(기본: 운영자 사용자에서 유도)"),
+        _a("--purpose", required=True),
+        _a("--data-grade", required=True, choices=list(intake_service.DATA_GRADES)),
+        _a("--allowed-resources", required=True, type=_json_arg,
+           help="허용 자원(JSON 배열 또는 객체)"),
+        _a("--provider", required=True),
+        _a("--owner", required=True, help="책임자의 LiteLLM 사용자 식별자"),
+        _a("--credential-notice", required=True, help="자격 통지 확보 방법"),
+        _a("--revocation-record", required=True, help="철회 기록 확보 방법"),
+        _a("--audit-access-days", required=True, type=int, help="감사 접근 보장 일수"),
+        _a("--data-return-terms", required=True, help="자료 삭제·반환 조건"),
+        _a("--image-digest", help="자체 배포 서버의 이미지 다이제스트"),
+        _a("--source-commit", help="자체 배포 서버의 소스 커밋"),
+    ],
+    "intake recheck": [
+        _INTAKE_ID,
+        _a("--registry-first", action="store_true",
+           help="제출 서버를 LiteLLM 레지스트리에 올린 뒤 검사(키 권한은 주지 않는다)"),
+    ],
+    "intake assign": [_INTAKE_ID, _a("--requester", required=True, help="신청자 사용자 식별자")],
+    "intake approve": _DECISION,
+    "intake reject": _DECISION,
+    "intake except": _DECISION,
+}
+
+
 def _add_arguments(parser: argparse.ArgumentParser, name: str) -> None:
-    for spec in ARGUMENTS.get(name, []):
+    for spec in ARGUMENTS.get(name) or INTAKE_ARGUMENTS.get(name, []):
         if spec == "SUBJECT":
             group = parser.add_mutually_exclusive_group(required=True)
             group.add_argument("--team")
@@ -726,7 +850,7 @@ def build_parser() -> argparse.ArgumentParser:
     root.add_argument("--json", action="store_true", help="결과를 JSON 한 개로 출력")
     tree: dict[tuple[str, ...], argparse._SubParsersAction] = {(): root.add_subparsers(
         dest="group0", metavar="명령", required=True)}
-    for command in COMMANDS:
+    for command in ALL_COMMANDS:
         for depth in range(1, len(command.path)):
             prefix = command.path[:depth]
             if prefix not in tree:
@@ -745,7 +869,7 @@ def build_parser() -> argparse.ArgumentParser:
     return root
 
 
-COMMAND_INDEX: dict[str, CliCommand] = {c.name: c for c in COMMANDS}
+COMMAND_INDEX: dict[str, CliCommand] = {c.name: c for c in ALL_COMMANDS}
 
 
 def _token(args: argparse.Namespace, environ: dict[str, str]) -> str | None:
@@ -796,7 +920,7 @@ def run_command(args: argparse.Namespace, environ: dict[str, str]) -> None:
                 raise AuthError(f"{command.name}은(는) {operator.role} 역할로 실행할 수 없습니다.")
             ctx = Context(conn, cfg.instance_id, operator)
         run = Run(args, cfg, environ, conn, ctx)
-        HANDLERS[command.name](run)
+        {**HANDLERS, **INTAKE_HANDLERS}[command.name](run)
     if args.json:
         print(json.dumps(_result(run, command), ensure_ascii=False, default=str))
     else:

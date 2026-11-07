@@ -261,3 +261,63 @@ COMMANDS: tuple[CliCommand, ...] = (
         roles=ALL_ROLES,
     ),
 )
+
+
+# 2단계 신청(수용검증) 명령. 1단계 표(``COMMANDS``)와 그 시험 기대값을 바꾸지 않도록 별도 표로 둔다.
+INTAKE_COMMANDS: tuple[CliCommand, ...] = (
+    CliCommand(
+        path=("intake", "list"),
+        summary="수용검증 신청을 상태별로 조회한다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("intake", "show"),
+        summary="신청 한 건과 검사 결과, 도구 계약 후보를 보인다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("intake", "create"),
+        summary="서버의 수용검증 신청을 만든다. 제출에서 온 `received` 신청이 있으면 필수 입력을 "
+        "채운다. 필수 입력(목적, 자료 등급, 허용 자원, 제공자, 책임자, 종료 준비도 3항목,"
+        " 자료 삭제·반환 조건)이 모두 있어야 검사가 시작된다.",
+        roles=ADMIN_ONLY,
+        litellm_reads=(_SERVER_GET,),
+        events=(EventKind.INTAKE_RECEIVED,),
+    ),
+    CliCommand(
+        path=("intake", "recheck"),
+        summary="검사를 다시 한다. `--registry-first`는 자격이 필요한 제출 서버를 LiteLLM "
+        "레지스트리에 올린 뒤(키 권한은 주지 않는다) 연결·정의 검사를 다시 한다.",
+        roles=ADMIN_ONLY,
+    ),
+    CliCommand(
+        path=("intake", "assign"),
+        summary="신청자가 비어 있는 제출 신청에 사람 사용자를 신청자로 지정한다. "
+        "지정한 운영자는 그 신청을 결정할 수 없다.",
+        roles=ADMIN_ONLY,
+        litellm_reads=("/user/info",),
+        events=(EventKind.INTAKE_REQUESTER_ASSIGNED,),
+    ),
+    CliCommand(
+        path=("intake", "approve"),
+        summary="모든 검사를 통과한 신청을 승인한다. 신청자와 같은 사용자는 승인할 수 없고, "
+        "연결·정의 증거는 24시간 안이어야 한다. 이용 관계와 `pending` 승인이 만들어진다.",
+        roles=APPROVER_UP,
+        events=(EventKind.INTAKE_DECIDED, EventKind.CONTRACT_APPROVED),
+    ),
+    CliCommand(
+        path=("intake", "reject"),
+        summary="신청을 거절한다. 사유가 필요하며 제출 서버는 LiteLLM 제출도 거절된다.",
+        roles=APPROVER_UP,
+        events=(EventKind.INTAKE_DECIDED,),
+    ),
+    CliCommand(
+        path=("intake", "except"),
+        summary="판별 불가가 있는 신청을 예외 승인한다. 사유 필수, 두 번째 승인자 필수, 유효 기간 "
+        "90일 이내.",
+        roles=APPROVER_UP,
+        events=(EventKind.INTAKE_DECIDED, EventKind.CONTRACT_APPROVED),
+    ),
+)
+
+ALL_COMMANDS: tuple[CliCommand, ...] = COMMANDS + INTAKE_COMMANDS

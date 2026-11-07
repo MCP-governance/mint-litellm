@@ -114,6 +114,7 @@ SCHEDULES: dict[str, Callable[[Any], int]] = {
     "sync_reconcile": lambda s: s.reconcile_seconds,
     "export_checkpoint": lambda s: s.checkpoint_seconds,
     "session_verify": lambda s: s.session_verify_seconds,
+    "evidence_expiry_scan": lambda s: 3600,  # 1시간(고정)
 }
 
 

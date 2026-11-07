@@ -6,6 +6,7 @@ from pathlib import Path
 
 from mint_litellm.control.errors import ControlError
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
+from mint_litellm.control.litellm_control import LiteLLMControl
 from mint_litellm.types.settings import Mode
 
 
@@ -42,6 +43,11 @@ class ControlConfig:
         if not self.database_url:
             raise ControlError("MINT_DATABASE_URL이 설정되어 있지 않습니다.")
         return self.database_url
+
+    def litellm_control(self) -> LiteLLMControl:
+        if not self.litellm_url or not self.litellm_key:
+            raise ControlError("MINT_LITELLM_URL과 MINT_LITELLM_KEY가 필요합니다.")
+        return LiteLLMControl(self.litellm_url, self.litellm_key)
 
     def litellm(self) -> LiteLLMAdmin:
         if not self.litellm_url or not self.litellm_key:
