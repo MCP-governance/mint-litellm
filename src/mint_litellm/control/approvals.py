@@ -5,11 +5,12 @@ import re
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from mint_litellm.control import operators
+from mint_litellm.control import operators, sync_state
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.errors import ControlError, forbidden, not_found, separation_of_duties
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
+from mint_litellm.control.services import base
 from mint_litellm.types.events import EventKind
 from mint_litellm.types.ids import new_uuid7
 
@@ -322,6 +323,14 @@ def revoke(ctx: Context, approval_id: str, reason: str, deny: bool) -> None:
         {"approval_id": approval_id, "server_id": row["server_id"], "reason": reason,
          "with_denial": deny},
     )
+    if row["scope_type"] in sync_state.SYNC_SCOPES:
+        # 철회로 빠진 항목은 같은 수렴 작업이 LiteLLM에서 거둔다(그 항목의 카운터·보류를 지운다)
+        sync_state.reset_counters(
+            ctx.conn, ctx.instance_id, row["scope_type"], row["scope_id"], row["server_id"]
+        )
+        base.enqueue_job(
+            ctx, "sync_target", sync_state.target_ref(row["scope_type"], row["scope_id"])
+        )
     if deny:
         create_denial(
             ctx,

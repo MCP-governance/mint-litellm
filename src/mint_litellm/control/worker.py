@@ -13,6 +13,7 @@ import sys
 import threading
 import uuid
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import psycopg
 
@@ -20,6 +21,7 @@ from mint_litellm.control import jobs
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.db.connection import connect, fetchone
 from mint_litellm.control.errors import ControlError
+from mint_litellm.control.litellm_write import LiteLLMSync
 from mint_litellm.control.stage2_config import Stage2Settings
 
 log = logging.getLogger("mint_litellm.worker")
@@ -47,12 +49,14 @@ class Worker:
         lease_seconds: float | None = None,
         restore_check: Callable[[psycopg.Connection, str], bool] = no_restore_detected,
         owner: str | None = None,
+        litellm: Any = None,
     ) -> None:
         self.database_url = database_url
         self.instance_id = instance_id
         self.settings = settings
         self.lease_seconds = lease_seconds or settings.worker_lease_seconds
         self.restore_check = restore_check
+        self.litellm = litellm
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.stop = threading.Event()
         self.current: jobs.JobContext | None = None
@@ -124,6 +128,16 @@ class Worker:
                 ctx.cancel.set()
                 return
 
+    def _before_write(self, ctx: jobs.JobContext) -> Callable[[], None]:
+        """외부 쓰기 직전 확인: 취소·임대 상실, 되돌림 상태(공통 경계가 들어올 때까지의 자리)."""
+
+        def check() -> None:
+            ctx.checkpoint()
+            if self.restore_check(ctx.conn, self.instance_id):
+                raise jobs.RestoreBlocked
+
+        return check
+
     def _run(self, job: dict) -> None:
         assert self.conn is not None
         conn, job_id = self.conn, job["id"]
@@ -131,7 +145,8 @@ class Worker:
         if restored and jobs.KINDS[job["kind"]].external_write:
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
             return
-        ctx = jobs.JobContext(conn, self.instance_id, job, self.settings)
+        ctx = jobs.JobContext(conn, self.instance_id, job, self.settings, litellm=self.litellm)
+        ctx.before_write = self._before_write(ctx)
         self.current = ctx
         if self.stop.is_set():
             ctx.cancel.set()
@@ -141,6 +156,8 @@ class Worker:
         outcome: str | tuple[str, str] = "ok"
         try:
             jobs.HANDLERS[job["kind"]](ctx)
+        except jobs.RestoreBlocked:
+            outcome = "restore_blocked"
         except jobs.Cancelled:
             outcome = "cancelled"
         except Exception as error:  # 어떤 실패도 작업 실패로 센다(메시지는 저장하지 않는다)
@@ -159,6 +176,8 @@ class Worker:
             jobs.complete(conn, job_id, self.owner)
         elif outcome == "cancelled":
             jobs.release(conn, job_id, self.owner, "shutdown")
+        elif outcome == "restore_blocked":
+            jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
         else:
             jobs.fail(conn, job_id, self.owner, outcome[1])
 
@@ -182,7 +201,10 @@ def main(environ: Mapping[str, str] | None = None) -> int:
     environ = dict(os.environ) if environ is None else dict(environ)
     config = ControlConfig.from_env(environ)
     settings = Stage2Settings.from_env(environ)
-    worker = Worker(config.require_database(), config.instance_id, settings)
+    litellm = None
+    if config.litellm_url and config.litellm_key:
+        litellm = LiteLLMSync(config.litellm_url, config.litellm_key)
+    worker = Worker(config.require_database(), config.instance_id, settings, litellm=litellm)
     worker.open()
     restore = install_signals(worker)
     print(f"작업 실행기 시작: {worker.owner}", file=sys.stderr, flush=True)

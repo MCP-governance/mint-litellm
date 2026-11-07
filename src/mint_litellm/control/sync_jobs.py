@@ -1,0 +1,547 @@
+"""권한 동기화 작업 처리기: ``sync_target``, ``sync_server``, ``sync_reconcile``,
+``activation_finalize``.
+
+모든 처리기는 실행 시점의 DB 상태를 읽어 결과를 계산하는 수렴형이다. 같은 작업이 두 번 돌거나
+순서가 바뀌어도 결과가 같다. 외부 호출(LiteLLM 읽기·쓰기)은 트랜잭션 밖에서 하고, 그 결과를 DB에
+적는 일만 한 트랜잭션으로 묶는다.
+"""
+
+import functools
+from collections.abc import Callable
+from typing import Any
+
+import psycopg
+
+from mint_litellm.control import ledger
+from mint_litellm.control.context import Context, Operator
+from mint_litellm.control.db.connection import fetchall, fetchone
+from mint_litellm.control.errors import ControlError
+from mint_litellm.control.jobs import JobContext
+from mint_litellm.control.litellm_write import (
+    LiteLLMForbidden,
+    LiteLLMHttpError,
+    LiteLLMSync,
+    LiteLLMUnreachable,
+)
+from mint_litellm.control.services.base import enqueue_job
+from mint_litellm.control.sync_state import (
+    ACTOR,
+    SYNC_SCOPES,
+    Item,
+    Plan,
+    desired_for_target,
+    load_rows,
+    make_plan,
+    permission_of,
+    pin_satisfied,
+    present,
+    raise_alert,
+    resolve_alert,
+    split_ref,
+    target_ref,
+    upsert_grant,
+    withdraw_grant,
+)
+from mint_litellm.types.events import EventKind
+
+# MINT가 소유하지 않는 키·팀 필드. 쓰기 응답에서 읽기 전 값과 다르면 다른 관리자의 동시 수정이다.
+FOREIGN_FIELDS = ("blocked", "models", "max_budget", "user_id", "team_id", "allowed_routes",
+                  "metadata")
+UNREACHABLE_ALERT_AFTER = 3
+# 관리 API 연속 실패 횟수(작업 실행기 프로세스 안, 실행기 복제본마다 따로 센다).
+_failures: dict[str, int] = {}
+
+
+class SyncRetry(ControlError):
+    """이 작업은 다른 작업이 먼저 끝나야 한다. 재시도 규칙으로 대기에 되돌린다."""
+
+    code = "team_not_ready"
+
+
+class NotConfigured(ControlError):
+    code = "litellm_not_configured"
+
+
+def _actor_context(ctx: JobContext) -> Context:
+    return Context(ctx.conn, ctx.instance_id, Operator(ACTOR, "system", None))
+
+
+def _client(ctx: JobContext) -> LiteLLMSync:
+    if ctx.litellm is None:
+        raise NotConfigured("MINT_LITELLM_URL과 MINT_LITELLM_KEY가 없어 동기화할 수 없습니다.")
+    return ctx.litellm.with_hook(ctx.before_write)
+
+
+def _reachable(handler: Callable[[JobContext], None]) -> Callable[[JobContext], None]:
+    """관리 API 연속 실패를 세어 3회째에 경보 ``litellm_unreachable``을 연다. 성공하면 닫는다."""
+
+    @functools.wraps(handler)
+    def run(ctx: JobContext) -> None:
+        try:
+            handler(ctx)
+        except LiteLLMUnreachable:
+            _failures[ctx.instance_id] = _failures.get(ctx.instance_id, 0) + 1
+            if _failures[ctx.instance_id] >= UNREACHABLE_ALERT_AFTER:
+                raise_alert(
+                    ctx.conn, ctx.instance_id, kind="litellm_unreachable", severity="high",
+                    dedup_key="litellm_unreachable",
+                    subject={"consecutive_failures": _failures[ctx.instance_id]},
+                )
+            raise
+        _failures[ctx.instance_id] = 0
+        resolve_alert(ctx.conn, ctx.instance_id, "litellm_unreachable")
+
+    return run
+
+
+def _read(client: LiteLLMSync, kind: str, target_id: str) -> dict | None:
+    return client.get_key(target_id) if kind == "key" else client.get_team(target_id)
+
+
+def _event(
+    conn: psycopg.Connection, instance_id: str, kind: EventKind, grant: dict, payload: dict
+) -> None:
+    ledger.record(
+        conn, instance_id, kind, entity_id=str(grant["id"]),
+        state_version=grant["state_version"], actor=ACTOR, payload=payload,
+    )
+
+
+def _pending_approvals(conn: psycopg.Connection, instance_id: str, ids: tuple[str, ...]) -> list:
+    if not ids:
+        return []
+    rows = fetchall(
+        conn,
+        "SELECT id FROM mint.approvals WHERE instance_id = %s AND status = 'pending'"
+        " AND id = ANY(%s::uuid[])",
+        (instance_id, list(ids)),
+    )
+    return [str(r["id"]) for r in rows]
+
+
+def _request_finalize(ctx: JobContext, approval_ids: list[str]) -> None:
+    for approval_id in approval_ids:
+        enqueue_job(_actor_context(ctx), "activation_finalize", approval_id)
+
+
+# --- sync_target -------------------------------------------------------------------
+
+
+def _foreign_changes(before: dict, after: dict | None) -> list[str]:
+    """쓰기 전에 읽은 값과 쓰기 응답에서 MINT 소유가 아닌 필드가 달라진 것."""
+    after = after or {}
+    return [f for f in FOREIGN_FIELDS if f in before and f in after and before[f] != after[f]]
+
+
+def _write(client: LiteLLMSync, kind: str, target_id: str, plan: Plan) -> dict:
+    if kind == "key":
+        return client.update_key_permission(target_id, plan.servers, plan.tools)
+    return client.update_team_permission(target_id, plan.servers, plan.tools)
+
+
+def _record(
+    ctx: JobContext, kind: str, target_id: str, plan: Plan, rows: list[dict],
+    before: tuple[list[str], dict], after: tuple[list[str], dict], written: bool,
+) -> list[dict]:
+    """읽어 확인한 결과를 ``litellm_grants``에 적고 사건을 남긴다. 확인되지 않은 항목을 돌려준다."""
+    conn, inst = ctx.conn, ctx.instance_id
+    old = {(r["item"], r["server_id"]): r for r in rows if r["observed"] is not None}
+    unconfirmed: list[dict] = []
+    with conn.transaction():
+        for it in plan.items:
+            confirmed = present(it, *after)
+            tools = it.tools if it.item == "tool_permission" else None
+            if it.want:
+                applied = confirmed and written and not present(it, *before)
+                grant = upsert_grant(
+                    conn, inst, kind, target_id, it.item, it.server_id, tools=tools,
+                    preexisting=it.preexisting, observed=confirmed, applied=applied,
+                )
+                if applied:
+                    _event(conn, inst, EventKind.SYNC_APPLIED, grant, _payload(kind, target_id, it,
+                                                                               "grant"))
+                if not confirmed:
+                    unconfirmed.append(_payload(kind, target_id, it, "grant"))
+                continue
+            # 거두는 항목: 원래 있던 것은 그대로 두고 관리만 끝낸다
+            if it.preexisting or confirmed:
+                grant = withdraw_grant(conn, old[(it.item, it.server_id)]["id"])
+                if not it.preexisting and written:
+                    _event(conn, inst, EventKind.SYNC_APPLIED, grant,
+                           _payload(kind, target_id, it, "withdraw"))
+            else:
+                unconfirmed.append(_payload(kind, target_id, it, "withdraw"))
+    return unconfirmed
+
+
+def _payload(kind: str, target_id: str, it: Item, action: str) -> dict:
+    return {"target_type": kind, "target_id": target_id, "item": it.item,
+            "server_id": it.server_id, "tools": it.tools, "preexisting": it.preexisting,
+            "action": action}
+
+
+@_reachable
+def sync_target(ctx: JobContext) -> None:
+    """키·팀 하나를 원하는 상태로 맞춘다. MINT 소유 항목만 바꾼 전체 목록·맵을 쓴다."""
+    kind, target_id = split_ref(ctx.job["target_ref"])
+    ref, conn, inst = target_ref(kind, target_id), ctx.conn, ctx.instance_id
+    client = _client(ctx)
+    ctx.checkpoint()
+    current = _read(client, kind, target_id)
+    gone_key = f"sync_divergence:target:{ref}"
+    if current is None:
+        raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=gone_key,
+                    subject={"target": ref, "reason": "target_missing"})
+        return
+    resolve_alert(conn, inst, gone_key)
+    desired = desired_for_target(conn, inst, kind, target_id)
+    rows = load_rows(conn, inst, kind, target_id)
+    before = permission_of(current)
+    plan = make_plan(*before, desired, rows)
+    response = None
+    if plan.changed:
+        try:
+            response = _write(client, kind, target_id, plan)
+        except LiteLLMForbidden:
+            team = current.get("team_id") if kind == "key" else None
+            if not team:
+                raise
+            # 팀 소속 키의 서버는 팀 허용 서버의 부분집합이어야 한다. 팀을 먼저 맞춘다.
+            enqueue_job(_actor_context(ctx), "sync_target", target_ref("team", team))
+            raise SyncRetry(f"팀 {team}이(가) 먼저 맞춰져야 합니다.") from None
+        changed_fields = _foreign_changes(
+            current, response if kind == "key" else (response or {}).get("data")
+        )
+        key = f"sync_foreign_change:{ref}"
+        if changed_fields:
+            raise_alert(conn, inst, kind="sync_foreign_change", severity="medium", dedup_key=key,
+                        subject={"target": ref, "fields": changed_fields})
+        else:
+            resolve_alert(conn, inst, key)
+    reread = _read(client, kind, target_id)
+    after = permission_of(reread)
+    unconfirmed = _record(ctx, kind, target_id, plan, rows, before, after, response is not None)
+    key = f"sync_divergence:readback:{ref}"
+    if unconfirmed:
+        raise_alert(conn, inst, kind="sync_divergence", severity="medium", dedup_key=key,
+                    subject={"target": ref, "reason": "readback_mismatch", "items": unconfirmed})
+    else:
+        resolve_alert(conn, inst, key)
+    _request_finalize(ctx, _pending_approvals(conn, inst, desired.approvals))
+
+
+# --- sync_server ---------------------------------------------------------------------
+
+
+@_reachable
+def sync_server(ctx: JobContext) -> None:
+    """LiteLLM 서버가 있는지 확인하고, 제출 서버면 승인한다. 결과를 적고 활성화 완결을 요청한다.
+
+    고정(pin) 단계는 이 자리에 들어온다.
+    """
+    server_id, conn, inst = ctx.job["target_ref"], ctx.conn, ctx.instance_id
+    if not fetchone(
+        conn, "SELECT 1 AS x FROM mint.servers WHERE instance_id = %s AND server_id = %s",
+        (inst, server_id),
+    ):
+        return
+    wanted = fetchall(
+        conn,
+        "SELECT id, status FROM mint.approvals WHERE instance_id = %s AND server_id = %s"
+        " AND ((status = 'active' AND valid_from <= now() AND valid_until > now())"
+        " OR (status = 'pending' AND valid_until > now()))",
+        (inst, server_id),
+    )
+    if not wanted:
+        return  # 서버 승인 상태는 명시 중지로만 바뀐다. 고정 해제는 고정 단계의 일이다.
+    client = _client(ctx)
+    ctx.checkpoint()
+    key = f"sync_divergence:server:{server_id}"
+    server = client.get_server(server_id)
+    if server is None:
+        raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=key,
+                    subject={"server_id": server_id, "reason": "registry_missing"})
+        _record_server(ctx, server_id, observed=False, approved_now=False, first_seen_active=False)
+        return
+    status = server.get("approval_status")
+    approved_now = False
+    if status == "pending_review":
+        try:
+            client.approve_server(server_id)
+            approved_now = True
+        except LiteLLMHttpError as error:
+            if error.status != 400:  # 400은 그 사이 다른 쪽이 승인한 경우다
+                raise
+        status = (client.get_server(server_id) or {}).get("approval_status")
+    active = status == "active"
+    _record_server(ctx, server_id, observed=active, approved_now=approved_now,
+                   first_seen_active=active and not approved_now)
+    if active:
+        resolve_alert(conn, inst, key)
+    else:
+        raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=key,
+                    subject={"server_id": server_id, "reason": "not_active", "status": status})
+    _request_finalize(ctx, [str(r["id"]) for r in wanted if r["status"] == "pending"])
+
+
+def _record_server(
+    ctx: JobContext, server_id: str, *, observed: bool, approved_now: bool, first_seen_active: bool
+) -> None:
+    conn, inst = ctx.conn, ctx.instance_id
+    with conn.transaction():
+        row = fetchone(
+            conn,
+            "SELECT preexisting FROM mint.litellm_grants WHERE instance_id = %s"
+            " AND target_type = 'server' AND target_id = %s AND item = 'server_approval'"
+            " AND server_id = %s AND observed IS NOT NULL",
+            (inst, server_id, server_id),
+        )
+        grant = upsert_grant(
+            conn, inst, "server", server_id, "server_approval", server_id, tools=None,
+            preexisting=row["preexisting"] if row else first_seen_active, observed=observed,
+            applied=approved_now,
+        )
+        if approved_now:
+            _event(conn, inst, EventKind.SYNC_APPLIED, grant,
+                   {"target_type": "server", "target_id": server_id, "item": "server_approval",
+                    "server_id": server_id, "tools": None, "preexisting": False,
+                    "action": "grant"})
+
+
+# --- activation_finalize -------------------------------------------------------------
+
+
+def _target_ready(client: LiteLLMSync, approval: dict) -> bool:
+    """대상 권한에 이 승인의 서버와 도구가 지금 있는가(읽어서 확인)."""
+    current = _read(client, approval["scope_type"], approval["scope_id"])
+    if current is None:
+        return False
+    servers, tools = permission_of(current)
+    entry = tools.get(approval["server_id"])
+    return approval["server_id"] in servers and entry is not None and set(approval["tools"]) <= set(
+        entry
+    )
+
+
+@_reachable
+def activation_finalize(ctx: JobContext) -> None:
+    """대기 승인을 활성으로 바꾼다. 조건이 안 되면 아무것도 하지 않는다.
+
+    조건: 서버의 LiteLLM 승인 상태가 확인되었고, 키·팀 범위면 대상의 서버와 도구가 LiteLLM에
+    있다. 고정 조건은 ``pin_satisfied``가 들어올 자리다.
+    """
+    conn, inst = ctx.conn, ctx.instance_id
+    approval = fetchone(
+        conn,
+        "SELECT * FROM mint.approvals WHERE instance_id = %s AND id = %s",
+        (inst, ctx.job["target_ref"]),
+    )
+    if approval is None or approval["status"] != "pending":
+        return
+    server_id = approval["server_id"]
+    server_row = fetchone(
+        conn,
+        "SELECT observed FROM mint.litellm_grants WHERE instance_id = %s AND target_type ="
+        " 'server' AND target_id = %s AND item = 'server_approval' AND server_id = %s",
+        (inst, server_id, server_id),
+    )
+    if not server_row or server_row["observed"] is not True:
+        return
+    if not pin_satisfied(conn, inst, server_id):
+        return
+    ctx.checkpoint()
+    if approval["scope_type"] in SYNC_SCOPES:
+        rows = {
+            (r["item"], r["server_id"]): r
+            for r in load_rows(conn, inst, approval["scope_type"], approval["scope_id"])
+        }
+        for item in ("mcp_server", "tool_permission"):
+            row = rows.get((item, server_id))
+            if row is None or row["observed"] is not True:
+                return
+    client = _client(ctx)
+    server = client.get_server(server_id)
+    if server is None or server.get("approval_status") != "active":
+        return
+    if approval["scope_type"] in SYNC_SCOPES and not _target_ready(client, approval):
+        return
+    with conn.transaction():
+        activated = fetchone(
+            conn,
+            "UPDATE mint.approvals SET status = 'active',"
+            " granted_by = COALESCE(granted_by, %s) WHERE id = %s AND status = 'pending'"
+            " RETURNING id",
+            (ACTOR, approval["id"]),
+        )
+        if activated is None:
+            return
+        first = fetchone(
+            conn,
+            "SELECT id, status FROM mint.servers WHERE instance_id = %s AND server_id = %s"
+            " FOR UPDATE",
+            (inst, server_id),
+        )
+        if first and first["status"] == "awaiting_approval":
+            allowlists = (approval["basis"] or {}).get("allowlist_ids") or []
+            updated = fetchone(
+                conn,
+                "UPDATE mint.servers SET status = 'approved', basis_allowlist_ids = %s::uuid[]"
+                " WHERE id = %s RETURNING state_version",
+                (allowlists, first["id"]),
+            )
+            ledger.record(
+                conn, inst, EventKind.SERVER_APPROVED, entity_id=str(first["id"]),
+                state_version=updated["state_version"], actor=ACTOR,
+                payload={"server_id": server_id, "first_approval_id": str(approval["id"]),
+                         "basis_allowlist_ids": allowlists},
+            )
+        conn.execute(
+            "UPDATE mint.servers SET last_observed_at = now() WHERE instance_id = %s"
+            " AND server_id = %s",
+            (inst, server_id),
+        )
+
+
+# --- sync_reconcile ------------------------------------------------------------------
+
+_COUNT_MISSING = (
+    "WITH expired AS (SELECT (missing_window_start IS NULL OR missing_window_start <="
+    " now() - make_interval(secs => %s)) AS fresh FROM mint.litellm_grants WHERE id = %s"
+    " FOR UPDATE) "
+    "UPDATE mint.litellm_grants g SET observed = false,"
+    " missing_count = CASE WHEN e.fresh THEN 1 ELSE g.missing_count + 1 END,"
+    " missing_window_start = CASE WHEN e.fresh THEN now() ELSE g.missing_window_start END,"
+    " held = NOT e.fresh, held_at = CASE WHEN e.fresh THEN g.held_at ELSE now() END"
+    " FROM expired e WHERE g.id = %s RETURNING g.id, g.state_version, g.held, g.missing_count"
+)
+
+
+def _missing(row: dict, desired: Any, servers: list[str], tools: dict) -> bool:
+    """MINT가 반영한 항목이 원하는데 LiteLLM에 없는가."""
+    if row["item"] == "mcp_server":
+        return row["server_id"] in desired.servers and row["server_id"] not in servers
+    want = desired.tools.get(row["server_id"])
+    return bool(want) and not want <= set(tools.get(row["server_id"], ()))
+
+
+def _count_missing(
+    ctx: JobContext, kind: str, target_id: str, row: dict, window_seconds: int
+) -> bool:
+    """외부 삭제 한 번을 센다. 한 시간 창 안의 두 번째면 보류하고 참을 돌려준다."""
+    conn, inst = ctx.conn, ctx.instance_id
+    with conn.transaction():
+        updated = fetchone(conn, _COUNT_MISSING, (window_seconds, row["id"], row["id"]))
+        if not updated["held"]:
+            return False
+        payload = {"target_type": kind, "target_id": target_id, "item": row["item"],
+                   "server_id": row["server_id"], "missing_count": updated["missing_count"],
+                   "window_seconds": window_seconds}
+        _event(conn, inst, EventKind.SYNC_HELD, updated, payload)
+        raise_alert(conn, inst, kind="sync_divergence", severity="high",
+                    dedup_key=f"sync_divergence:held:{row['id']}",
+                    subject={**payload, "reason": "held"})
+    return True
+
+
+def _reconcile_target(
+    ctx: JobContext, client: LiteLLMSync, kind: str, target_id: str, window_seconds: int
+) -> None:
+    conn, inst = ctx.conn, ctx.instance_id
+    ref = target_ref(kind, target_id)
+    gone_key = f"sync_divergence:target:{ref}"
+    current = _read(client, kind, target_id)
+    if current is None:
+        raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=gone_key,
+                    subject={"target": ref, "reason": "target_missing"})
+        return
+    resolve_alert(conn, inst, gone_key)
+    desired = desired_for_target(conn, inst, kind, target_id)
+    rows = load_rows(conn, inst, kind, target_id)
+    servers, tools = permission_of(current)
+    regrant = False
+    for row in rows:
+        # 반영되어 있던 항목이 없어진 순간만 외부 삭제 한 번으로 센다(이미 없다고 본 것은 다시 세지
+        # 않는다. 복구 작업이 다시 보면 반영됨으로 돌아온다).
+        if row["observed"] is not True or row["held"] or not _missing(row, desired, servers, tools):
+            continue
+        if not _count_missing(ctx, kind, target_id, row, window_seconds):
+            regrant = True
+    after = load_rows(conn, inst, kind, target_id)
+    plan = make_plan(servers, tools, desired, after)
+    if plan.changed or regrant:
+        enqueue_job(_actor_context(ctx), "sync_target", ref)
+
+
+def _reconcile_server(ctx: JobContext, client: LiteLLMSync, server_id: str) -> None:
+    conn, inst = ctx.conn, ctx.instance_id
+    key = f"sync_divergence:server:{server_id}"
+    server = client.get_server(server_id)
+    if server is None:
+        raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=key,
+                    subject={"server_id": server_id, "reason": "registry_missing"})
+        return
+    status = server.get("approval_status")
+    grant = fetchone(
+        conn,
+        "SELECT observed FROM mint.litellm_grants WHERE instance_id = %s AND target_type ="
+        " 'server' AND target_id = %s AND item = 'server_approval' AND server_id = %s",
+        (inst, server_id, server_id),
+    )
+    if status == "active":
+        resolve_alert(conn, inst, key)
+        if grant is None or grant["observed"] is not True:
+            enqueue_job(_actor_context(ctx), "sync_server", server_id)
+        return
+    raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=key,
+                subject={"server_id": server_id, "reason": "not_active", "status": status})
+    if status == "pending_review":
+        enqueue_job(_actor_context(ctx), "sync_server", server_id)
+
+
+def _overdue_activations(ctx: JobContext) -> None:
+    """한 시간 안에 완결되지 않은 대기 승인에 경보 ``job_failed``를 올리고 완결을 다시 요청한다."""
+    conn, inst = ctx.conn, ctx.instance_id
+    for row in fetchall(
+        conn,
+        "SELECT a.id::text AS ref, (SELECT min(j.created_at) FROM mint.jobs j WHERE"
+        " j.instance_id = a.instance_id AND j.kind = 'activation_finalize'"
+        " AND j.target_ref = a.id::text) < now() - interval '1 hour' AS overdue"
+        " FROM mint.approvals a WHERE a.instance_id = %s AND a.status = 'pending'"
+        " AND a.valid_until > now()",
+        (inst,),
+    ):
+        enqueue_job(_actor_context(ctx), "activation_finalize", row["ref"])
+        if row["overdue"]:
+            raise_alert(conn, inst, kind="job_failed", severity="high",
+                        dedup_key=f"job_failed:activation_finalize:{row['ref']}",
+                        subject={"job_kind": "activation_finalize", "target_ref": row["ref"],
+                                 "reason": "not_completed_within_one_hour"})
+
+
+@_reachable
+def sync_reconcile(ctx: JobContext) -> None:
+    """대상마다 LiteLLM 값과 원하는 상태를 비교해 차이가 있으면 그 대상의 동기화를 등록한다."""
+    conn, inst = ctx.conn, ctx.instance_id
+    client = _client(ctx)
+    window = ctx.settings.sync_hold_window_seconds
+    targets = fetchall(
+        conn,
+        "SELECT scope_type AS kind, scope_id AS id FROM mint.approvals WHERE instance_id = %s"
+        " AND scope_type IN ('key', 'team') AND status IN ('active', 'pending')"
+        " UNION SELECT target_type, target_id FROM mint.litellm_grants WHERE instance_id = %s"
+        " AND target_type IN ('key', 'team') AND observed IS NOT NULL ORDER BY 1, 2",
+        (inst, inst),
+    )
+    for target in targets:
+        ctx.checkpoint()
+        _reconcile_target(ctx, client, target["kind"], target["id"], window)
+    servers = fetchall(
+        conn,
+        "SELECT DISTINCT server_id FROM mint.approvals WHERE instance_id = %s"
+        " AND status IN ('active', 'pending') ORDER BY 1",
+        (inst,),
+    )
+    for server in servers:
+        ctx.checkpoint()
+        _reconcile_server(ctx, client, server["server_id"])
+    _overdue_activations(ctx)

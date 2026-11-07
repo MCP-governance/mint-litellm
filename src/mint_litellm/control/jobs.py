@@ -58,6 +58,10 @@ class Cancelled(Exception):
     """작업 코드가 취소 신호를 보고 외부 호출을 멈추고 끝낼 때 낸다."""
 
 
+class RestoreBlocked(Cancelled):
+    """외부 쓰기 직전에 되돌림 상태로 판정되어 멈출 때 낸다(실패가 아니라 대기)."""
+
+
 @dataclass
 class JobContext:
     """처리기에 건네는 맥락. 처리기는 외부 호출 전에 ``checkpoint()``로 취소를 확인한다."""
@@ -68,6 +72,10 @@ class JobContext:
     settings: Any = None
     cancel: threading.Event = field(default_factory=threading.Event)
     lost: threading.Event = field(default_factory=threading.Event)
+    # 관리 API 클라이언트(쓰기 가능). 설정이 없으면 None이다.
+    litellm: Any = None
+    # 외부 쓰기 직전마다 부르는 확인(취소·임대·되돌림). 예외를 내면 쓰지 않는다.
+    before_write: Callable[[], None] | None = None
 
     def checkpoint(self) -> None:
         if self.cancel.is_set():
@@ -78,9 +86,24 @@ def _approval_expiry_scan(job: JobContext) -> None:
     expiry.expire_due(job.conn, job.instance_id)
 
 
+def _sync(name: str) -> Callable[[JobContext], None]:
+    """권한 동기화 처리기(``sync_jobs``)를 부를 때 불러온다(모듈 순환을 피한다)."""
+
+    def run(job: JobContext) -> None:
+        from mint_litellm.control import sync_jobs
+
+        getattr(sync_jobs, name)(job)
+
+    return run
+
+
 # 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
 HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "approval_expiry_scan": _approval_expiry_scan,
+    "sync_server": _sync("sync_server"),
+    "sync_target": _sync("sync_target"),
+    "sync_reconcile": _sync("sync_reconcile"),
+    "activation_finalize": _sync("activation_finalize"),
 }
 
 # 일정(주기 작업): 종류 -> 설정에서 주기(초)를 얻는 함수. 처리기가 있는 종류만 일정을 만든다.
