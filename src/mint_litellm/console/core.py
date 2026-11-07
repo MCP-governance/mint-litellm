@@ -1,6 +1,8 @@
 """콘솔 공통: 설정, 요청마다 여는 DB 연결, 인증(세션 쿠키 또는 운영자 토큰), 오류 변환."""
 
 import hmac
+import time
+from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +21,7 @@ from mint_litellm.control.services import console_sessions
 from mint_litellm.control.stage2_config import Stage2Settings
 
 COOKIE = "__Host-mint_session"
+STAFF_COOKIE = "__Host-mint_staff"
 UNSAFE = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 STATUS = {
@@ -29,6 +32,7 @@ STATUS = {
     AdminCode.STALE_EVIDENCE: 409,
 }
 INVALID = "MINT-ADMIN-INVALID-INPUT"
+COOKIE_OPTIONS = {"httponly": True, "secure": True, "samesite": "strict", "path": "/"}
 
 
 class ReadOnlyLiteLLM:
@@ -57,6 +61,8 @@ class ConsoleConfig:
     # 승인·운영자 등록처럼 LiteLLM 읽기가 필요한 변경에만 쓴다. 없으면 그 변경은 거부한다.
     litellm_admin: ReadOnlyLiteLLM | None
     database_url: str
+    # 직원 화면 전용 로그인 역할(mint_staff_app)의 주소. 없으면 직원 화면을 열지 않는다.
+    staff_database_url: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "ConsoleConfig":
@@ -65,7 +71,10 @@ class ConsoleConfig:
         if not control.litellm_url:
             raise ControlError("MINT_LITELLM_URL이 설정되어 있지 않습니다.")
         admin = ReadOnlyLiteLLM(control.litellm()) if control.litellm_key else None
-        return cls(control, stage2, control.litellm_url, admin, control.require_database())
+        staff_url = (env.get("MINT_STAFF_DATABASE_URL") or "").strip() or None
+        return cls(
+            control, stage2, control.litellm_url, admin, control.require_database(), staff_url
+        )
 
     @property
     def instance_id(self) -> str:
@@ -106,6 +115,25 @@ class Actor:
         return self.config.litellm_admin
 
 
+def is_staff_path(request: Request) -> bool:
+    return request.url.path == "/staff" or request.url.path.startswith("/staff/")
+
+
+LOGIN_ATTEMPTS_PER_MINUTE = 10
+
+def too_many_attempts(request: Request) -> bool:
+    """같은 주소의 분당 로그인 시도 수 제한. 프로세스별 메모리 기준이다(복제본마다 따로 센다)."""
+    now = time.monotonic()
+    address = request.client.host if request.client else ""
+    window = request.app.state.attempts.setdefault(address, deque())
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= LOGIN_ATTEMPTS_PER_MINUTE:
+        return True
+    window.append(now)
+    return False
+
+
 def config_of(request: Request) -> ConsoleConfig:
     return request.app.state.config
 
@@ -141,7 +169,7 @@ async def require_csrf(request: Request) -> None:
         return
     if request.headers.get("authorization", "").lower().startswith("bearer "):
         return
-    cookie = request.cookies.get(COOKIE)
+    cookie = request.cookies.get(STAFF_COOKIE if is_staff_path(request) else COOKIE)
     if not cookie:
         return  # 세션이 없으면 인증 단계가 거부한다(로그인 요청은 출처만 확인한다)
     sent = request.headers.get("x-csrf-token")
@@ -203,9 +231,10 @@ def error_response(error: ControlError, request_id: str) -> JSONResponse:
 
 
 def login_redirect(request: Request) -> Response:
+    target = "/staff/login" if is_staff_path(request) else "/login"
     if request.headers.get("hx-request"):
-        return Response(status_code=200, headers={"HX-Redirect": "/login"})
-    return RedirectResponse("/login", status_code=303)
+        return Response(status_code=200, headers={"HX-Redirect": target})
+    return RedirectResponse(target, status_code=303)
 
 
 def public(value: Any) -> Any:

@@ -1,0 +1,14 @@
+{% extends "staff_base.html" %}{% import "macros.html" as m %}
+{% block title %}사용 가능한 서버·도구 · MINT{% endblock %}
+{% block body %}
+<h1>사용 가능한 서버·도구</h1>
+{% if rows %}
+<table><thead><tr><th>서버</th><th>조직</th><th>전송</th><th>인증</th><th>도구</th><th>승인 만료</th></tr></thead><tbody>
+{% for r in rows %}<tr>
+<td>{{ r.server_id }}</td><td>{{ r.org_name }}</td>
+<td>{{ L.pick(L.TRANSPORT, r.transport) }}</td><td>{{ L.pick(L.AUTH_TYPE, r.auth_type) }}</td>
+<td>{{ r.tools | join }}</td><td>{{ r.valid_until | when }}</td>
+</tr>{% endfor %}
+</tbody></table>
+{% else %}{{ m.empty('쓸 수 있는 서버가 없습니다', '/staff/consents', '동의 관리') }}{% endif %}
+{% endblock %}
