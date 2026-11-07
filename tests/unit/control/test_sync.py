@@ -808,9 +808,10 @@ def test_a_controlled_server_opened_to_all_keys_is_closed_and_reported(admin, fa
     [alert] = alerts(admin, "sync_foreign_change")
     assert alert["subject"] == {"server_id": "srv-1", "fields": ["allow_all_keys"]}
     assert alerts(admin, "sync_divergence") == []
-    reconcile(admin)  # 이미 닫혔으면 쓰지 않는다
+    reconcile(admin)  # 이미 닫혔으면 쓰지 않고, 돌아온 값을 보면 외부 변경 경보를 닫는다
     drain(worker)
     assert len(fake.writes()) == 1
+    assert alerts(admin, "sync_foreign_change")[0]["status"] == "resolved"
 
 
 def test_an_allow_all_keys_that_cannot_be_closed_raises_a_divergence(admin, fake, worker):
@@ -866,6 +867,10 @@ def test_a_row_left_unobserved_is_fixed_by_the_reconcile_and_the_approval_activa
     reconcile(admin)
     drain(worker)
     assert [g["observed"] for g in grants(admin) if g["target_type"] == "key"] == [True, True]
+    late = [e for e in events(admin, "sync_applied") if e["payload"].get("late_confirmation")]
+    assert len(late) == 2  # 늦게 확인한 두 행의 반영이 사건으로 남았다
+    assert all(g["last_applied_at"] is not None for g in grants(admin)
+               if g["target_type"] == "key")
     assert fetchone(admin, "SELECT status FROM mint.approvals WHERE id = %s",
                     (approval,))["status"] == "active"
     assert len(fake.writes()) == 1  # 이미 있는 항목은 다시 쓰지 않는다
