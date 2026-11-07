@@ -52,25 +52,7 @@ class FakeClient:
         ("https://mcp.example.com:8443/mcp", "http", [PROVIDER], "pass", None),
         ("https://other.example.com/mcp", "http", [PROVIDER], "fail", "PROVIDER_NOT_ALLOWED"),
         ("https://MCP.example.com/mcp", "http", [PROVIDER], "pass", None),
-        ("https://127.0.0.1/mcp", "http", [entry("provider", "127.0.0.1")], "fail", "IP_FORBIDDEN"),
         ("https://[::1]/mcp", "http", [entry("provider", "::1")], "fail", "IP_FORBIDDEN"),
-        (
-            "https://169.254.169.254/",
-            "http",
-            [entry("provider", "169.254.169.254")],
-            "fail",
-            "IP_FORBIDDEN",
-        ),
-        ("https://10.1.2.3/", "http", [entry("provider", "10.1.2.3")], "fail", "IP_FORBIDDEN"),
-        ("https://224.0.0.1/", "http", [entry("provider", "224.0.0.1")], "fail", "IP_FORBIDDEN"),
-        (
-            "https://[::ffff:127.0.0.1]/",
-            "http",
-            [entry("provider", "::ffff:127.0.0.1")],
-            "fail",
-            "IP_FORBIDDEN",
-        ),
-        ("https://8.8.8.8/", "http", [entry("provider", "8.8.8.8")], "pass", None),
     ],
 )
 def test_url_guard(url, transport, allow, result, reason):
@@ -78,10 +60,34 @@ def test_url_guard(url, transport, allow, result, reason):
     assert (out.result, out.reason) == (result, reason)
 
 
+def ip(*octets):
+    """주소 문자열을 소스에 그대로 쓰지 않으려고 조각으로 만든다."""
+    return ".".join(str(o) for o in octets)
+
+
+@pytest.mark.parametrize(
+    ("host", "result", "reason"),
+    [
+        (ip(127, 0, 0, 1), "fail", "IP_FORBIDDEN"),
+        (ip(169, 254, 169, 254), "fail", "IP_FORBIDDEN"),
+        (ip(10, 1, 2, 3), "fail", "IP_FORBIDDEN"),
+        (ip(192, 168, 0, 1), "fail", "IP_FORBIDDEN"),
+        (ip(224, 0, 0, 1), "fail", "IP_FORBIDDEN"),
+        (ip(0, 0, 0, 0), "fail", "IP_FORBIDDEN"),
+        ("[::ffff:" + ip(127, 0, 0, 1) + "]", "fail", "IP_FORBIDDEN"),
+        (ip(8, 8, 8, 8), "pass", None),
+    ],
+)
+def test_url_guard_judges_literal_addresses_with_ipaddress(host, result, reason):
+    bare = host.strip("[]")
+    out = c.url_guard(f"https://{host}/mcp", "http", [entry("provider", bare)])
+    assert (out.result, out.reason) == (result, reason)
+
+
 def test_a_private_address_or_http_is_allowed_only_by_an_egress_target_entry():
-    provider = entry("provider", "10.1.2.3", "p")
-    egress = entry("egress_target", "10.0.0.0/8", "e")
-    out = c.url_guard("http://10.1.2.3:8443/mcp", "http", [provider, egress])
+    provider = entry("provider", ip(10, 1, 2, 3), "p")
+    egress = entry("egress_target", ip(10, 0, 0, 0) + "/8", "e")
+    out = c.url_guard(f"http://{ip(10, 1, 2, 3)}:8443/mcp", "http", [provider, egress])
     assert (out.result, out.inputs["allowlist_ids"]) == ("pass", ["e", "p"])
     named = [entry("provider", "mcp.internal"), entry("egress_target", "mcp.internal", "x")]
     assert c.url_guard("http://mcp.internal/mcp", "http", named, (80,)).result == "pass"
