@@ -262,7 +262,7 @@ def test_a_user_outside_the_org_and_a_suspended_server_are_refused(world):
         staff.grant_consent(sctx(world), SESSION, **consent_args(org_id="beta"), team_ids=["t1"])
     with psycopg.connect(url) as admin:
         admin.execute("UPDATE mint.servers SET status = 'suspended' WHERE server_id = 'srv'")
-    with pytest.raises(ControlError, match="suspended"):
+    with pytest.raises(ControlError, match="승인된 서버가 아니어서"):
         staff.grant_consent(sctx(world), SESSION, **consent_args())
 
 

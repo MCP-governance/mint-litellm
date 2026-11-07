@@ -41,6 +41,8 @@ class StaffContext:
     consent_max_days: int = 90
     # 인증된 LiteLLM 세션 키 정보에서만 채운다. 화면 입력을 받지 않는다.
     team_ids: tuple[str, ...] = ()
+    # 이 세션의 키 토큰(키 범위 승인 조회용).
+    key_token: str = ""
 
 
 @contextmanager
@@ -97,8 +99,9 @@ def start_session(
         raise ControlError("세션 만료 시각이 올바르지 않습니다(현재 < 유휴 만료 <= 절대 만료).")
     with _staff_transaction(sctx) as conn:
         conn.execute(
-            "SELECT mint.staff_start_session(%s, %s, %s, %s)",
-            (session_id_hash, key_token, idle_expiry, absolute_expiry),
+            "SELECT mint.staff_start_session(%s, %s, %s, %s, %s::jsonb)",
+            (session_id_hash, key_token, idle_expiry, absolute_expiry,
+             json.dumps(list(sctx.team_ids))),
         )
 
 
@@ -141,7 +144,7 @@ def _decide(
     open_states = ("pending", "confirmed") if target == "cancel" else ("pending",)
     if row["status"] not in open_states:
         raise conflict(
-            f"본인 확인 {confirmation_id}은(는) {row['status']} 상태라 처리할 수 없습니다."
+            f"본인 확인 {confirmation_id}은(는) 이미 처리되었거나 만료되어 처리할 수 없습니다."
         )
     if target != "cancel" and row["expired"]:
         raise stale_evidence(f"본인 확인 {confirmation_id}은(는) 만료되었습니다.")
@@ -180,6 +183,35 @@ def cancel(sctx: StaffContext, session_id_hash: str, confirmation_id: str) -> No
 # ---------------------------------------------------------------------------
 
 
+def _member_orgs(sctx: StaffContext, team_ids: Sequence[str]) -> set[str]:
+    """사용자 바인딩 → 팀 바인딩 → 기본 조직, 처음 맞는 쪽이 소속을 정한다(DB 함수와 같은 순서)."""
+    user_orgs = {
+        r["org_id"] for r in fetchall(
+            sctx.control,
+            "SELECT org_id FROM mint.org_bindings WHERE instance_id = %s"
+            " AND subject_type = 'user' AND subject_id = %s",
+            (sctx.instance_id, sctx.user_id),
+        )
+    }
+    team_orgs = set() if user_orgs else {
+        r["org_id"] for r in fetchall(
+            sctx.control,
+            "SELECT org_id FROM mint.org_bindings WHERE instance_id = %s"
+            " AND subject_type = 'team' AND subject_id = ANY(%s)",
+            (sctx.instance_id, list(team_ids)),
+        )
+    }
+    orgs = user_orgs or team_orgs
+    if not orgs:
+        default = fetchone(
+            sctx.control,
+            "SELECT default_org_id FROM mint.settings WHERE instance_id = %s",
+            (sctx.instance_id,),
+        )
+        orgs = {default["default_org_id"]} if default and default["default_org_id"] else set()
+    return orgs
+
+
 def _check_consent_target(
     sctx: StaffContext, org_id: str, server_id: str, team_ids: Sequence[str]
 ) -> None:
@@ -191,31 +223,7 @@ def _check_consent_target(
         )
         if org is None or org["status"] != "active":
             raise ControlError(f"활성 상태의 조직 {org_id}이(가) 없습니다.")
-        # 사용자 바인딩 → 팀 바인딩 → 기본 조직, 처음 맞는 쪽이 소속을 정한다.
-        user_orgs = {
-            r["org_id"] for r in fetchall(
-                sctx.control,
-                "SELECT org_id FROM mint.org_bindings WHERE instance_id = %s"
-                " AND subject_type = 'user' AND subject_id = %s",
-                (sctx.instance_id, sctx.user_id),
-            )
-        }
-        team_orgs = set() if user_orgs else {
-            r["org_id"] for r in fetchall(
-                sctx.control,
-                "SELECT org_id FROM mint.org_bindings WHERE instance_id = %s"
-                " AND subject_type = 'team' AND subject_id = ANY(%s)",
-                (sctx.instance_id, list(team_ids)),
-            )
-        }
-        orgs = user_orgs or team_orgs
-        if not orgs:
-            default = fetchone(
-                sctx.control,
-                "SELECT default_org_id FROM mint.settings WHERE instance_id = %s",
-                (sctx.instance_id,),
-            )
-            orgs = {default["default_org_id"]} if default and default["default_org_id"] else set()
+        orgs = _member_orgs(sctx, team_ids)
         member = org_id in orgs
         if not member:
             raise forbidden(f"조직 {org_id}에 속한 사용자만 이 조직의 동의를 등록할 수 있습니다.")
@@ -230,7 +238,7 @@ def _check_consent_target(
             raise forbidden(f"조직 {org_id}의 이용 관계에 서버 {server_id}가 없습니다.")
         if server["status"] != "approved":
             raise ControlError(
-                f"서버 {server_id}가 {server['status']} 상태라 동의를 등록할 수 없습니다."
+                f"서버 {server_id}는 승인된 서버가 아니어서 동의를 등록할 수 없습니다."
             )
 
 
@@ -301,3 +309,76 @@ def list_consents(sctx: StaffContext) -> list[dict]:
 
 def list_events(sctx: StaffContext, limit: int = 100) -> list[dict]:
     return _list(sctx, "SELECT * FROM mint.staff_list_events(%s)", (limit,))
+
+
+# ---------------------------------------------------------------------------
+# 화면용 읽기(제어 연결)
+# ---------------------------------------------------------------------------
+
+
+def find_session(control: psycopg.Connection, instance_id: str, id_hash: str) -> dict | None:
+    """유효한 직원 세션의 사용자·키·소속 팀. 없으면 None. 읽기만 한다."""
+    with control.transaction():
+        return fetchone(
+            control,
+            "SELECT user_id, key_token, team_ids FROM mint.console_sessions"
+            " WHERE instance_id = %s AND id_hash = %s AND subject = 'staff'"
+            " AND revoked_at IS NULL AND idle_expiry > now() AND absolute_expiry > now()",
+            (instance_id, id_hash),
+        )
+
+
+def requires_separate_key(sctx: StaffContext) -> bool:
+    with sctx.control.transaction():
+        row = fetchone(
+            sctx.control,
+            "SELECT require_separate_confirm_key AS v FROM mint.settings WHERE instance_id = %s",
+            (sctx.instance_id,),
+        )
+    return row is None or row["v"] is not False
+
+
+def list_available(sctx: StaffContext) -> list[dict]:
+    """이 사용자가 쓸 수 있는 서버와 도구: 소속 조직의 이용 관계가 있는 승인된 서버마다,
+    본인·본인 팀·본인 조직·본인 키 범위의 유효한 승인이 허용하는 도구."""
+    orgs = sorted(_member_orgs(sctx, sctx.team_ids))
+    if not orgs:
+        return []
+    scope = (
+        "((a.scope_type = 'user' AND a.scope_id = %(user)s)"
+        " OR (a.scope_type = 'team' AND a.scope_id = ANY(%(teams)s))"
+        " OR (a.scope_type = 'org' AND a.scope_id = r.org_id)"
+        " OR (a.scope_type = 'key' AND a.scope_id = %(key)s))"
+    )
+    denied = (
+        "EXISTS (SELECT 1 FROM mint.denials d WHERE d.instance_id = s.instance_id"
+        " AND d.lifted_at IS NULL AND (d.server_id IS NULL OR d.server_id = s.server_id)"
+        " AND (d.org_id IS NULL OR d.org_id = r.org_id)"
+        " AND ((d.scope_type = 'user' AND d.scope_id = %(user)s)"
+        "   OR (d.scope_type = 'team' AND d.scope_id = ANY(%(teams)s))"
+        "   OR (d.scope_type = 'org' AND d.scope_id = r.org_id)"
+        "   OR (d.scope_type = 'key' AND d.scope_id = %(key)s)"
+        "   OR (d.scope_type = 'server' AND d.scope_id = s.server_id))"
+        " AND (d.tools IS NULL OR t = ANY(d.tools)))"
+    )
+    with sctx.control.transaction():
+        return fetchall(
+            sctx.control,
+            "SELECT s.server_id, r.org_id, o.name AS org_name, s.transport, s.auth_type,"
+            " COALESCE((SELECT array_agg(DISTINCT t ORDER BY t) FROM mint.approvals a,"
+            "   unnest(a.tools) AS t WHERE a.instance_id = s.instance_id"
+            "   AND a.server_id = s.server_id AND a.org_id = r.org_id AND a.status = 'active'"
+            f"   AND a.valid_from <= now() AND a.valid_until > now() AND {scope}"
+            f"   AND NOT {denied}), '{{}}') AS tools,"
+            " (SELECT max(a.valid_until) FROM mint.approvals a WHERE a.instance_id = s.instance_id"
+            "   AND a.server_id = s.server_id AND a.org_id = r.org_id AND a.status = 'active'"
+            f"   AND a.valid_until > now() AND {scope}) AS valid_until"
+            " FROM mint.servers s JOIN mint.usage_relations r ON r.instance_id = s.instance_id"
+            " AND r.server_id = s.server_id AND r.status = 'active'"
+            " JOIN mint.orgs o ON o.instance_id = r.instance_id AND o.org_id = r.org_id"
+            " AND o.status = 'active'"
+            " WHERE s.instance_id = %(iid)s AND s.status = 'approved' AND r.org_id = ANY(%(orgs)s)"
+            " ORDER BY s.server_id, r.org_id",
+            {"user": sctx.user_id, "teams": list(sctx.team_ids), "key": sctx.key_token,
+             "iid": sctx.instance_id, "orgs": orgs},
+        )

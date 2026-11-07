@@ -19,6 +19,9 @@ x-mint-env: &mint-env
   MINT_SELFCHECK_GRACE_SECONDS: "60"
   MINT_FINGERPRINT_KEY: BwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSY
   MINT_FINGERPRINT_KEY_VERSION: "1"
+  # 시험 전용 값이며 실제 비밀이 아니다(base64url 32바이트).
+  MINT_EXPORT_DIR: /var/lib/mint/export
+  MINT_EXPORT_HMAC_KEY: ${MINT_E_EXPORT_HMAC_KEY:-dGVzdC1vbmx5LWV4cG9ydC1obWFjLWtleS0wMDAwMDA}
 
 x-litellm-env: &litellm-env
   <<: *mint-env
@@ -89,6 +92,8 @@ services:
       MINT_DATABASE_URL: postgresql://postgres:${MINT_E_DB_PASSWORD:-integration-db}@postgres:5432/mint
       MINT_PLUGIN_DB_PASSWORD: ${MINT_E_PLUGIN_PASSWORD:-integration-plugin}
       MINT_CONTROL_DB_PASSWORD: ${MINT_E_CONTROL_PASSWORD:-integration-control}
+      MINT_WORKER_DB_PASSWORD: ${MINT_E_WORKER_PASSWORD:-integration-worker}
+      MINT_STAFF_DB_PASSWORD: ${MINT_E_STAFF_PASSWORD:-integration-staff}
     volumes:
       - bundles:/bundles
     depends_on:
@@ -124,9 +129,32 @@ services:
       - ${MINT_E_LITELLM_CONFIG:-./config/litellm.mint.yaml}:/app/config/litellm.config.yaml:ro
       - ./config:/work/config:ro
       - bundles:/bundles
+      - export:/var/lib/mint/export
     depends_on:
       mint-init:
         condition: service_completed_successfully
+    networks: [front]
+
+  # 작업 실행기. 기동 직후 첫 체크포인트(latest.json)를 쓴다. LiteLLM은 같은 볼륨을 읽기 전용으로 본다.
+  worker:
+    image: mint-litellm-it:local
+    entrypoint: ["mint-litellm"]
+    command: ["worker"]
+    environment:
+      <<: *mint-env
+      MINT_DATABASE_URL: postgresql://mint_worker_app:${MINT_E_WORKER_PASSWORD:-integration-worker}@postgres:5432/mint
+      MINT_OPA_URL: http://opa:8181
+    volumes:
+      - export:/var/lib/mint/export
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib,sys; sys.exit(0 if pathlib.Path('/var/lib/mint/export/integration/latest.json').is_file() else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    depends_on:
+      mint-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
     networks: [front]
 
   testserver-a:
@@ -205,6 +233,7 @@ services:
       - ${MINT_E_LITELLM_CONFIG:-./config/litellm.mint.yaml}:/app/config/litellm.config.yaml:ro
       - ./guardrails/it_guardrails.py:/app/config/it_guardrails.py:ro
       - buffer1:/var/lib/mint/buffer${MINT_E_BUFFER1_MODE:-}
+      - export:/var/lib/mint/export:ro
     depends_on:
       mint-init:
         condition: service_completed_successfully
@@ -223,6 +252,7 @@ services:
       - ${MINT_E_LITELLM_CONFIG:-./config/litellm.mint.yaml}:/app/config/litellm.config.yaml:ro
       - ./guardrails/it_guardrails.py:/app/config/it_guardrails.py:ro
       - buffer2:/var/lib/mint/buffer
+      - export:/var/lib/mint/export:ro
     depends_on:
       litellm1:
         condition: service_healthy
@@ -259,3 +289,4 @@ volumes:
   bundles:
   buffer1:
   buffer2:
+  export:
