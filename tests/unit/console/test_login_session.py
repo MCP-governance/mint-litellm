@@ -102,7 +102,7 @@ def test_an_unknown_key_is_refused(world):
 
 def test_a_key_without_a_user_is_refused(world):
     world.stub.own("sk-service", None)
-    refused(attempt(world, "sk-service"), "사람 사용자에 결속된 키가 아닙니다")
+    refused(attempt(world, "sk-service"), "사람 사용자에 연결된 키가 아닙니다")
 
 
 def test_a_missing_user_record_is_refused(world):

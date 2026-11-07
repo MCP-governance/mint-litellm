@@ -283,7 +283,7 @@ def test_the_review_form_explains_what_an_unset_path_limit_does(world, admin):
     world.with_control_key()
     relation = world.query("SELECT id FROM mint.usage_relations WHERE server_id = 'srv-wait'")[0][0]
     html = admin.get(f"/approvals/new?relation_id={relation}").text
-    assert "경로 이탈(<code>..</code>)만 막고" in html
+    assert "경로 이탈(<code>..</code>)만 차단하고" in html
     assert 'name="paths_mode" value="unset" checked' in html
     assert 'name="paths_mode" value="unrestricted"' in html and "제한 없음" in html
 
