@@ -306,7 +306,7 @@ def test_concurrent_repin_is_rejected_before_external_call(contract_db):
     candidate = add_tool(conn, NEW)
     iid = evidence(conn, candidate)
     pin = Pin(conn, old, candidate, {"read": NEW})
-    with psycopg.connect(conn.info.dsn, autocommit=True) as other:
+    with psycopg.connect(conn.info.dsn, password=conn.info.password, autocommit=True) as other:
         other.execute("SELECT pg_advisory_lock(hashtextextended('contract-pin:i:s',0))")
         with pytest.raises(AdminError):
             reapprove(ctx, pin, "s", iid, [str(candidate)])

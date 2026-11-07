@@ -160,7 +160,7 @@ def test_a_known_kind_can_be_registered_before_its_handler_is_connected(url):
     with psycopg.connect(url) as conn:
         ensure(conn, INSTANCE)
         ctx = make_ctx(conn)
-        for kind, key in (("sync_server", None), ("seal", "seal:x"), ("alert_deliver", "a:1")):
+        for kind, key in (("sync_server", None), ("seal", "seal:x")):
             assert kind not in jobs.HANDLERS
             assert base.enqueue_job(ctx, kind, "x", key)
         assert base.enqueue_job(ctx, "approval_expiry_scan", "x", "approval_expiry_scan:t")

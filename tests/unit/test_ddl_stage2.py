@@ -1275,9 +1275,9 @@ def test_control_runs_the_service_tables(db, base):
     update(db, "alerts", f"id = '{alert}'", status="acknowledged", acknowledged_by="alice")
     update(db, "litellm_grants", f"id = '{grant}'", held=False, missing_count=0)
     assert scalar(db, "SELECT count(*) FROM mint.exports") == 0
-    denied(db, f"UPDATE mint.litellm_grants SET applied_sha256 = '{HEX}' WHERE id = '{grant}'",
+    denied(db, f"UPDATE mint.litellm_grants SET target_id = 'x' WHERE id = '{grant}'",
            f"UPDATE mint.alerts SET count = 9 WHERE id = '{alert}'",
-           f"UPDATE mint.tool_contracts SET observed_at = now() WHERE id = '{tool}'")  # fmt: skip
+           f"UPDATE mint.tool_contracts SET canonical_text = 'x' WHERE id = '{tool}'")  # fmt: skip
 
 
 def test_worker_runs_jobs_exports_and_alerts(db, base):

@@ -306,6 +306,7 @@ class PluginRuntime:
     database: PluginDatabase
     recorder: EvidenceRecorder
     evaluate: PolicyEvaluate | None
+    secret_markers: Callable[..., Awaitable[tuple[str, ...] | None]] | None = None
     view_collector: Callable[[], LiteLLMView] = collect_view
     terminate: Callable[[], None] = terminate_process
     readiness: Callable[[str, float], Awaitable[bool]] = wait_for_readiness
@@ -329,6 +330,7 @@ class PluginRuntime:
             snapshots=self.database,
             recorder=self.recorder,
             evaluate=self.evaluate,
+            secret_markers=self.secret_markers,
             verified=lambda: self.verified,
         )
 
@@ -566,6 +568,24 @@ class PolicyEngine:
         self._owner: tuple[int, asyncio.AbstractEventLoop] | None = None
         self._guard: asyncio.Task[None] | None = None
 
+    def _opa(self) -> OPAClient:
+        loop = asyncio.get_running_loop()
+        owner = (os.getpid(), loop)
+        if self._client is None or self._owner != owner:
+            client = OPAClient(self._base_url, self._timeout)
+            self._client, self._owner = client, owner
+            self._guard = loop.create_task(self._close_with_loop(client))
+        return self._client
+
+    async def secret_markers(
+        self, *, policy_version_id: str, bundle_sha256: str, budget_seconds: float | None = None
+    ) -> tuple[str, ...] | None:
+        return await self._opa().secret_markers(
+            policy_version_id=policy_version_id,
+            bundle_sha256=bundle_sha256,
+            budget_seconds=budget_seconds,
+        )
+
     async def evaluate(
         self,
         policy_input: dict[str, Any],
@@ -574,13 +594,7 @@ class PolicyEngine:
         bundle_sha256: str,
         budget_seconds: float | None = None,
     ) -> Evaluation:
-        loop = asyncio.get_running_loop()
-        owner = (os.getpid(), loop)
-        if self._client is None or self._owner != owner:
-            client = OPAClient(self._base_url, self._timeout)
-            self._client, self._owner = client, owner
-            self._guard = loop.create_task(self._close_with_loop(client))
-        return await self._client.evaluate(
+        return await self._opa().evaluate(
             policy_input,
             policy_version_id=policy_version_id,
             bundle_sha256=bundle_sha256,
@@ -623,10 +637,12 @@ def get_runtime(env: Mapping[str, str] | None = None) -> PluginRuntime:
             budget_seconds=config.decision_budget_seconds,
             instance_id=config.instance_id,
         )
+        engine = PolicyEngine(config.opa_url, config.decision_budget_seconds)
         _runtime = PluginRuntime(
             config=config,
             database=database,
             recorder=recorder,
-            evaluate=PolicyEngine(config.opa_url, config.decision_budget_seconds).evaluate,
+            evaluate=engine.evaluate,
+            secret_markers=engine.secret_markers,
         )
     return _runtime

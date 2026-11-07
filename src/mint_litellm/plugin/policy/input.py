@@ -4,12 +4,16 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from mint_litellm.plugin.policy.patterns import NAMES as PATTERN_NAMES
 from mint_litellm.types.identity import Principal
 
 _FIELDS = {
-    "server": ("id", "status", "transport", "auth_type", "provider_allowed", "auth_server_allowed"),
+    "server": (
+        "id", "status", "transport", "auth_type", "provider_allowed", "auth_server_allowed",
+        "contract_status",
+    ),
     "tool": ("name",),
-    "arguments": ("keys", "sizes"),
+    "arguments": ("keys", "sizes", "patterns"),
     "approval": ("present", "id", "class", "scope_type", "expires_in_days", "conditions"),
     "consent": ("status", "source"),
     "settings": ("high_risk_tools",),
@@ -32,8 +36,12 @@ def has_only_policy_fields(value: Mapping[str, Any]) -> bool:
     arguments = value.get("arguments", {})
     keys = arguments.get("keys", [])
     sizes = arguments.get("sizes", {})
+    patterns = arguments.get("patterns", {})
     return (
-        isinstance(keys, list)
+        isinstance(patterns, Mapping)
+        and set(patterns) <= set(PATTERN_NAMES)
+        and all(type(v) is bool for v in patterns.values())
+        and isinstance(keys, list)
         and all(isinstance(key, str) for key in keys)
         and isinstance(sizes, Mapping)
         and all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in sizes.items())
@@ -53,6 +61,7 @@ def policy_input(
     high_risk_tools: list[str],
     mode: str,
     operation: str,
+    argument_patterns: Mapping[str, bool] | None = None,
 ) -> dict[str, Any]:
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must have a timezone")
@@ -75,6 +84,8 @@ def policy_input(
         "consent": consent,
         "settings": {"high_risk_tools": list(high_risk_tools)},
     }
+    if argument_patterns is not None:
+        sections["arguments"]["patterns"] = dict(argument_patterns)
     result: dict[str, Any] = {
         "principal": {
             "type": principal.principal_type.value,

@@ -15,7 +15,7 @@ CREATE TABLE mint.contract_observations (
 );
 CREATE TABLE mint.contract_observation_receipts (
     instance_id mint.ident NOT NULL,
-    event_id uuid NOT NULL REFERENCES mint.events(event_id),
+    event_id uuid NOT NULL,
     PRIMARY KEY (instance_id, event_id)
 );
 GRANT SELECT, INSERT, UPDATE ON mint.contract_observations TO mint_control;
