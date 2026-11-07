@@ -340,7 +340,10 @@ class Rig:
         observation = self.root / (self.run_id + "-" + name + ".observation.json")
         replacements = {"{observation}": str(observation), "{run_id}": self.run_id}
         argv = [replacements.get(arg, arg) for arg in command["apply"]]
-        self.command(argv, timeout=command.get("timeout", 120))
+        done = self.command(argv, check=False, timeout=command.get("timeout", 120))
+        if done.returncode == 78:  # 어댑터 규약: 제품 명령·처리기 부재
+            self.skip(done.stdout.strip() or f"미구현으로 건너뜀: 어댑터 {name}")
+        assert done.returncode == 0, self.clean(done.stderr + done.stdout)
         self.result["steps"].append({"fixture": name, "exit_code": 0})
         if restore:
             self.undo.append(lambda: self.command(command["undo"], timeout=120))

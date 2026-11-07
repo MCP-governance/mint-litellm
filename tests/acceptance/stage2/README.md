@@ -3,11 +3,11 @@
 범위는 합격 기준 1~13이다. 제품 코드는 바꾸지 않는다. 실행 대상은 솔루션 기기,
 pj1, pj3이며 공개 MCP는 Playwright, Context7, Grafana이다.
 
-**현재 자산은 조건부 실행 골격이다.** 명령·작업 처리기가 없으면
-「미구현으로 건너뜀」을 JSON에 기록한다. 장비 초기화 및 복잡한 장애 주입을 담당하는
-기존 장비 도구의 argv 연결과 관측 JSON 어댑터는 이 복제본에 들어 있지 않다.
-`site.example.json`만 복사해서 전체 합격 시험을 실행할 수 있는 상태는 아니다.
-이 연결 누락은 제품 미구현으로 숨기지 않고 실패로 처리한다.
+**장애 주입 어댑터는 `adapters.py`에 있다.** 사례마다 이름 있는 함수 하나이며
+`python -m tests.acceptance.stage2.adapters <이름> apply|undo`로 실행된다.
+종료 코드 78은 「미구현으로 건너뜀」(제품 명령·작업 처리기 부재), 70은 어댑터 본문 미작성(실패)이다.
+`emit-site`가 `faults`와 `case_setup` 조각을 만들어 준다(아래). 명령·처리기가 병합되지 않은
+사례(동기·신청·계약·콘솔)는 78로 건너뛰고, 병합된 뒤에도 본문이 없으면 70으로 실패한다.
 
 ## 솔루션 기기의 깨끗한 복제본
 
@@ -80,6 +80,19 @@ argv 배열이다. `{case}`를 사례 식별자로 치환한다. 마지막 사�
 셸 문자열 조합을 사용하지 않는다. `apply` 전후 상태를 보관하고 `undo`는 중복 호출해도
 원래 상태로 돌아가야 한다. 실패해도 역순으로 복구하며 복구 실패는 시험 실패다.
 DB 복원은 시험 스택에 한정한다. 24시간 시험은 timeout을 최소 86460초로 지정한다.
+
+어댑터가 쓰는 환경변수(값은 장비 환경에만 둔다): `COMPOSE_PROJECT_NAME`(또는 `ACC_COMPOSE` argv
+문자열), `ACC_PG_SERVICE`·`ACC_PG_SUPERUSER`, `ACC_EXPORT_HOST_DIR`·`ACC_EXPORT_CONTAINER_DIR`,
+`ACC_LITELLM_ADMIN_URL`·`MINT_LITELLM_KEY`, `ACC_FIXTURE_URL`, `ACC_SERVER_ID`,
+`ACC_PLUGIN_DATABASE_URL`, `ACC_ADMIN_TOKEN`, `ACC_STATE_DIR`. 시험 시작 전에 한 번
+`adapters snapshot`으로 기준 스냅숏을 만들고, 사례마다 `case_setup`이 그것으로 복원한다.
+
+```bash
+.venv/bin/python -m tests.acceptance.stage2.adapters emit-site --repo "$PWD"   > tests/acceptance/stage2/.runtime/site-faults.json   # faults, case_setup 조각을 site.json에 합친다
+```
+
+`--ssh <별칭>`을 주면 각 argv가 `ssh <별칭> <한 줄 명령>`이 된다. 관측 JSON은 어댑터가 도는
+호스트에 쓰이므로, 시험 실행기와 다른 호스트일 때는 증거 디렉터리를 공유해야 한다.
 
 누락된 연결 목록은 DB 없이 만들 수 있다.
 

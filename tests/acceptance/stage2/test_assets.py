@@ -65,3 +65,16 @@ def test_observation_contracts_cover_cases():
             ):
                 for name in ast.literal_eval(node.args[1]):
                     assert prefix + name in expected["observations"], (filename, name)
+
+
+def test_every_required_fault_has_a_named_adapter():
+    from .adapters import ADAPTERS, SKIPPED, emit_site, main
+    from .inventory import required_faults
+
+    site = emit_site(repo="/clone")
+    assert set(required_faults()) <= set(site["faults"]) == set(ADAPTERS) - {
+        "db_backup", "db_restore", "snapshot"}
+    assert all(f["apply"][0] == "bash" and "{observation}" in " ".join(f["apply"])
+               for f in site["faults"].values())
+    assert main(["no_such", "apply"]) == 2
+    assert main(["sync_race_30", "apply"]) in (SKIPPED, 70)
