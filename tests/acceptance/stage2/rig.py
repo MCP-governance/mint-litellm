@@ -299,22 +299,51 @@ class Rig:
         ))
         entry = self.site["servers"][server_name]
         server = entry["server_id"]
-        intake = self.api("POST", "/intakes", {
-            **self.site["intake"], "server_id": server,
-        })
+        intake_id = self.create_intake(server)
         self.wait(
-            lambda: self.api("GET", f"/intakes/{intake['id']}")["status"]
-            in ("passed", "failed", "indeterminate"), 120, "검사 8종",
+            lambda: self.intake(intake_id)["status"] in ("passed", "failed", "indeterminate"),
+            120, "검사 8종",
         )
-        intake = self.api("GET", f"/intakes/{intake['id']}")
+        intake = self.intake(intake_id)
         assert intake["status"] == "passed", self.clean(intake)
-        return {**entry, "intake_id": intake["id"], "name": server_name}
+        return {**entry, "intake_id": intake_id, "name": server_name}
+
+    def create_intake(self, server):
+        """운영자 경로 신청(CLI). 신청자는 admin 토큰의 사용자이다."""
+        s = self.site["intake"]
+        r = s["readiness"]
+
+        def text(value):
+            return "예" if value is True else str(value)
+
+        return self.cli(
+            "intake", "create", server, "--org", s["org_id"], "--purpose", s["purpose"],
+            "--data-grade", s["data_grade"],
+            "--allowed-resources", json.dumps(s["allowed_resources"]),
+            "--provider", s["provider"], "--owner", s["owner_user_id"],
+            "--credential-notice", text(r["credential_notice"]),
+            "--revocation-record", text(r["revocation_record"]),
+            "--audit-access-days", r["audit_access_days"],
+            "--data-return-terms", s["data_return_terms"],
+        )["id"]
+
+    def intake(self, intake_id):
+        return self.cli("intake", "show", intake_id)["intake"]
+
+    def approval_scope(self):
+        """승인 범위: site.approval_scope({type: key|team, id, team?}), 없으면 호출 키의 키 범위."""
+        scope = self.site.get("approval_scope")
+        if scope:
+            return scope
+        return {"type": "key",
+                "id": hashlib.sha256(self.secret("caller").encode()).hexdigest()}
 
     def activate(self, fixture):
         intake_id = fixture["intake_id"]
-        self.versioned(f"/intakes/{intake_id}", "decision", {
-            "decision": "approved", "reason": "acceptance",
-        }, role="approver")
+        scope = self.approval_scope()
+        extra = ["--team", scope["team"]] if scope.get("team") else []
+        self.cli("intake", "approve", intake_id, "--reason", "acceptance",
+                 "--scope", scope["type"], "--scope-id", scope["id"], *extra, role="approver")
         server = fixture["server_id"]
         self.wait(lambda: self.rows("approvals", "server_id=%s AND status='active'", [server]),
                   120, "활성화")

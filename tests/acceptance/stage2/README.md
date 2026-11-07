@@ -87,6 +87,9 @@ DB 복원은 시험 스택에 한정한다. 24시간 시험은 timeout을 최소
 `ACC_PLUGIN_DATABASE_URL`, `ACC_ADMIN_TOKEN`, `ACC_STATE_DIR`. 시험 시작 전에 한 번
 `adapters snapshot`으로 기준 스냅숏을 만들고, 사례마다 `case_setup`이 그것으로 복원한다.
 
+활성화(`rig.fixture`·`rig.activate`)는 CLI(`intake create|approve`)를 쓴다. 승인 범위는 `site.approval_scope`
+(`{type: key|team, id, team?}`)이며 없으면 호출 키(`caller`)의 키 범위이다.
+
 시나리오 어댑터(`scenarios.py`)가 추가로 읽는 값: `ACC_SITE`(또는 `MINT_ACC_SITE`, 없으면
 `.runtime/site.json`)에서 서버·신청 입력·계수기·로그 명령을 읽는다. 환경변수는 `ACC_LITELLM_ADMIN_URL`
 과 `ACC_LITELLM_ADMIN_KEY`(시험 주체 생성·삭제용 관리 키), `ACC_SUBMIT_KEY`(조직에 묶인 사용자의

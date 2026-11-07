@@ -21,8 +21,9 @@ def test_negative_intake(rig, case):
                           [intake["id"]])
         assert checks
     if case in ("same_requester", "stale_evidence"):
-        code = "SEPARATION-OF-DUTIES" if case == "same_requester" else "STALE-EVIDENCE"
-        reply = rig.versioned(f"/intakes/{intake['id']}", "decision", {
-            "decision": "approved", "reason": "acceptance",
-        }, status=(403, 409))
-        assert reply["code"] == "MINT-ADMIN-" + code
+        # 같은 사용자(신청자)이거나 오래된 증거이면 CLI 결정이 거부되어야 한다.
+        word = "신청자" if case == "same_requester" else "24시간"
+        done = rig.cli("intake", "approve", str(intake["id"]), "--reason", "acceptance",
+                       role="admin" if case == "same_requester" else "approver", check=False)
+        assert done.returncode != 0 and word in done.stderr, rig.clean(done.stderr)
+        assert rig.rows("intakes", "id=%s AND decision IS NULL", [intake["id"]])
