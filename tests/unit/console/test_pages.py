@@ -288,7 +288,11 @@ def test_the_review_form_explains_what_an_unset_path_limit_does(world, admin):
     assert 'name="paths_mode" value="unrestricted"' in html and "제한 없음" in html
 
 
-def test_the_overview_shows_jobs_nobody_can_handle_and_the_longest_wait(world, admin):
+def test_the_overview_shows_jobs_nobody_can_handle_and_the_longest_wait(world, admin, monkeypatch):
+    from mint_litellm.control import jobs
+
+    # 처리기가 붙는 시점과 상관없이, 처리기가 없는 종류를 하나 만들어 시험한다.
+    monkeypatch.delitem(jobs.HANDLERS, "sync_server", raising=False)
     world.query(
         "INSERT INTO mint.jobs (id, instance_id, kind, target_ref, idempotency_key, created_at)"
         " VALUES (gen_random_uuid(), %s, 'sync_server', 'x', NULL, now() - interval '2 hours')",
