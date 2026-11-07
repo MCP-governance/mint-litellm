@@ -107,18 +107,34 @@ def test_url_guard_records_only_fingerprints_and_honors_the_port_setting():
 
 def test_oauth_issuer_allowlist():
     auth = entry("auth_server", "https://idp.example.com", "a1")
+    cc = "client_credentials"
     assert c.oauth_issuer_allowlist("none", None, []).result == "pass"
     assert c.oauth_issuer_allowlist("bearer_token", None, []).inputs == {"applicable": False}
-    out = c.oauth_issuer_allowlist("oauth2", "https://idp.example.com", [auth])
+    out = c.oauth_issuer_allowlist("oauth2", "https://idp.example.com", [auth], cc)
     assert (out.result, out.inputs["allowlist_ids"]) == ("pass", ["a1"])
-    assert c.oauth_issuer_allowlist("oauth2", "https://evil.example.com", [auth]).reason == (
+    assert c.oauth_issuer_allowlist("oauth2", "https://evil.example.com", [auth], cc).reason == (
         "ISSUER_NOT_ALLOWED"
     )
     assert (
-        c.oauth_issuer_allowlist("oauth2", "https://idp.example.com", [PROVIDER]).result == "fail"
+        c.oauth_issuer_allowlist("oauth2", "https://idp.example.com", [PROVIDER], cc).result
+        == "fail"
     )
-    out = c.oauth_issuer_allowlist("oauth2", None, [auth])
+    out = c.oauth_issuer_allowlist("oauth2", None, [auth], cc)
     assert (out.result, out.reason) == ("indeterminate", "ISSUER_UNDECLARED")
+
+
+@pytest.mark.parametrize("flow", [None, "", "authorization_code", "token_exchange", 7])
+def test_oauth2_is_a_server_scope_only_when_the_flow_is_confirmed_as_client_credentials(flow):
+    auth = entry("auth_server", "https://idp.example.com", "a1")
+    out = c.oauth_issuer_allowlist("oauth2", "https://idp.example.com", [auth], flow)
+    assert (out.result, out.reason) == ("indeterminate", "OAUTH2_FLOW_UNCONFIRMED")
+    assert out.inputs["oauth2_flow"] in (None, "", "authorization_code", "token_exchange")
+
+
+def test_other_oauth_auth_types_do_not_need_the_server_credential_flow():
+    auth = entry("auth_server", "https://idp.example.com", "a1")
+    out = c.oauth_issuer_allowlist("oauth_delegate", "https://idp.example.com", [auth])
+    assert out.result == "pass"
 
 
 # --- 3. connection ----------------------------------------------------------------

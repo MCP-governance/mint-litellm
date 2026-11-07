@@ -5,6 +5,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 
 from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
@@ -64,8 +65,24 @@ def verify_pin(desired: dict, response: dict) -> str:
         raise conflict("재pin 응답의 정의 형식이 올바르지 않습니다.") from None
 
 
+def _requester_valid(conn, instance_id: str, saved: dict) -> bool:
+    """재승인을 요청한 운영자가 지금도 유효한 승인자인가(삭제·만료·역할 변경·사용자 결속 변경).
+
+    운영자 행을 ``FOR SHARE``로 잠가 읽는다: 호출한 트랜잭션이 끝날 때까지 그 승인자의 권한을
+    철회하는 변경이 기다린다(확인 뒤 철회된 승인자의 승인본 교체가 커밋되지 않는다)."""
+    return fetchone(
+        conn,
+        "SELECT 1 AS ok FROM mint.operators WHERE instance_id=%s AND name=%s AND user_id=%s"
+        " AND role IN ('admin','approver') AND (expires_at IS NULL OR expires_at > now())"
+        " FOR SHARE",
+        (instance_id, saved["requested_by"], saved["requested_user_id"]),
+    ) is not None
+
+
 def _pending(ctx: Context, saved: dict) -> dict:
     plan = saved["plan"]
+    if not _requester_valid(ctx.conn, ctx.instance_id, saved):
+        raise conflict("재승인을 요청한 승인자가 더 이상 유효하지 않습니다.")
     fresh = _plan(
         ctx,
         saved["server_id"],
@@ -181,11 +198,15 @@ def _replace(ctx: Context, saved: dict, fresh: dict, digest: str) -> dict:
     return result
 
 
-def finalize_reapproval(conn, instance_id: str, server_id: str, pin_client) -> dict:
+def finalize_reapproval(
+    conn, instance_id: str, server_id: str, pin_client, guard: Callable[[], None] | None = None
+) -> dict:
     """G4b의 sync_server pin 단계용. 외부 응답 뒤 계획·후보 판본을 다시 잠가 확정한다.
 
     pin은 DB와 원자적으로 커밋할 수 없으므로 먼저 커밋한 차단 표지를 실패 시 유지한다.
-    승인본·사건·pin 원장·계획 완료는 마지막 트랜잭션 하나에서 함께 확정한다.
+    승인본·사건·pin 원장·계획 완료는 마지막 트랜잭션 하나에서 함께 확정한다. 응답을 받은 뒤
+    ``guard``(임대·종료 신호·되돌림 차단 확인)와 계획·후보·서버 상태·요청자 유효성을 다시 확인하고,
+    하나라도 확인하지 못하면 고정을 풀고 차단 표지를 유지한 채 끝낸다(다음 실행이 다시 수렴한다).
     """
     if conn.info.transaction_status != TransactionStatus.IDLE:
         raise conflict("재승인 확정은 유휴 연결에서 실행해야 합니다.")
@@ -219,6 +240,8 @@ def finalize_reapproval(conn, instance_id: str, server_id: str, pin_client) -> d
         try:
             response = pin_client.pin(server_id)
             digest = verify_pin(saved["plan"]["desired"], response)
+            if guard is not None:
+                guard()
             with transact(ctx):
                 current = fetchone(
                     conn,

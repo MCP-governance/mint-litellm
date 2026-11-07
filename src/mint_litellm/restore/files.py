@@ -91,11 +91,20 @@ def read_verified(path: Path, keys: Sequence[bytes]) -> dict[str, Any]:
     return document
 
 
+def document_bytes(document: dict[str, Any]) -> bytes:
+    """파일에 실제로 쓰는 바이트(해시를 미리 계산하는 데도 쓴다)."""
+    return json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False).encode() + b"\n"
+
+
 def atomic_write(path: Path, document: dict[str, Any]) -> None:
     """임시 파일에 쓰고 fsync한 뒤 이름을 바꾼다. 읽는 쪽은 옛 파일이나 새 파일만 본다."""
+    atomic_write_bytes(path, document_bytes(document))
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """바이트를 같은 방식(임시 파일·fsync·이름 바꾸기)으로 쓴다. 표지 파일도 이것을 쓴다."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    data = json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False).encode() + b"\n"
     try:
         with open(temp, "wb") as handle:
             handle.write(data)
@@ -133,6 +142,14 @@ def newest_negative(export_dir: Path, instance_id: str) -> Path | None:
     except (FileNotFoundError, NotADirectoryError):
         return None
     return max(names, key=lambda p: int(p.stem), default=None)
+
+
+def file_sha256(path: Path) -> str:
+    """파일 바이트의 SHA-256. 파일이 없으면 ``absent``(복원 요청의 결속값)."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "absent"
 
 
 def now() -> str:

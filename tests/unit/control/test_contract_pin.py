@@ -92,6 +92,8 @@ class MemoryConnection:
             ok = not self.locked
             self.locked = True
             return {"ok": ok}
+        if "FROM mint.operators" in sql:
+            return None if self.state.get("requester_gone") else {"ok": 1}
         if sql.startswith("SELECT * FROM mint.contract_reapproval_plans"):
             return deepcopy(self.state["saved"])
         if sql.startswith("UPDATE mint.servers SET deployment_drift=true"):
@@ -310,3 +312,45 @@ def test_changed_candidate_is_rejected_before_pin(setup):
         contract_pin.finalize_reapproval(conn, "i", "s", pin)
     assert pin.calls == pin.unpins == 0
     assert_pending(conn)
+
+
+def test_a_lost_lease_after_the_pin_write_keeps_the_block_and_unpins(setup):
+    conn, ctx = setup
+    request(conn, ctx)
+
+    def lost():
+        raise jobs.Cancelled
+
+    pin = Pin(conn)
+    with pytest.raises(jobs.Cancelled):
+        contract_pin.finalize_reapproval(conn, "i", "s", pin, guard=lost)
+    assert pin.calls == pin.unpins == 1
+    assert_pending(conn)
+    # 다음 실행이 다시 수렴한다(임대를 얻은 새 실행)
+    result = contract_pin.finalize_reapproval(conn, "i", "s", Pin(conn), guard=lambda: None)
+    assert conn.state["saved"]["status"] == "completed" and result["pin_sha256"]
+
+
+def test_the_requesting_approver_removed_while_waiting_blocks_the_replacement(setup):
+    conn, ctx = setup
+    request(conn, ctx)
+    pin = Pin(conn, lambda: conn.state.update(requester_gone=True))
+    with pytest.raises(AdminError, match="승인자"):
+        contract_pin.finalize_reapproval(conn, "i", "s", pin)
+    assert pin.calls == pin.unpins == 1
+    assert_pending(conn)
+
+
+def test_a_response_that_arrives_after_a_newer_plan_replaced_the_old_one_is_discarded(setup):
+    conn, ctx = setup
+    request(conn, ctx)
+
+    def newer_plan():
+        conn.state["saved"]["id"] = uuid4()
+        conn.state["saved"]["status"] = "pending"
+
+    pin = Pin(conn, newer_plan)
+    with pytest.raises(AdminError):
+        contract_pin.finalize_reapproval(conn, "i", "s", pin)
+    assert conn.state["tools"][conn.old] == "approved"
+    assert conn.state["grant"] is None

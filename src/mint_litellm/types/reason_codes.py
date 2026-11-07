@@ -56,6 +56,14 @@ class ContractDriftKind(StrEnum):
     DEPLOYMENT = "deployment"
     UNOBSERVED = "unobserved"
     UNAPPROVED_TOOL = "unapproved_tool"
+    PIN = "pin"  # 고정 불일치·고정 해제 미완료(재승인 차단 표지)
+    NO_CONTRACT = "no_contract"  # 관리 서버인데 승인 계약이 하나도 없다
+
+
+# 관측 모드로 완화할 수 없는 계약 차단(고정 안전 조건). 설정과 무관하게 호출을 막는다.
+NON_OBSERVABLE_DRIFT: frozenset[str] = frozenset(
+    {ContractDriftKind.PIN.value, ContractDriftKind.NO_CONTRACT.value}
+)
 
 
 PARAMETERIZED_REASONS: frozenset[Reason] = frozenset(

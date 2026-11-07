@@ -226,12 +226,19 @@ def _write_latest(
                 return False  # 더 낮은 세대로 덮지 않는다
         except (FileNotFoundError, files.ExportUnverified, KeyError, ValueError):
             pass  # 읽을 수 없는 옛 파일은 판정이 이미 통과한 뒤이므로 새 값으로 바꾼다
-    files.atomic_write(path, files.sign({
+    files.atomic_write(path, latest_document(settings, instance_id, document))
+    return True
+
+
+def latest_document(
+    settings: Stage2Settings, instance_id: str, document: dict[str, Any]
+) -> dict[str, Any]:
+    """체크포인트 문서에서 만든 서명된 ``latest.json`` 내용."""
+    return files.sign({
         "format": files.FORMAT, "instance_id": instance_id,
         "state_epoch": document["state_epoch"], "to_seal_seq": document["to_seal_seq"],
         "tail_hash": document["tail_hash"], "written_at": document["written_at"],
-    }, settings.export_hmac_key))
-    return True
+    }, settings.export_hmac_key)
 
 
 def resign_newest_negative(settings: Stage2Settings, instance_id: str) -> bool:

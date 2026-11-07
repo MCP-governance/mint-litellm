@@ -80,12 +80,14 @@ def staff_actor(
     if not session_id:
         raise StaffUnauthenticated()
     id_hash = console_sessions.hash_id(session_id)
-    row = staff.find_session(control, config.instance_id, id_hash)
+    row = staff.find_session(
+        control, config.instance_id, id_hash, config.stage2.session_verify_window_seconds)
     if row is None:
         raise StaffUnauthenticated()
     sctx = staff.StaffContext(
         staff_conn, control, config.instance_id, row["user_id"],
         consent_max_days=config.stage2.staff_consent_max_days,
+        verify_window_seconds=config.stage2.session_verify_window_seconds,
         team_ids=tuple(row["team_ids"]), key_token=row["key_token"],
     )
     staff.touch_session(
@@ -146,6 +148,7 @@ def login_submit(
     sctx = staff.StaffContext(
         staff_conn, control, config.instance_id, identity.user_id,
         consent_max_days=config.stage2.staff_consent_max_days,
+        verify_window_seconds=config.stage2.session_verify_window_seconds,
         team_ids=identity.team_ids, key_token=identity.key_token,
     )
     now = datetime.now(UTC)

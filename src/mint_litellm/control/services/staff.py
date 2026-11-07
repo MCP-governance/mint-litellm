@@ -39,6 +39,8 @@ class StaffContext:
     user_id: str
     # 본인 동의의 유효 기간 상한(일). Stage2Settings.staff_consent_max_days 값을 넘긴다.
     consent_max_days: int = 90
+    # 마지막 성공 확인 뒤 직원 세션을 받아 주는 시간(초, session_verify_window_seconds).
+    verify_window_seconds: int = 600
     # 인증된 LiteLLM 세션 키 정보에서만 채운다. 화면 입력을 받지 않는다.
     team_ids: tuple[str, ...] = ()
     # 이 세션의 키 토큰(키 범위 승인 조회용).
@@ -47,7 +49,7 @@ class StaffContext:
 
 @contextmanager
 def _staff_transaction(
-    sctx: StaffContext, session_id_hash: str = "", team_ids: Sequence[str] | None = None,
+    sctx: StaffContext, session_id_hash: str = "",
 ) -> Iterator[psycopg.Connection]:
     """직원 함수가 읽는 설정을 이 트랜잭션에만 걸고 연결을 내준다."""
     # 바깥 트랜잭션 안이면 세이브포인트가 되어 설정이 바깥 끝까지 남는다. 유휴 연결만 받는다.
@@ -58,11 +60,10 @@ def _staff_transaction(
             "SELECT set_config('mint.staff_user_id', %s, true),"
             " set_config('mint.staff_instance_id', %s, true),"
             " set_config('mint.staff_session_id_hash', %s, true),"
-            " set_config('mint.staff_team_ids', %s, true),"
-            " set_config('mint.staff_consent_max_days', %s, true)",
+            " set_config('mint.staff_consent_max_days', %s, true),"
+            " set_config('mint.staff_verify_window_seconds', %s, true)",
             (sctx.user_id, sctx.instance_id, session_id_hash,
-             json.dumps(list(sctx.team_ids if team_ids is None else team_ids)),
-             str(sctx.consent_max_days)),
+             str(sctx.consent_max_days), str(sctx.verify_window_seconds)),
         )
         yield sctx.staff
 
@@ -74,8 +75,9 @@ def _active_session(sctx: StaffContext, session_id_hash: str) -> dict:
             sctx.control,
             "SELECT key_token FROM mint.console_sessions WHERE instance_id = %s AND id_hash = %s"
             " AND subject = 'staff' AND user_id = %s AND revoked_at IS NULL"
-            " AND idle_expiry > now() AND absolute_expiry > now()",
-            (sctx.instance_id, session_id_hash, sctx.user_id),
+            " AND idle_expiry > now() AND absolute_expiry > now()"
+            " AND last_verified_at > now() - make_interval(secs => %s)",
+            (sctx.instance_id, session_id_hash, sctx.user_id, sctx.verify_window_seconds),
         )
     if row is None:
         raise forbidden("직원 세션이 없거나 만료되었습니다. 다시 로그인하십시오.")
@@ -274,7 +276,7 @@ def grant_consent(
     _active_session(sctx, session_id_hash)
     _check_consent_target(sctx, org_id, server_id, team_ids)
     consent_id = new_uuid7()
-    with _staff_transaction(sctx, session_id_hash, team_ids) as conn:
+    with _staff_transaction(sctx, session_id_hash) as conn:
         conn.execute(
             "SELECT mint.staff_grant_consent(%s, %s, %s, %s, %s, %s, %s)",
             (consent_id, org_id, server_id, purpose.strip(), data_scope, text_version, valid_until),
@@ -316,15 +318,20 @@ def list_events(sctx: StaffContext, limit: int = 100) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def find_session(control: psycopg.Connection, instance_id: str, id_hash: str) -> dict | None:
-    """유효한 직원 세션의 사용자·키·소속 팀. 없으면 None. 읽기만 한다."""
+def find_session(
+    control: psycopg.Connection, instance_id: str, id_hash: str, window_seconds: int = 600
+) -> dict | None:
+    """유효한 직원 세션의 사용자·키·소속 팀. 없으면 None. 읽기만 한다.
+
+    마지막 성공 확인이 ``window_seconds``를 넘은 세션은 없는 것으로 본다."""
     with control.transaction():
         return fetchone(
             control,
             "SELECT user_id, key_token, team_ids FROM mint.console_sessions"
             " WHERE instance_id = %s AND id_hash = %s AND subject = 'staff'"
-            " AND revoked_at IS NULL AND idle_expiry > now() AND absolute_expiry > now()",
-            (instance_id, id_hash),
+            " AND revoked_at IS NULL AND idle_expiry > now() AND absolute_expiry > now()"
+            " AND last_verified_at > now() - make_interval(secs => %s)",
+            (instance_id, id_hash, window_seconds),
         )
 
 

@@ -67,6 +67,12 @@ SELECT jsonb_build_object(
           AND t.tool = %(tool)s AND t.status = 'approved'
           AND EXISTS (SELECT 1 FROM srv WHERE contract_status = 'managed')
     ),
+    'approved_contracts', (
+        SELECT count(*) FROM mint.tool_contracts t, srv
+        WHERE t.instance_id = %(iid)s AND t.server_id = %(server_id)s AND t.status = 'approved'
+          AND t.credential_scope = CASE WHEN srv.auth_type IN ('oauth_delegate',
+              'true_passthrough') THEN 'per_user' ELSE 'server' END
+    ),
     'allowlists', (
         SELECT coalesce(jsonb_agg(to_jsonb(a)), '[]'::jsonb) FROM mint.allowlists a
         WHERE a.instance_id = %(iid)s AND a.id = ANY (SELECT unnest(basis_allowlist_ids) FROM srv)
@@ -231,6 +237,8 @@ class ServerRow:
     issuer: str | None = None
     last_observed_at: datetime | None = None
     deployment_drift: bool = False
+    pin_blocked: bool = False  # 고정 불일치·해제 미완료 표지(관측 모드로 풀 수 없다)
+    approved_contracts: int | None = None  # 승인 계약 수. None은 알 수 없음(1단계 스키마)
 
 
 @dataclass(frozen=True)
@@ -391,6 +399,8 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
             issuer=server.get("issuer"),
             last_observed_at=_maybe_time(server.get("last_observed_at")),
             deployment_drift=server.get("deployment_drift", False),
+            pin_blocked="pin_reapproval" in (server.get("deployment_drift_fields") or ()),
+            approved_contracts=doc.get("approved_contracts"),
         ),
         allowlists={
             a["id"]: AllowlistRow(

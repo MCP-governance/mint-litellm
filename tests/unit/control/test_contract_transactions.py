@@ -34,6 +34,9 @@ def contract_db(fresh_db):
 
     with psycopg.connect(fresh_db, autocommit=True) as conn:
         conn.execute("INSERT INTO mint.orgs(instance_id,org_id,name) VALUES ('i','o','org')")
+        conn.execute(  # 재승인 요청자는 확정 때도 유효한 승인자여야 한다
+            "INSERT INTO mint.operators(instance_id,name,role,token_hash,user_id)"
+            " VALUES ('i','reviewer','approver',repeat('d',64),'reviewer')")
         conn.execute(
             "INSERT INTO mint.servers(id,instance_id,server_id,status,url_sha256,transport,"
             "auth_type,registered_by,contract_status) VALUES (%s,'i','s','pending',%s,'http',"

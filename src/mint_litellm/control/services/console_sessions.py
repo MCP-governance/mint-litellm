@@ -86,19 +86,25 @@ def create(
 def lookup(
     conn: psycopg.Connection, instance_id: str, settings: Stage2Settings, session_id: str
 ) -> SessionInfo | None:
-    """유효한 세션이면 유휴 만료를 늘리고(절대 만료까지) 정보를 돌려준다. 아니면 None."""
+    """유효한 세션이면 유휴 만료를 늘리고(절대 만료까지) 정보를 돌려준다. 아니면 None.
+
+    마지막 성공 확인(``last_verified_at``)이 확인 주기 두 번(기본 10분)을 넘은 세션은 요청마다
+    거부한다: 작업 실행기가 멈추거나 큐가 밀려도 만료가 집행된다.
+    """
     row = fetchone(
         conn,
         "UPDATE mint.console_sessions SET last_seen_at = now(),"
         " idle_expiry = LEAST(now() + make_interval(secs => %s), absolute_expiry)"
         " WHERE instance_id = %s AND id_hash = %s AND subject = 'admin' AND revoked_at IS NULL"
         " AND idle_expiry > now() AND absolute_expiry > now()"
+        " AND last_verified_at > now() - make_interval(secs => %s)"
         " AND EXISTS (SELECT 1 FROM mint.operators o"
         "  WHERE o.instance_id = console_sessions.instance_id"
         "  AND o.user_id = console_sessions.user_id AND o.role = console_sessions.role"
         "  AND (o.expires_at IS NULL OR o.expires_at > now()))"
         " RETURNING id_hash, user_id, operator_name, role, key_token",
-        (settings.session_idle_seconds, instance_id, hash_id(session_id)),
+        (settings.session_idle_seconds, instance_id, hash_id(session_id),
+         settings.session_verify_window_seconds),
     )
     return None if row is None else SessionInfo(**row)
 

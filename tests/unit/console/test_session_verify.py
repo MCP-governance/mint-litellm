@@ -193,3 +193,14 @@ def test_without_a_control_key_unverified_sessions_are_revoked_after_two_periods
     conn.close()
     assert live(world) == [("human-1",)]
     assert end_reasons(world) == ["unverified"]
+
+
+def test_a_session_not_verified_within_two_periods_is_refused_on_every_request(world):
+    """작업 실행기가 멈춰 session_verify가 돌지 않아도 요청마다 10분 기한이 집행된다."""
+    client = world.session_client()
+    world.query("UPDATE mint.console_sessions SET last_verified_at = now() - interval '9 minutes'")
+    assert client.get("/").status_code == 200
+    world.query("UPDATE mint.console_sessions SET last_verified_at = now() - interval '11 minutes'")
+    assert client.get("/").status_code == 303
+    # 세션 행은 폐기되지 않았지만 요청은 더 받지 않는다(다시 로그인해야 한다)
+    assert live(world) == [("human-1",)]
