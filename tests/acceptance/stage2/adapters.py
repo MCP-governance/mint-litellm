@@ -22,6 +22,8 @@ from pathlib import Path
 
 import yaml
 
+from . import scenarios
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 STATE = Path(os.environ.get("ACC_STATE_DIR", HERE / ".runtime" / "state"))
@@ -419,9 +421,7 @@ def auth_plugin_control_event(ctx):
     write_observation(ctx, sqlstate=sqlstate, inserted=inserted)
 
 
-# ---------------------------------------------------------------- 시나리오 어댑터(본문 대기)
-# 아직 main에 없는 명령(intake·contract·sync·console)의 응답 모양에 의존한다. 그 명령이 병합돼
-# gate()를 통과하면 이 이름들은 장비 실행 전에 본문을 채워야 하며, 그때까지 70으로 실패한다.
+# ---------------------------------------------------------------- 시나리오 어댑터
 
 SCENARIOS = sorted(
     name for name in yaml.safe_load((HERE / "expected_events.yaml").read_text(
@@ -430,12 +430,16 @@ SCENARIOS = sorted(
 
 
 def pending(name):
+    """본문이 없는 시나리오의 자리표시. `scenarios.py`에 본문이 생기면 쓰이지 않는다."""
     def apply(ctx):
         gate(name)
         raise Unwritten(f"어댑터 본문 미작성: {name}")
+    apply.pending = True
     return apply
 
 
+scenarios.bind(sys.modules[__name__])
+ADAPTERS.update(scenarios.BODIES)
 for _name in SCENARIOS:
     ADAPTERS.setdefault(_name, (pending(_name), None))
 
@@ -476,7 +480,7 @@ def emit_site(ssh=None, repo="."):
             continue
         faults[name] = {
             "apply": wrap(name, "apply", "--observation", "{observation}", "--run-id", "{run_id}"),
-            "undo": wrap(name, "undo"), "timeout": 86460 if name == "restore_steady_24h" else 600}
+            "undo": wrap(name, "undo"), "timeout": scenarios.TIMEOUTS.get(name, 600)}
     return {"faults": faults, "case_setup": wrap("case_setup", "{case}")}
 
 

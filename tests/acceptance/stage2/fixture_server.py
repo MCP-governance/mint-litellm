@@ -75,11 +75,15 @@ class Handler(BaseHTTPRequestHandler):
         with STATE.lock:
             if self.path == "/control":
                 mode = request["mode"]
-                if mode not in {"base", "description", "schema", "added", "removed", "limit"}:
+                if mode not in {"base", "description", "schema", "added", "removed", "limit",
+                                "unauthorized"}:
                     self.send_json(400, {"error": "unknown mode"})
                     return
                 STATE.mode = mode
                 self.send_json(200, {"mode": STATE.mode})
+                return
+            if STATE.mode == "unauthorized":  # 자격이 필요한 업스트림(수용검증 시험용)
+                self.send_json(401, {"error": "authentication required"})
                 return
             method = request.get("method")
             STATE.counts[method] += 1

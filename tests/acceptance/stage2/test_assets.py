@@ -77,7 +77,12 @@ def test_every_required_fault_has_a_named_adapter():
     assert all(f["apply"][0] == "bash" and "{observation}" in " ".join(f["apply"])
                for f in site["faults"].values())
     assert main(["no_such", "apply"]) == 2
-    assert main(["sync_race_30", "apply"]) in (SKIPPED, 70)
+    # 46종 모두 본문이 있고, 직원 화면(G8b) 의존 사례만 건너뜀으로 끝난다
+    from .adapters import SCENARIOS
+    from .scenarios import BODIES
+    assert len(BODIES) == 46 and set(BODIES) <= set(SCENARIOS)
+    assert not [n for n in SCENARIOS if getattr(ADAPTERS[n][0], "pending", False)]
+    assert main(["auth_screens_13", "apply"]) == SKIPPED
 
 
 def test_generated_commands_replace_shell_placeholders():

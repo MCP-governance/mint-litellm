@@ -1,0 +1,1689 @@
+"""시나리오 어댑터 본문 46종. `adapters.py`가 `bind()`로 자기 도구(psql·compose·http 등)를 넘긴다.
+
+각 함수는 실제 CLI·LiteLLM 관리 API·DB 질의로 준비 → 행동 → 실측을 하고 `write_observation`으로
+측정값만 남긴다. 기대값은 `expected_events.yaml`이 정본이며 여기서 복사하지 않는다.
+설정은 `site.json`(환경변수 ACC_SITE 또는 MINT_ACC_SITE, 없으면 `.runtime/site.json`)과
+환경변수에서 읽는다.
+기기 주소·계정·비밀은 이 파일에 없다.
+"""
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+A = None  # adapters 모듈(순환 import를 피하려고 bind로 받는다)
+BODIES = {}
+TIMEOUTS = {"restore_steady_24h": 86460, "confirmation_expiry_10m": 1500, "sync_race_30": 1200,
+            "auth_blocked_key": 900, "auth_deleted_key": 900, "restore_backup_before_revoke": 900,
+            "restore_epoch_caught_up": 900, "restore_consent": 900, "sync_revoke_race": 900}
+ROLE_ENV = {"admin": "ACC_ADMIN_TOKEN", "approver": "ACC_APPROVER_TOKEN",
+            "admin2": "ACC_ADMIN2_TOKEN"}
+CAUSES = ("restore_pending", "export_missing", "export_unverified")
+
+
+def bind(module):
+    global A
+    A = module
+
+
+def scenario(name, undo=None):
+    def register(fn):
+        def body(ctx):
+            A.gate(name)
+            fn(ctx)
+        BODIES[name] = (body, undo)
+        return fn
+    return register
+
+
+# ---------------------------------------------------------------- 공통 도구
+
+def site():
+    path = Path(os.environ.get("ACC_SITE") or os.environ.get("MINT_ACC_SITE")
+                or A.HERE / ".runtime" / "site.json")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sec(role):
+    return os.environ[site()["secret_env"][role]]
+
+
+def lit(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def iid():
+    return A.instance()
+
+
+def q(sql):
+    out = A.psql(f"SELECT coalesce(json_agg(t), '[]'::json) FROM ({sql}) t", "mint")
+    return json.loads(out)
+
+
+def q1(sql):
+    rows = q(sql)
+    return rows[0] if rows else None
+
+
+def n(sql):
+    return int(A.psql(sql, "mint") or 0)
+
+
+def db_now():
+    return A.psql("SELECT clock_timestamp()", "mint")
+
+
+def wait(predicate, seconds, label, step=1.0):
+    deadline = time.monotonic() + seconds
+    while True:
+        value = predicate()
+        if value:
+            return value
+        if time.monotonic() > deadline:
+            raise SystemExit(f"시간 상한 초과: {label} ({seconds}s)")
+        time.sleep(step)
+
+
+def limit(name):
+    return A.yaml.safe_load((A.HERE / "expected_events.yaml").read_text(
+        encoding="utf-8"))["limits"][name]
+
+
+def sv():
+    return os.environ.get("ACC_SERVER_ID") or site()["servers"]["synthetic"]["server_id"]
+
+
+def synthetic():
+    return site()["servers"]["synthetic"]
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def raw(method, url, body=None, key=None, headers=None):
+    """(상태, 본문 문자열). HTTP 오류도 값으로 돌려준다."""
+    request = urllib.request.Request(
+        url, method=method, data=None if body is None else json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", **(headers or {}),
+                 **({"Authorization": f"Bearer {key}"} if key else {})})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode("utf-8", "replace")
+
+
+def admin_key():
+    return A.env("ACC_LITELLM_ADMIN_KEY", os.environ.get("MINT_LITELLM_KEY"))
+
+
+def lite(method, path, body=None, key=None):
+    return A.http(method, A.env("ACC_LITELLM_ADMIN_URL").rstrip("/") + path, body,
+                  key or admin_key())
+
+
+def lite_raw(method, path, body=None, key=None):
+    return raw(method, A.env("ACC_LITELLM_ADMIN_URL").rstrip("/") + path, body,
+               key or admin_key())
+
+
+def cli(*args, role="admin", token=None, check=True, env_over=None):
+    """운영자 CLI 한 번. (종료 코드, JSON 또는 None, 표준 오류)."""
+    env = {**os.environ, "MINT_OPERATOR_TOKEN": token or A.env(ROLE_ENV[role]),
+           **(env_over or {})}
+    command = shlex.split(os.environ.get("ACC_CLI", f"{sys.executable} -m mint_litellm.cli"))
+    done = subprocess.run([*command, *map(str, args), "--json"], cwd=A.ROOT, env=env, text=True,
+                          encoding="utf-8", capture_output=True, timeout=180)
+    try:
+        data = json.loads(done.stdout) if done.stdout.strip() else None
+    except ValueError:
+        data = None
+    if check and done.returncode:
+        raise SystemExit(f"CLI 실패({done.returncode}): {' '.join(map(str, args[:3]))} "
+                         + done.stderr[-300:])
+    return done.returncode, data, done.stderr
+
+
+def iso(delta):
+    return (datetime.now(UTC) + delta).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def code_of(text):
+    found = re.search(r"MINT-[A-Z0-9-]+", text)
+    return found.group(0) if found else None
+
+
+def cause_of(text):
+    return next((c for c in CAUSES if c in text), None)
+
+
+def rest_call(key, tool, arguments, server=None, mark=None):
+    """호출 키로 LiteLLM REST 호출. (상태, 본문, 호출 표식)."""
+    mark = mark or "acc-" + uuid.uuid4().hex
+    status, text = raw("POST", site()["litellm"][0].rstrip("/") + "/mcp-rest/tools/call",
+                       {"server_id": server or sv(), "name": tool, "arguments": arguments}, key,
+                       {"x-litellm-call-id": mark})
+    return status, text, mark
+
+
+def upstream(server=None):
+    status, text = raw("GET", site()["counters"][server or sv()])
+    return json.loads(text)["tools/call"]
+
+
+def log_count(pattern, since):
+    """LiteLLM 접근 로그(site.decision_logs)에서 `since`(UTC datetime) 이후 패턴 줄 수."""
+    total = 0
+    for argv in site().get("decision_logs", []):
+        argv = list(argv)
+        if argv[:2] == ["docker", "logs"]:
+            argv[2:2] = ["--since", since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")]
+        done = subprocess.run(argv, text=True, encoding="utf-8", errors="replace",
+                              capture_output=True, timeout=120)
+        total += len(re.findall(pattern, done.stdout + done.stderr))
+    return total
+
+
+def event_count(kind, since):
+    return n(f"SELECT count(*) FROM mint.events WHERE instance_id={lit(iid())} "
+             f"AND kind={lit(kind)} AND inserted_at >= {lit(since)}")
+
+
+def epoch():
+    return n(f"SELECT coalesce(max(epoch),0) FROM mint.state_epoch WHERE instance_id={lit(iid())}")
+
+
+@contextmanager
+def paused(service):
+    """서비스를 멈춰 두고(작업이 쌓이게) 나올 때 원래대로 되돌린다."""
+    was = A.running(service)
+    if was:
+        A.compose("stop", service)
+    try:
+        yield
+    finally:
+        if was:
+            A.compose("start", service)
+
+
+def observe(ctx, **fields):
+    A.write_observation(ctx, **fields)
+
+
+# ---- LiteLLM 시험 주체와 정리
+
+def track(kind, ident):
+    path = A.state_file("litellm-objects.json")
+    items = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    items.append([kind, ident])
+    path.write_text(json.dumps(items), encoding="utf-8")
+
+
+def cleanup(ctx=None):
+    path = A.state_file("litellm-objects.json")
+    if not path.exists():
+        return
+    bodies = {"key": ("/key/delete", "keys"), "team": ("/team/delete", "team_ids"),
+              "user": ("/user/delete", "user_ids")}
+    for kind, ident in reversed(json.loads(path.read_text(encoding="utf-8"))):
+        try:
+            if kind == "server":
+                lite_raw("DELETE", f"/v1/mcp/server/{ident}")
+            else:
+                route, field = bodies[kind]
+                lite_raw("POST", route, {field: [ident]})
+        except Exception:  # 이미 지워졌거나 닿지 않아도 정리는 계속한다
+            continue
+    path.unlink(missing_ok=True)
+
+
+def new_user():
+    user = "acc-" + uuid.uuid4().hex[:10]
+    lite("POST", "/user/new", {"user_id": user, "user_role": "internal_user"})
+    track("user", user)
+    return user
+
+
+def new_team(servers=()):
+    body = {"team_alias": "acc-team-" + uuid.uuid4().hex[:8]}
+    if servers:
+        body["object_permission"] = {"mcp_servers": list(servers)}
+    team = lite("POST", "/team/new", body)["team_id"]
+    track("team", team)
+    return team
+
+
+def new_key(user, team=None, servers=(), **extra):
+    body = {"user_id": user, **extra}
+    if team:
+        body["team_id"] = team
+    if servers:
+        body["object_permission"] = {"mcp_servers": list(servers)}
+    key = lite("POST", "/key/generate", body)["key"]
+    track("key", key)
+    return key, sha(key)
+
+
+# ---- MINT 쪽 준비(소유 권한용 승인은 intake approve가 만드는 pending 행과 같은 모양을 쓴다)
+
+def relation(server):
+    row = q1(f"SELECT id, org_id FROM mint.usage_relations WHERE instance_id={lit(iid())} "
+             f"AND server_id={lit(server)} AND status='active' ORDER BY id LIMIT 1")
+    if row is None:
+        raise SystemExit("활성 이용 관계 없음: 서버가 먼저 활성화되어야 합니다")
+    return row
+
+
+def tool_names(server):
+    rows = q(f"SELECT DISTINCT tool FROM mint.tool_contracts WHERE instance_id={lit(iid())} "
+             f"AND server_id={lit(server)} AND status='approved' ORDER BY tool")
+    if not rows:
+        raise SystemExit("승인된 도구 계약 없음")
+    return [r["tool"] for r in rows]
+
+
+def add_pending_approval(scope_type, scope_id, server, tools=None, conditions=None):
+    """approve CLI는 LiteLLM에 사전 권한을 요구해 MINT 소유 항목을 못 만든다. intake approve가 쓰는
+    것과 같은 `pending` 승인 행을 넣고 동기화 작업을 등록한다(승인 완결은 작업 실행기의 몫)."""
+    rel = relation(server)
+    approval = str(uuid.uuid4())
+    names = "ARRAY[" + ",".join(lit(t) for t in (tools or tool_names(server))) + "]::text[]"
+    A.psql(
+        "INSERT INTO mint.approvals (id, instance_id, org_id, relation_id, class, server_id, tools,"
+        " scope_type, scope_id, valid_from, valid_until, conditions, basis, granted_by,"
+        " requested_by, status) VALUES ("
+        f"{lit(approval)}, {lit(iid())}, {lit(rel['org_id'])}, {lit(rel['id'])}, 'standard', "
+        f"{lit(server)}, {names}, {lit(scope_type)}, {lit(scope_id)}, now(), "
+        "now() + interval '1 day', "
+        f"{lit(json.dumps(conditions or {}))}::jsonb, '{{\"text\":\"acceptance\"}}'::jsonb, "
+        "'acceptance', 'acceptance', 'pending')", "mint")
+    enqueue("sync_server", server)
+    enqueue("sync_target", f"{scope_type}:{scope_id}")
+    return approval
+
+
+def enqueue(kind, ref):
+    A.psql("INSERT INTO mint.jobs (id, instance_id, kind, target_ref) VALUES ("
+           f"gen_random_uuid(), {lit(iid())}, {lit(kind)}, {lit(ref)}) ON CONFLICT "
+           "(instance_id, kind, target_ref) WHERE status = 'pending' AND idempotency_key IS NULL "
+           "DO NOTHING", "mint")
+
+
+def grant_row(target_type, target_id, server=None, item="mcp_server"):
+    return q1("SELECT id, observed, preexisting, held, missing_count, last_applied_at "
+              f"FROM mint.litellm_grants WHERE instance_id={lit(iid())} "
+              f"AND target_type={lit(target_type)} AND target_id={lit(target_id)} "
+              f"AND item={lit(item)} AND server_id={lit(server or sv())}")
+
+
+def converged(target_type, target_id, server=None):
+    row = grant_row(target_type, target_id, server)
+    return row is not None and row["observed"] is True
+
+
+def permission(target_type, target_id):
+    """LiteLLM에서 읽은 object_permission(키는 토큰 해시로 조회한다)."""
+    if target_type == "key":
+        return lite("GET", "/key/info?key=" + target_id)["info"].get("object_permission") or {}
+    return lite("GET", "/team/info?team_id=" + target_id)["team_info"].get(
+        "object_permission") or {}
+
+
+def has_server(target_type, target_id, server=None):
+    return (server or sv()) in (permission(target_type, target_id).get("mcp_servers") or [])
+
+
+def active_approval(server=None):
+    return A.psql("SELECT id FROM mint.approvals WHERE instance_id=" + lit(iid())
+                  + " AND server_id=" + lit(server or sv())
+                  + " AND status='active' ORDER BY valid_from DESC LIMIT 1", "mint")
+
+
+# ================================================================ 동기화 7종
+
+@scenario("sync_team_order", undo=cleanup)
+def sync_team_order(ctx):
+    server = sv()
+    team, user = new_team(), new_user()
+    _, kid = new_key(user, team)
+    with paused("worker"):  # 키 작업이 팀 작업보다 먼저 임대되도록 쌓아 둔다
+        add_pending_approval("key", kid, server)
+        add_pending_approval("team", team, server)
+    wait(lambda: converged("key", kid) and converged("team", team), limit("sync_seconds"),
+         "팀 → 키 수렴")
+    order = q1("SELECT t.last_applied_at < k.last_applied_at AS team_first FROM "
+               f"mint.litellm_grants t, mint.litellm_grants k WHERE t.instance_id={lit(iid())} "
+               f"AND k.instance_id=t.instance_id AND t.target_type='team' "
+               f"AND t.target_id={lit(team)} "
+               f"AND t.item='mcp_server' AND k.target_type='key' AND k.target_id={lit(kid)} "
+               "AND k.item='mcp_server'")
+    forbidden = n(f"SELECT count(*) FROM mint.alerts WHERE instance_id={lit(iid())} "
+                  f"AND dedup_key LIKE {lit('sync_divergence:forbidden:key:' + kid)}")
+    observe(ctx, server_id=server, team_before_key=bool(order and order["team_first"]),
+            key_first_status=403 if forbidden else None,
+            converged=converged("key", kid) and has_server("key", kid))
+
+
+@scenario("sync_preexisting", undo=cleanup)
+def sync_preexisting(ctx):
+    server = sv()
+    user = new_user()
+    _, kid = new_key(user, servers=[server])  # 사람이 미리 넣은 항목
+    approval = add_pending_approval("key", kid, server)
+    wait(lambda: A.psql(f"SELECT status FROM mint.approvals WHERE id={lit(approval)}",
+                        "mint") == "active", limit("sync_seconds"), "승인 완결")
+    pre = grant_row("key", kid)
+    cli("revoke", approval, "--reason", "acceptance")
+    wait(lambda: n("SELECT count(*) FROM mint.litellm_grants WHERE "
+                   f"instance_id={lit(iid())} AND target_type='key' AND target_id={lit(kid)} "
+                   "AND item='mcp_server' AND NOT preexisting AND observed") == 0
+         and A.psql(f"SELECT status FROM mint.jobs WHERE instance_id={lit(iid())} "
+                    f"AND kind='sync_target' AND target_ref={lit('key:' + kid)} "
+                    "ORDER BY created_at DESC LIMIT 1", "mint") == "done",
+         limit("sync_seconds"), "철회 수렴")
+    owned = n(f"SELECT count(*) FROM mint.litellm_grants WHERE instance_id={lit(iid())} "
+              f"AND target_type='key' AND target_id={lit(kid)} AND item='mcp_server' "
+              "AND NOT preexisting AND observed")
+    observe(ctx, server_id=server, preexisting_recorded=bool(pre and pre["preexisting"]),
+            preexisting_after_revoke=1 if has_server("key", kid) else 0, owned_after_revoke=owned)
+
+
+def pin_mismatch_undo(ctx):
+    A.http("POST", A.env("ACC_FIXTURE_URL").rstrip("/") + "/control", {"mode": "base"})
+    cleanup(ctx)
+
+
+@scenario("sync_pin_mismatch", undo=pin_mismatch_undo)
+def sync_pin_mismatch(ctx):
+    server = sv()
+    start = datetime.now(UTC)
+    since = db_now()
+    team, user = new_team(), new_user()
+    _, kid = new_key(user)
+    A.http("POST", A.env("ACC_FIXTURE_URL").rstrip("/") + "/control", {"mode": "description"})
+    with paused("worker"):  # sync_server가 먼저 돌아 고정 불일치가 대상 작업보다 앞서게 한다
+        approval = add_pending_approval("key", kid, server)
+        add_pending_approval("team", team, server)
+        enqueue("sync_server", server)
+    wait(lambda: event_count("reapproval_requested", since) >= 1, limit("sync_seconds"),
+         "재승인 요청")
+    time.sleep(limit("observe_seconds") / 2)  # 늦게 도는 대상 작업이 권한을 내보내지 않는지 본다
+
+    def granted(kind, target):
+        return n(f"SELECT count(*) FROM mint.litellm_grants WHERE instance_id={lit(iid())} "
+                 f"AND item='mcp_server' AND observed AND target_type={lit(kind)} "
+                 f"AND target_id={lit(target)}")
+
+    observe(ctx, server_id=server, key_grants=granted("key", kid),
+            team_grants=granted("team", team),
+            approval_status=A.psql(f"SELECT status FROM mint.approvals WHERE id={lit(approval)}",
+                                   "mint"),
+            unpin_calls=log_count(r"DELETE /v1/mcp/server/\S+/pin", start),
+            events={"reapproval_requested": event_count("reapproval_requested", since)})
+
+
+@scenario("sync_race_30", undo=cleanup)
+def sync_race_30(ctx):
+    server, rounds = sv(), 30
+    subjects = []
+    for i in range(rounds):
+        user = new_user()
+        key, kid = new_key(user, metadata={"acc": "init"})
+        subjects.append((i, key, kid))
+    barrier = threading.Barrier(rounds)
+
+    def race(i, key, kid):
+        barrier.wait()
+        add_pending_approval("key", kid, server)  # MINT 쓰기를 부르는 쪽
+        lite("POST", "/key/update", {"key": kid, "metadata": {"acc": f"foreign-{i}"}})
+
+    threads = [threading.Thread(target=race, args=s) for s in subjects]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    deadline = limit("sync_seconds")
+    wait(lambda: all(converged("key", kid) for _, _, kid in subjects), deadline, "30회 수렴")
+    missing = sum(1 for _, _, kid in subjects if not has_server("key", kid))
+    unalerted = 0
+    for i, _, kid in subjects:
+        info = lite("GET", "/key/info?key=" + kid)["info"]
+        if (info.get("metadata") or {}).get("acc") != f"foreign-{i}":  # 비소유 필드가 덮였다
+            unalerted += 0 if n(f"SELECT count(*) FROM mint.alerts WHERE instance_id={lit(iid())} "
+                                f"AND dedup_key={lit('sync_foreign_change:key:' + kid)}") else 1
+    observe(ctx, server_id=server, rounds=rounds, owned_missing=missing,
+            foreign_change_without_alert=unalerted)
+
+
+@scenario("sync_dedup", undo=cleanup)
+def sync_dedup(ctx):
+    import psycopg
+
+    from mint_litellm.control.context import Context, Operator
+    from mint_litellm.control.services.base import enqueue_job
+
+    server = sv()
+    _, kid = new_key(new_user())
+    ref = f"key:{kid}"
+    ids = []
+
+    def click():
+        with psycopg.connect(A.env("MINT_DATABASE_URL")) as conn:
+            ids.append(enqueue_job(Context(conn, iid(), Operator("acceptance", "admin", None)),
+                                   "sync_target", ref))
+
+    with paused("worker"):  # 대기 행이 그대로 남아 있어야 센다
+        threads = [threading.Thread(target=click) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        pending = n(f"SELECT count(*) FROM mint.jobs WHERE instance_id={lit(iid())} "
+                    f"AND kind='sync_target' AND target_ref={lit(ref)} AND status='pending'")
+    observe(ctx, server_id=server, pending_per_target=pending, requests=len(ids),
+            distinct_job_ids=len(set(map(str, ids))))
+
+
+@scenario("sync_lease_reclaim", undo=cleanup)
+def sync_lease_reclaim(ctx):
+    server = sv()
+    start = datetime.now(UTC)
+    user = new_user()
+    _, kid = new_key(user)
+    ref = f"key:{kid}"
+    with paused("worker"):
+        approval = add_pending_approval("key", kid, server)
+        # 처리기가 LiteLLM에 쓴 뒤 기록 전에 죽은 상태: 소유 행(관측 전)·LiteLLM 값·만료된 임대
+        A.psql("INSERT INTO mint.litellm_grants (id, instance_id, target_type, target_id, item, "
+               f"server_id, observed) VALUES (gen_random_uuid(), {lit(iid())}, 'key', {lit(kid)}, "
+               f"'mcp_server', {lit(server)}, false)", "mint")
+        current = permission("key", kid)
+        lite("POST", "/key/update", {"key": kid, "object_permission": {
+            **current, "mcp_servers": [*(current.get("mcp_servers") or []), server]}})
+        A.psql("UPDATE mint.jobs SET status='running', lease_owner='acc-crashed', "
+               "lease_until=now() + interval '2 seconds', attempts=1 WHERE "
+               f"instance_id={lit(iid())} AND kind='sync_target' AND target_ref={lit(ref)} "
+               "AND status='pending'", "mint")
+    wait(lambda: converged("key", kid), limit("sync_seconds"), "임대 회수 뒤 수렴")
+    job = q1(f"SELECT status, attempts FROM mint.jobs WHERE instance_id={lit(iid())} "
+             f"AND kind='sync_target' AND target_ref={lit(ref)} ORDER BY created_at DESC LIMIT 1")
+    writes = log_count(r"POST /key/update", start) - 1  # 장애를 만든 내 쓰기 1건 제외
+    observe(ctx, server_id=server, reexecutions=int(job["attempts"]) - 0,
+            duplicate_writes=max(0, writes),
+            converged=converged("key", kid) and has_server("key", kid),
+            approval=approval)
+
+
+@scenario("sync_revoke_race", undo=cleanup)
+def sync_revoke_race(ctx):
+    server, count = sv(), 6
+    targets = []
+    for _ in range(count):
+        _, kid = new_key(new_user())
+        approval = add_pending_approval("key", kid, server)
+        targets.append((kid, approval))
+    wait(lambda: all(A.psql(f"SELECT status FROM mint.approvals WHERE id={lit(a)}", "mint")
+                     == "active" for _, a in targets), limit("sync_seconds"), "활성화")
+    for kid, _ in targets:  # 작업 실행기가 바쁘게 돌도록 대상 작업을 한꺼번에 등록
+        enqueue("sync_target", f"key:{kid}")
+    overlap = False
+    started = time.monotonic()
+    for _kid, approval in targets:
+        running = n(f"SELECT count(*) FROM mint.jobs WHERE instance_id={lit(iid())} "
+                    "AND kind='sync_target' AND status='running'")
+        cli("revoke", approval, "--reason", "acceptance")
+        overlap = overlap or running > 0
+    wait(lambda: not any(has_server("key", kid) for kid, _ in targets), 60, "철회 제거 확인")
+    elapsed = time.monotonic() - started
+    remaining = n(f"SELECT count(*) FROM mint.litellm_grants WHERE instance_id={lit(iid())} "
+                  "AND item='mcp_server' AND NOT preexisting AND observed AND target_type='key' "
+                  "AND target_id IN (" + ",".join(lit(k) for k, _ in targets) + ")")
+    observe(ctx, server_id=server, overlap=overlap, remaining_owned=remaining,
+            elapsed_seconds=elapsed)
+
+
+# ================================================================ 수용검증 음성 7종
+
+def fixture_control(mode):
+    A.http("POST", A.env("ACC_FIXTURE_URL").rstrip("/") + "/control", {"mode": mode})
+
+
+def fixture_undo(ctx):
+    try:
+        fixture_control("base")
+    finally:
+        cleanup(ctx)
+
+
+def fixture_url():
+    """LiteLLM이 합성 서버에 접속하는 주소(활성화된 합성 서버의 등록 값)."""
+    return lite("GET", f"/v1/mcp/server/{sv()}")["url"]
+
+
+def register_fixture_server():
+    """운영자 경로: 합성 서버를 LiteLLM에 새 항목으로 등록한다."""
+    alias = "acc-" + uuid.uuid4().hex[:8]
+    created = lite("POST", "/v1/mcp/server", {
+        "alias": alias, "server_name": alias, "url": fixture_url(), "transport": "http",
+        "allow_all_keys": False})
+    track("server", created["server_id"])
+    return created["server_id"]
+
+
+def submit_server(url, allow_all_keys=False):
+    """제출 경로: 비관리자 팀 범위 키로 공개 서버 제출. 책임 사용자는 조직에 묶여 있어야 한다."""
+    alias = "acc-" + uuid.uuid4().hex[:8]
+    status, text = lite_raw("POST", "/v1/mcp/server/register", {
+        "alias": alias, "server_name": alias, "url": url, "transport": "http",
+        "description": "acceptance", "allow_all_keys": allow_all_keys},
+        key=A.env("ACC_SUBMIT_KEY"))
+    if status not in (200, 201):
+        raise SystemExit(f"제출 실패(HTTP {status})")
+    server_id = json.loads(text)["server_id"]
+    track("server", server_id)
+    return server_id
+
+
+def create_intake(server_id, url=None):
+    s = site()["intake"]
+    r = s["readiness"]
+
+    def text(value):
+        return "예" if value is True else str(value)
+
+    args = ["intake", "create", server_id, "--org", s["org_id"], "--purpose", s["purpose"],
+            "--data-grade", s["data_grade"],
+            "--allowed-resources", json.dumps(s["allowed_resources"]),
+            "--provider", s["provider"], "--owner", s["owner_user_id"],
+            "--credential-notice", text(r["credential_notice"]),
+            "--revocation-record", text(r["revocation_record"]),
+            "--audit-access-days", str(r["audit_access_days"]),
+            "--data-return-terms", s["data_return_terms"]]
+    if url:
+        args += ["--url", url]
+    return cli(*args)[1]["id"]
+
+
+def intake_status(intake_id):
+    return A.psql(f"SELECT status FROM mint.intakes WHERE id={lit(intake_id)}", "mint")
+
+
+def checked(intake_id):
+    return intake_status(intake_id) in ("passed", "failed", "indeterminate", "decided")
+
+
+def decision_writes(intake_id):
+    return (n(f"SELECT count(*) FROM mint.intakes WHERE id={lit(intake_id)} "
+              "AND (decision IS NOT NULL OR decided_by IS NOT NULL)")
+            + n(f"SELECT count(*) FROM mint.events WHERE instance_id={lit(iid())} "
+                f"AND kind='intake_decided' AND payload->>'intake_id'={lit(intake_id)}"))
+
+
+def negative_submission(ctx, url, allow_all_keys=False):
+    start = datetime.now(UTC)
+    server_id = submit_server(url, allow_all_keys)
+    seen_open = lite("GET", f"/v1/mcp/server/{server_id}").get("allow_all_keys")
+    wait(lambda: n(f"SELECT count(*) FROM mint.intakes WHERE instance_id={lit(iid())} "
+                   f"AND server_id={lit(server_id)}"), 180, "제출 신청 수신")
+    intake_id = A.psql(f"SELECT id FROM mint.intakes WHERE instance_id={lit(iid())} "
+                       f"AND server_id={lit(server_id)} ORDER BY created_at LIMIT 1", "mint")
+    create_intake(server_id)  # 필수 입력을 채우면 검사가 시작된다
+    wait(lambda: A.psql(f"SELECT coalesce(decision,'') FROM mint.intakes "
+                        f"WHERE id={lit(intake_id)}", "mint") == "rejected", 180, "자동 거절")
+    time.sleep(5)  # 뒤늦은 시험 호출·재신청이 없는지 본다
+    observe(ctx, intake_id=intake_id, submitted_allow_all_keys=seen_open is True,
+            test_route_calls=log_count(r"/mcp-rest/test/", start),
+            reject_calls=log_count(r"PUT /v1/mcp/server/\S+/reject", start),
+            resubmissions=n(f"SELECT count(*) FROM mint.intakes WHERE instance_id={lit(iid())} "
+                            f"AND server_id={lit(server_id)}") - 1,
+            failed_checks=n(f"SELECT count(*) FROM mint.intake_checks WHERE "
+                            f"intake_id={lit(intake_id)} AND result='fail'"))
+
+
+@scenario("intake_provider_denied", undo=cleanup)
+def intake_provider_denied(ctx):
+    negative_submission(ctx, f"https://denied-{uuid.uuid4().hex[:8]}.example.org/mcp")
+
+
+@scenario("intake_private_literal", undo=cleanup)
+def intake_private_literal(ctx):
+    negative_submission(ctx, "https://10.20.30.40/mcp")
+
+
+@scenario("intake_allow_all_keys", undo=cleanup)
+def intake_allow_all_keys(ctx):
+    negative_submission(ctx, f"https://denied-{uuid.uuid4().hex[:8]}.example.org/mcp",
+                        allow_all_keys=True)
+
+
+@scenario("intake_definitions_limit", undo=fixture_undo)
+def intake_definitions_limit(ctx):
+    fixture_control("limit")  # 도구 501개: 상한 500 초과
+    intake_id = create_intake(register_fixture_server(), fixture_url())
+    wait(lambda: checked(intake_id), 180, "검사")
+    result = intake_status(intake_id)
+    second = A.env(ROLE_ENV["admin2"])
+    over = cli("intake", "except", intake_id, "--reason", "acceptance", "--valid-until",
+               iso(timedelta(days=91)), "--second-approver", second, role="approver", check=False)
+    ok = cli("intake", "except", intake_id, "--reason", "acceptance", "--valid-until",
+             iso(timedelta(days=89, hours=23)), "--second-approver", second, role="approver")
+    approval = q1("SELECT extract(epoch FROM valid_until - valid_from) / 86400 AS days, "
+                  "basis->>'second_approver' AS second, granted_by FROM mint.approvals WHERE "
+                  f"instance_id={lit(iid())} AND basis->>'intake_id'={lit(intake_id)}")
+    observe(ctx, intake_id=intake_id, result=result,
+            distinct_approvers=len({approval["second"], approval["granted_by"]} - {None}),
+            exception_days=round(float(approval["days"]), 3), day_91_rejected=over[0] != 0,
+            exception_exit=ok[0])
+
+
+@scenario("intake_same_requester", undo=fixture_undo)
+def intake_same_requester(ctx):
+    intake_id = create_intake(register_fixture_server(), fixture_url())  # 신청자 = 이 관리자
+    wait(lambda: checked(intake_id), 180, "검사")
+    refused = cli("intake", "approve", intake_id, role="admin", check=False)
+    observe(ctx, intake_id=intake_id, refused_exit=refused[0],
+            decision_writes=decision_writes(intake_id))
+
+
+@scenario("intake_stale_evidence", undo=fixture_undo)
+def intake_stale_evidence(ctx):
+    intake_id = create_intake(register_fixture_server(), fixture_url())
+    wait(lambda: intake_status(intake_id) == "passed", 180, "검사 통과")
+    # 검사 기록은 추가 전용이라 시험 스택의 복제 역할로만 시각을 옮긴다
+    A.psql("SET session_replication_role=replica; UPDATE mint.intake_checks SET "
+           "ran_at = now() - interval '25 hours' WHERE intake_id=" + lit(intake_id)
+           + " AND check IN ('connection','definitions')", "mint")
+    age = float(A.psql("SELECT extract(epoch FROM now() - min(ran_at)) / 3600 FROM "
+                       f"mint.intake_checks WHERE intake_id={lit(intake_id)} "
+                       "AND check IN ('connection','definitions')", "mint"))
+    refused = cli("intake", "approve", intake_id, role="approver", check=False)
+    observe(ctx, intake_id=intake_id, evidence_age_hours=round(age, 3), refused_exit=refused[0],
+            decision_writes=decision_writes(intake_id))
+
+
+@scenario("intake_credentials_required", undo=fixture_undo)
+def intake_credentials_required(ctx):
+    fixture_control("unauthorized")
+    base = A.env("ACC_FIXTURE_URL").rstrip("/")
+    upstream_status = raw("POST", base + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0]
+    test_status, test_text = lite_raw("POST", "/mcp-rest/test/connection", {
+        "url": fixture_url(), "transport": "http", "auth_type": "none"})
+    intake_id = create_intake(register_fixture_server(), fixture_url())
+    wait(lambda: checked(intake_id), 180, "검사")
+    observe(ctx, intake_id=intake_id, upstream_status=upstream_status,
+            test_http_status=test_status, test_body_status=json.loads(test_text).get("status"),
+            result=intake_status(intake_id))
+
+
+# ================================================================ 되돌림 8종
+
+def tagged(tag):
+    return type("Tag", (), {"run_id": tag})
+
+
+def export_root():
+    return A.export_dir()
+
+
+def newest_negative():
+    names = [int(p.stem) for p in (export_root() / "negative").glob("*.json") if p.stem.isdigit()]
+    return max(names, default=-1)
+
+
+def file_backup_path(name):
+    return A.state_file("export-" + name)
+
+
+def keep_file(path):
+    """원래 파일을 보관한다. 되돌릴 때 같은 바이트로 쓴다."""
+    file_backup_path(path.name).write_bytes(path.read_bytes())
+
+
+def put_back(name, target):
+    saved = file_backup_path(name)
+    if saved.exists():
+        target.write_bytes(saved.read_bytes())
+        saved.unlink()
+
+
+def put_back_latest(ctx=None):
+    put_back("latest.json", export_root() / "latest.json")
+
+
+def restart_env(over):
+    """공개 키 환경을 바꿔 판정·작업 서비스를 다시 만든다(compose는 호스트 환경으로 보간한다)."""
+    base = shlex.split(os.environ.get("ACC_COMPOSE") or
+                       f"docker compose -p {A.env('COMPOSE_PROJECT_NAME', 'mint-acc')} "
+                       "-f deploy/compose.yaml")
+    services = os.environ.get("ACC_PLUGIN_SERVICES", "litellm worker").split()
+    done = subprocess.run([*base, "up", "-d", "--force-recreate", "--wait", *services],
+                          cwd=A.ROOT, env={**os.environ, **over}, text=True, encoding="utf-8",
+                          capture_output=True, timeout=600)
+    if done.returncode:
+        raise SystemExit("서비스 재생성 실패: " + done.stderr[-300:])
+
+
+def original_keys():
+    return {"MINT_EXPORT_HMAC_KEY": A.env("MINT_EXPORT_HMAC_KEY"),
+            "MINT_EXPORT_HMAC_KEY_PREVIOUS": os.environ.get("MINT_EXPORT_HMAC_KEY_PREVIOUS", "")}
+
+
+def restore_keys(ctx=None):
+    restart_env(original_keys())
+
+
+def new_hmac_key():
+    import base64
+    return base64.urlsafe_b64encode(os.urandom(48)).rstrip(b"=").decode()
+
+
+def writes_since(since):
+    """작업 실행기의 외부 쓰기(LiteLLM 쓰기 경로) 수. 로그가 없으면 소유 항목 갱신 시각으로 센다."""
+    if site().get("decision_logs"):
+        return log_count(r"(POST /(key|team)/update|PUT /v1/mcp/server|"
+                         r"(POST|DELETE) /v1/mcp/server/\S+/pin)", since)
+    return n(f"SELECT count(*) FROM mint.litellm_grants WHERE instance_id={lit(iid())} "
+             f"AND last_applied_at >= {lit(since.isoformat())}")
+
+
+def probe_once():
+    fx = synthetic()
+    try:
+        status, text, _ = rest_call(sec("caller"), fx["tool"], fx["arguments"])
+    except OSError:
+        return 0, ""
+    return status, text
+
+
+def is_blocked():
+    status, text = probe_once()
+    return status != 0 and status != 200 and "ENFORCEMENT" in text.upper()
+
+
+def probe_blocked(seconds, expect=True):
+    """호출을 반복해 (막힘|허용)이 될 때까지 걸린 시간.
+    (걸린 시간, 원인, 그 뒤 추가 호출 5번의 업스트림 증가분, 처음 성립 순간까지의 증가분)."""
+    started = time.monotonic()
+    before = upstream()
+    while True:
+        status, text = probe_once()
+        if status and (status != 200 and "ENFORCEMENT" in text.upper()) == expect:
+            break
+        if time.monotonic() - started > seconds:
+            raise SystemExit(f"시간 상한 초과: 호출 {'차단' if expect else '허용'} ({seconds}s)")
+        time.sleep(2)
+    elapsed = time.monotonic() - started
+    first = upstream() - before
+    cause = cause_of(text)
+    for _ in range(5):
+        probe_once()
+    return elapsed, cause, upstream() - before - first, first
+
+
+def revoke_and_export():
+    """활성 승인을 철회하고 부정 상태 파일이 새 세대로 써질 때까지 기다린다."""
+    approval = active_approval()
+    if not approval:
+        raise SystemExit("철회할 활성 승인이 없음")
+    cli("revoke", approval, "--reason", "acceptance")
+    target = epoch()
+    wait(lambda: newest_negative() >= target
+         and json.loads((export_root() / "latest.json").read_text(encoding="utf-8"))[
+             "state_epoch"] >= target, 180, "부정 상태 파일 기록")
+    return approval
+
+
+def restore_after_backup(ctx, tag, mutate):
+    A.db_backup(tagged(tag))
+    mutate()
+    started = datetime.now(UTC)
+    A.db_restore(tagged(tag))
+    return started
+
+
+def report_blocked(ctx, since, extra=None, from_check=None):
+    elapsed, cause, upstream_calls, _ = probe_blocked(180)
+    checked_ = cli("restore", "check", role="admin")[1] or {}
+    observe(ctx, file_epoch=checked_.get("file_epoch"), db_epoch=checked_.get("db_epoch"),
+            upstream_calls=upstream_calls, worker_external_writes=writes_since(since),
+            elapsed_seconds=elapsed, cause=cause,
+            events={"restore_blocked": event_count("restore_blocked", since.isoformat())},
+            **(extra or {}), **(from_check(checked_) if from_check else {}))
+
+
+@scenario("restore_backup_before_revoke")
+def restore_backup_before_revoke(ctx):
+    since = restore_after_backup(ctx, ctx.run_id + "-pre", revoke_and_export)
+    report_blocked(ctx, since)
+
+
+@scenario("restore_epoch_caught_up")
+def restore_epoch_caught_up(ctx):
+    since = restore_after_backup(ctx, ctx.run_id + "-pre", revoke_and_export)
+    file_epoch = cli("restore", "check", role="admin")[1]["file_epoch"]
+    rel = relation(sv())
+    done = {"consumption_after_restore": 0, "confirmation_after_restore": 0,
+            "observation_after_restore": 0}
+
+    def call_approval():
+        fx = synthetic()
+        request = cli("call-approval", "request", "--org", rel["org_id"], "--principal-type",
+                      "user", "--principal-id", "acc-restore", "--server", sv(), "--tool",
+                      fx["tool"], "--arguments", json.dumps({"n": uuid.uuid4().hex}),
+                      "--requested-by", "acc-restore")[1]["id"]
+        cli("call-approval", "approve", request)
+        return request
+
+    # 복구 직후의 소비·확인·관측이 DB 세대를 파일 세대 이상으로 올린다(호출 경로 대신 같은 UPDATE)
+    request = call_approval()
+    A.psql("UPDATE mint.call_approvals SET status='consumed', consumed_invocation_id="
+           f"gen_random_uuid() WHERE id={lit(request)}", "mint")
+    done["consumption_after_restore"] = 1
+    try:
+        policy = A.psql("SELECT id FROM mint.policy_versions WHERE instance_id=" + lit(iid())
+                        + " AND status='active' LIMIT 1", "mint")
+        confirmation = str(uuid.uuid4())
+        A.psql("INSERT INTO mint.self_confirmations (id, instance_id, org_id, principal_id, "
+               "server_id, tool, args_fp, fp_key_version, policy_version_id, purpose, "
+               "requested_by_key_token, expires_at) VALUES ("
+               f"{lit(confirmation)}, {lit(iid())}, {lit(rel['org_id'])}, 'acc-restore', "
+               f"{lit(sv())}, {lit(synthetic()['tool'])}, {lit(sha(confirmation))}, 1, "
+               f"{lit(policy)}, 'acceptance', 'acc-key', now() + interval '10 minutes')", "mint")
+        A.psql("UPDATE mint.self_confirmations SET status='cancelled' "
+               f"WHERE id={lit(confirmation)}", "mint")
+        done["confirmation_after_restore"] = 1
+    except SystemExit:
+        pass
+    tool = synthetic()["tool"]
+    A.psql("UPDATE mint.tool_contracts SET drift='description' WHERE instance_id="
+           f"{lit(iid())} AND server_id={lit(sv())} AND tool={lit(tool)} AND status='approved'",
+           "mint")
+    A.psql("UPDATE mint.tool_contracts SET drift='none' WHERE instance_id="
+           f"{lit(iid())} AND server_id={lit(sv())} AND tool={lit(tool)} AND status='approved'",
+           "mint")
+    done["observation_after_restore"] = 1
+    while epoch() < file_epoch:  # 부족하면 호출별 승인 요청을 더해 올린다
+        call_approval()
+    report_blocked(ctx, since, {**done, "db_epoch_at_least_file": epoch() >= file_epoch})
+
+
+@scenario("restore_consent")
+def restore_consent(ctx):
+    rel = relation(sv())
+    consent = cli("consent", "add", "--org", rel["org_id"], "--user", "acc-consent", "--server",
+                  sv(), "--purpose", "acceptance", "--data-scope", "acceptance", "--text-version",
+                  "1", "--valid-until", iso(timedelta(days=1)), "--evidence-ref", "acceptance",
+                  "--evidence-sha256", sha("acceptance"))[1]["id"]
+
+    def mutate():
+        cli("consent", "revoke", consent)
+        target = epoch()
+        wait(lambda: newest_negative() >= target, 180, "동의 철회 파일 기록")
+
+    since = restore_after_backup(ctx, ctx.run_id + "-pre", mutate)
+    # 검사 결과에 철회된 동의가 되돌릴 항목으로 나온다. 실제 재적용은 시험이 restore attest로 한다.
+    report_blocked(ctx, since, from_check=lambda c: {"consent_reapplied": any(
+        i.get("kind") == "consent" for i in c.get("items", []))})
+
+
+@scenario("restore_latest_missing", undo=put_back_latest)
+def restore_latest_missing(ctx):
+    if not n(f"SELECT count(*) FROM mint.exports WHERE instance_id={lit(iid())} "
+             "AND status='written'"):
+        raise SystemExit("기록된 내보내기가 없어 export_missing을 만들 수 없음")
+    latest = export_root() / "latest.json"
+    keep_file(latest)
+    since = datetime.now(UTC)
+    latest.unlink()
+    elapsed, cause, upstream_calls, _ = probe_blocked(180)
+    observe(ctx, upstream_calls=upstream_calls, cause=cause, elapsed_seconds=elapsed,
+            events={"restore_blocked": event_count("restore_blocked", since.isoformat())})
+
+
+@scenario("restore_hmac_changed", undo=restore_keys)
+def restore_hmac_changed(ctx):
+    since = datetime.now(UTC)
+    restart_env({"MINT_EXPORT_HMAC_KEY": new_hmac_key(), "MINT_EXPORT_HMAC_KEY_PREVIOUS": ""})
+    elapsed, cause, upstream_calls, _ = probe_blocked(240)
+    observe(ctx, upstream_calls=upstream_calls, cause=cause, elapsed_seconds=elapsed,
+            events={"restore_blocked": event_count("restore_blocked", since.isoformat())})
+
+
+@scenario("restore_previous_key", undo=restore_keys)
+def restore_previous_key(ctx):
+    original = original_keys()
+    since = datetime.now(UTC)
+    restart_env({"MINT_EXPORT_HMAC_KEY": new_hmac_key(),
+                 "MINT_EXPORT_HMAC_KEY_PREVIOUS": original["MINT_EXPORT_HMAC_KEY"]})
+    elapsed, _, _, first = probe_blocked(240, expect=False)
+    observe(ctx, upstream_calls=first, restore_blocked=event_count(
+        "restore_blocked", since.isoformat()), elapsed_seconds=elapsed)
+
+
+@scenario("restore_accept_stale", undo=put_back_latest)
+def restore_accept_stale(ctx):
+    latest = export_root() / "latest.json"
+    keep_file(latest)
+    since = datetime.now(UTC)
+    latest.unlink()
+    probe_blocked(180)
+    first = cli("restore", "accept-stale", "--reason", "acceptance", role="admin", check=False)
+    time.sleep(70)  # 한 사람의 요청만으로 새 파일이 게시되어 풀리지 않는지 기다려 본다
+    first_released = not is_blocked()
+    second = cli("restore", "accept-stale", "--reason", "acceptance", "--second-approver",
+                 A.env(ROLE_ENV["admin2"]), role="admin")
+    released = probe_blocked(240, expect=False)[0] >= 0
+    row = q1("SELECT requested_by, second_approver FROM mint.restore_requests WHERE "
+             f"instance_id={lit(iid())} AND kind='stale_accepted' ORDER BY created_at DESC LIMIT 1")
+    observe(ctx, first_operator_released=first_released, first_operator_exit=first[0],
+            released=released and second[0] == 0,
+            distinct_operators=len({row["requested_by"], row["second_approver"]} - {None}),
+            events={"restore_stale_accepted": event_count("restore_stale_accepted",
+                                                          since.isoformat())})
+
+
+@scenario("restore_steady_24h")
+def restore_steady_24h(ctx):
+    total = int(os.environ.get("ACC_STEADY_SECONDS", "86400"))
+    since = datetime.now(UTC)
+    started = time.monotonic()
+    stamps, blocked_samples = [started], 0
+    fx, key = synthetic(), sec("caller")
+    while time.monotonic() - started < total:
+        time.sleep(30)
+        stamps.append(time.monotonic())
+        if len(stamps) % 20 == 0:  # 10분마다 실제 호출도 한 번(판정 경로의 오탐 확인)
+            try:
+                status, text, _ = rest_call(key, fx["tool"], fx["arguments"])
+                blocked_samples += int(status != 200 and "ENFORCEMENT" in text.upper())
+            except OSError:
+                pass
+    gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]
+    observe(ctx, duration_seconds=time.monotonic() - started,
+            restore_false_positives=event_count("restore_blocked", since.isoformat())
+            + blocked_samples, max_sampling_gap_seconds=max(gaps, default=0))
+
+
+# ================================================================ 본인 확인 14종
+
+# 플러그인이 확인 행을 만들 때 쓰는 질의(plugin/snapshot.py request_confirmation)와 같은 문장
+REQUEST_SQL = """
+INSERT INTO mint.self_confirmations
+    (id, instance_id, org_id, principal_id, server_id, tool, args_fp, fp_key_version,
+     policy_version_id, purpose, requested_by_key_token, display, expires_at)
+SELECT %(id)s, %(iid)s::mint.ident, %(org_id)s::mint.ident, %(principal_id)s, %(server_id)s,
+       %(tool)s, %(args_fp)s, %(fp_key_version)s, %(policy_version_id)s::mint.ident, %(purpose)s,
+       %(key_token)s, %(display)s, clock_timestamp() + interval '10 minutes'
+WHERE (SELECT count(*) FROM mint.self_confirmations
+       WHERE instance_id = %(iid)s AND principal_id = %(principal_id)s
+         AND status = 'pending' AND expires_at > clock_timestamp()) < 20
+ON CONFLICT DO NOTHING
+"""
+# 정책이 본인 확인을 요구하게 하는 승인 조건(설계 §21.9). G9 정책 확장의 실제 키 이름에 맞춘다.
+CONFIRM_CONDITION = {"require_user_confirmation": {"purpose": "acceptance",
+                                                   "display_fields": ["text"]}}
+
+
+def need_policy():
+    text = "".join(p.read_text(encoding="utf-8")
+                   for p in (A.ROOT / "policy" / "bundle").rglob("*.rego"))
+    if "require_user_confirmation" not in text:
+        raise A.Skip("정책 번들에 본인 확인 의무 규칙이 없음(G9 정책 확장 미병합)")
+
+
+def active_policy():
+    return A.psql("SELECT id FROM mint.policy_versions WHERE instance_id=" + lit(iid())
+                  + " AND status='active' LIMIT 1", "mint")
+
+
+def request_row(principal, args_fp, *, display=None, key_token="acc-k1"):
+    """플러그인 로그인 역할로 확인 요청 행을 넣는다. 넣은 행 수(0|1)를 돌려준다."""
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    params = {"id": str(uuid.uuid4()), "iid": iid(), "org_id": relation(sv())["org_id"],
+              "principal_id": principal, "server_id": sv(), "tool": synthetic()["tool"],
+              "args_fp": args_fp, "fp_key_version": 1, "policy_version_id": active_policy(),
+              "purpose": "acceptance", "key_token": key_token, "display": Jsonb(display or {})}
+    with psycopg.connect(A.env("ACC_PLUGIN_DATABASE_URL")) as conn:
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                         (json.dumps([iid(), principal]),))
+            return conn.execute(REQUEST_SQL, params).rowcount
+
+
+def staff_confirm(user_id, key_token, confirmation_id):
+    """직원 서비스 계층으로 확인한다(세션을 만들고 확인). 같은 키면 분리 규칙 위반으로 예외."""
+    import psycopg
+
+    from mint_litellm.control.services import staff
+
+    with psycopg.connect(A.env("ACC_STAFF_DATABASE_URL")) as staff_conn, \
+            psycopg.connect(A.env("MINT_DATABASE_URL")) as control_conn:
+        sctx = staff.StaffContext(staff_conn, control_conn, iid(), user_id)
+        session = sha(secrets.token_urlsafe(32))
+        now = datetime.now(UTC)
+        staff.start_session(sctx, session, key_token, now + timedelta(minutes=30),
+                            now + timedelta(hours=8))
+        staff.confirm(sctx, session, str(confirmation_id))
+
+
+def confirmation_rows(**where):
+    clause = " AND ".join(f"{k}={lit(v)}" for k, v in where.items())
+    return q(f"SELECT id, status, display, expires_at, created_at, consumed_invocation_id "
+             f"FROM mint.self_confirmations WHERE instance_id={lit(iid())} AND {clause} "
+             "ORDER BY created_at")
+
+
+@scenario("confirmation_freeze_columns")
+def confirmation_freeze_columns(ctx):
+    principal = "acc-" + uuid.uuid4().hex[:8]
+    if request_row(principal, sha(principal), display={"text": "x"}) != 1:
+        raise SystemExit("확인 행을 만들지 못함")
+    row_id = confirmation_rows(principal_id=principal)[0]["id"]
+    columns = {"principal_id": "'other'", "server_id": "'other'", "tool": "'other'",
+               "args_fp": lit(sha("other")), "fp_key_version": "2", "policy_version_id": "'other'",
+               "purpose": "'other'", "requested_by_key_token": "'other'",
+               "expires_at": "now() + interval '1 day'", "created_at": "now()"}
+    before = q1(f"SELECT * FROM mint.self_confirmations WHERE id={lit(row_id)}")
+    rejected = True
+    for column, value in columns.items():
+        statement = f"UPDATE mint.self_confirmations SET {column} = {value} WHERE id={lit(row_id)}"
+        # 플러그인 역할과 제어 역할(요청 열 변경 권한이 없는 쪽이 아니라 동결 트리거를 거치게)
+        _, sqlstate = A.as_role("ACC_PLUGIN_DATABASE_URL", statement)
+        rejected = rejected and sqlstate is not None
+        try:
+            A.psql("BEGIN; SET LOCAL ROLE mint_control; " + statement + "; COMMIT", "mint")
+            rejected = False
+        except SystemExit:
+            pass
+    after = q1(f"SELECT * FROM mint.self_confirmations WHERE id={lit(row_id)}")
+    changed = [c for c in columns if before[c] != after[c]]
+    observe(ctx, changed_columns=len(changed), rejected=rejected, attempted_columns=len(columns))
+
+
+@scenario("confirmation_limit_20")
+def confirmation_limit_20(ctx):
+    principal = "acc-" + uuid.uuid4().hex[:8]
+    before = upstream()
+    inserted = [request_row(principal, sha(f"{principal}-{i}")) for i in range(21)]
+    observe(ctx, pending=n(f"SELECT count(*) FROM mint.self_confirmations WHERE "
+                           f"instance_id={lit(iid())} AND principal_id={lit(principal)} "
+                           "AND status='pending'"),
+            attempt_21_inserted=inserted[20], upstream_calls=upstream() - before)
+
+
+@scenario("confirmation_expiry_10m")
+def confirmation_expiry_10m(ctx):
+    principal = "acc-" + uuid.uuid4().hex[:8]
+    request_row(principal, sha(principal), display={"text": "표시 값"})
+    row = confirmation_rows(principal_id=principal)[0]
+    ttl = float(A.psql("SELECT extract(epoch FROM expires_at - created_at) FROM "
+                       f"mint.self_confirmations WHERE id={lit(row['id'])}", "mint"))
+    wait(lambda: A.psql(f"SELECT status FROM mint.self_confirmations WHERE id={lit(row['id'])}",
+                        "mint") == "expired", 1000, "만료 전이", step=5)
+    delay = float(A.psql("SELECT extract(epoch FROM clock_timestamp() - expires_at) FROM "
+                         f"mint.self_confirmations WHERE id={lit(row['id'])}", "mint"))
+    after = q1(f"SELECT display FROM mint.self_confirmations WHERE id={lit(row['id'])}")
+    observe(ctx, ttl_seconds=round(ttl), expiry_delay_seconds=round(delay, 1),
+            display=after["display"])
+
+
+@scenario("confirmation_replica_unique")
+def confirmation_replica_unique(ctx):
+    import psycopg
+
+    from mint_litellm.plugin.snapshot import CONSUME_CONFIRMATION_SQL
+
+    principal = "acc-" + uuid.uuid4().hex[:8]
+    fp = sha(principal)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(request_row(principal, fp)))
+               for _ in range(2)]  # 복제본 2개가 같은 호출을 동시에 요청
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    rows = confirmation_rows(principal_id=principal)
+    A.psql("INSERT INTO mint.org_bindings (id, instance_id, org_id, subject_type, subject_id, "
+           f"created_by) VALUES (gen_random_uuid(), {lit(iid())}, "
+           f"{lit(relation(sv())['org_id'])}, 'user', {lit(principal)}, 'acceptance')", "mint")
+    staff_confirm(principal, "acc-k2", rows[0]["id"])
+    row = q1(f"SELECT * FROM mint.self_confirmations WHERE id={lit(rows[0]['id'])}")
+    consumed = []
+
+    def consume():
+        with psycopg.connect(A.env("ACC_PLUGIN_DATABASE_URL"), autocommit=True) as conn:
+            consumed.append(conn.execute(CONSUME_CONFIRMATION_SQL, {
+                "iid": iid(), "id": row["id"], "org_id": row["org_id"],
+                "invocation_id": str(uuid.uuid4()), "principal_id": principal,
+                "server_id": row["server_id"], "tool": row["tool"], "args_fp": row["args_fp"],
+                "fp_key_version": row["fp_key_version"],
+                "policy_version_id": row["policy_version_id"],
+                "state_version": row["state_version"]}).rowcount)
+
+    threads = [threading.Thread(target=consume) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    observe(ctx, replicas=2, inserted=len(rows), consumed=sum(consumed),
+            raw_inserts=sum(results))
+
+
+# ---- 호출 경로가 필요한 확인 시험(정책 규칙이 있을 때만 장비에서 돈다)
+
+def conf_world(*, team=False, call_approval=False):
+    need_policy()
+    server, tool = sv(), synthetic()["tool"]
+    user = new_user()
+    team_id = new_team([server]) if team else None
+    k1, k1h = new_key(user, team_id, servers=[server])
+    _, k2h = new_key(user)
+    rel = relation(server)
+    cli("org", "bind", "--org", rel["org_id"], *(("--team", team_id) if team else ("--user", user)))
+    scope = ("team", team_id) if team else ("key", k1h)
+    args = ["approve", "--relation", rel["id"], "--scope", scope[0], "--scope-id", scope[1],
+            "--tools", ",".join(tool_names(server)), "--valid-until", iso(timedelta(days=1)),
+            "--basis", "acceptance", "--requested-by", user]
+    if call_approval:
+        args += ["--high-risk-tools", tool]
+    approval = cli(*args)[1]["id"]
+    A.psql("UPDATE mint.approvals SET conditions = conditions || "
+           f"{lit(json.dumps(CONFIRM_CONDITION))}::jsonb WHERE id={lit(approval)}", "mint")
+    return {"user": user, "k1": k1, "k1h": k1h, "k2h": k2h, "org": rel["org_id"], "tool": tool,
+            "approval": approval}
+
+
+def wcall(w, args):
+    before = upstream()
+    status, text, mark = rest_call(w["k1"], w["tool"], args)
+    time.sleep(site().get("settle_seconds", 2))
+    code = "MINT-CALL-APPROVAL-REQUIRED" if "MINT-CALL-APPROVAL-REQUIRED" in text else code_of(text)
+    return {"status": status, "code": code, "mark": mark, "upstream": upstream() - before}
+
+
+def invocation_of(mark):
+    return wait(lambda: A.psql(
+        f"SELECT invocation_id FROM mint.events WHERE instance_id={lit(iid())} "
+        f"AND kind='decision_evaluated' AND payload->>'litellm_call_id'={lit(mark)} LIMIT 1",
+        "mint"), 15, "판정 사건")
+
+
+def confirm_pending(w):
+    row = wait(lambda: next(iter(confirmation_rows(principal_id=w["user"], status="pending")),
+                            None), 30, "확인 행 생성")
+    staff_confirm(w["user"], w["k2h"], row["id"])
+    return row["id"]
+
+
+def fresh_args():
+    return {"text": "acceptance", "n": uuid.uuid4().hex}
+
+
+def consumed_count(w):
+    return n(f"SELECT count(*) FROM mint.self_confirmations WHERE instance_id={lit(iid())} "
+             f"AND principal_id={lit(w['user'])} AND status='consumed'")
+
+
+@scenario("confirmation_same_key")
+def confirmation_same_key(ctx):
+    raise A.Skip("직원 화면(G8b, PR #35) 미병합: 같은 키 확인 거부의 HTTP 403은 그 경로가 필요")
+
+
+@scenario("confirmation_other_key_once", undo=cleanup)
+def confirmation_other_key_once(ctx):
+    w = conf_world()
+    args = fresh_args()
+    first = wcall(w, args)
+    confirm_pending(w)
+    second, third = wcall(w, args), wcall(w, args)
+    observe(ctx, upstream_calls=second["upstream"], consumed=consumed_count(w),
+            second_upstream_calls=third["upstream"], first_code=first["code"],
+            second_status=second["status"])
+
+
+@scenario("confirmation_changed_args", undo=cleanup)
+def confirmation_changed_args(ctx):
+    w = conf_world()
+    wcall(w, fresh_args())
+    confirm_pending(w)
+    other = wcall(w, fresh_args())
+    observe(ctx, upstream_calls=other["upstream"], code=other["code"])
+
+
+@scenario("confirmation_stale_policy", undo=cleanup)
+def confirmation_stale_policy(ctx):
+    w = conf_world()
+    args = fresh_args()
+    wcall(w, args)
+    confirm_pending(w)
+    cli("policy", "activate", "acc-" + uuid.uuid4().hex[:8])  # 같은 번들을 새 판본으로
+    stale = wcall(w, args)
+    observe(ctx, upstream_calls=stale["upstream"], code=stale["code"])
+
+
+@scenario("confirmation_concurrent", undo=cleanup)
+def confirmation_concurrent(ctx):
+    w = conf_world()
+    args = fresh_args()
+    wcall(w, args)
+    confirm_pending(w)
+    results = []
+    before = upstream()
+    threads = [threading.Thread(target=lambda: results.append(wcall(w, args))) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    observe(ctx, submissions=len(results), consumed=consumed_count(w),
+            upstream_calls=upstream() - before)
+
+
+def approved_call(w, args):
+    request = cli("call-approval", "request", "--org", w["org"], "--principal-type", "user",
+                  "--principal-id", w["user"], "--server", sv(), "--tool", w["tool"],
+                  "--arguments", json.dumps(args), "--requested-by", w["user"])[1]["id"]
+    cli("call-approval", "approve", request)
+    return request
+
+
+def call_approvals_consumed(w):
+    return n(f"SELECT count(*) FROM mint.call_approvals WHERE instance_id={lit(iid())} "
+             f"AND principal_id={lit(w['user'])} AND consumed_invocation_id IS NOT NULL")
+
+
+@scenario("confirmation_both_atomic", undo=cleanup)
+def confirmation_both_atomic(ctx):
+    w = conf_world(call_approval=True)
+    args = fresh_args()
+    approved_call(w, args)
+    wcall(w, args)
+    confirm_pending(w)
+    final = wcall(w, args)
+    observe(ctx, call_approvals_consumed=call_approvals_consumed(w),
+            confirmations_consumed=consumed_count(w), upstream_calls=final["upstream"],
+            invocation_id=invocation_of(final["mark"]))
+
+
+class RowLock:
+    """psql 세션 하나로 행 잠금을 쥐고 있다가 같은 트랜잭션에서 확인을 취소한다."""
+
+    def __init__(self, row_id):
+        argv = [*shlex.split(os.environ.get("ACC_COMPOSE") or
+                             f"docker compose -p {A.env('COMPOSE_PROJECT_NAME', 'mint-acc')} "
+                             "-f deploy/compose.yaml"),
+                "exec", "-T", A.env("ACC_PG_SERVICE", "postgres"), "psql", "-U",
+                A.env("ACC_PG_SUPERUSER", "postgres"), "-d", "mint", "-X", "-q", "-A", "-t",
+                "-v", "ON_ERROR_STOP=1"]
+        self.row_id = row_id
+        self.proc = subprocess.Popen(argv, cwd=A.ROOT, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.proc.stdin.write("BEGIN;\nSELECT 'locked' FROM mint.self_confirmations WHERE id="
+                              f"{lit(row_id)} FOR UPDATE;\n")
+        self.proc.stdin.flush()
+        if self.proc.stdout.readline().strip() != "locked":
+            raise SystemExit("행 잠금을 얻지 못함")
+
+    def cancel_and_release(self):
+        self.proc.stdin.write("SET LOCAL ROLE mint_control;\nUPDATE mint.self_confirmations SET "
+                              f"status='cancelled' WHERE id={lit(self.row_id)};\nCOMMIT;\n")
+        self.proc.stdin.close()
+        self.proc.wait(timeout=60)
+
+
+@scenario("confirmation_both_rollback", undo=cleanup)
+def confirmation_both_rollback(ctx):
+    w = conf_world(call_approval=True)
+    args = fresh_args()
+    approved_call(w, args)
+    wcall(w, args)
+    row_id = confirm_pending(w)
+    lock = RowLock(row_id)
+    box = []
+    before = upstream()
+    thread = threading.Thread(target=lambda: box.append(wcall(w, args)))
+    thread.start()
+    time.sleep(5)  # 플러그인이 호출별 승인 소비 뒤 확인 행에서 기다리는 동안
+    lock.cancel_and_release()
+    thread.join()
+    observe(ctx, call_approvals_consumed=call_approvals_consumed(w),
+            confirmations_consumed=consumed_count(w), upstream_calls=upstream() - before,
+            invocation_id=invocation_of(box[0]["mark"]), code=box[0]["code"])
+
+
+@scenario("confirmation_team_no_row", undo=cleanup)
+def confirmation_team_no_row(ctx):
+    w = conf_world(team=True)
+    since = db_now()
+    blocked = wcall(w, fresh_args())
+    observe(ctx, inserted=n(f"SELECT count(*) FROM mint.self_confirmations WHERE "
+                            f"instance_id={lit(iid())} AND created_at >= {lit(since)}"),
+            upstream_calls=blocked["upstream"], code=blocked["code"])
+
+
+@scenario("confirmation_call_approval_only", undo=cleanup)
+def confirmation_call_approval_only(ctx):
+    w = conf_world(call_approval=True)
+    args = fresh_args()
+    wcall(w, args)
+    confirm_pending(w)  # 확인은 있지만 관리자 호출별 승인은 없다
+    blocked = wcall(w, args)
+    observe(ctx, upstream_calls=blocked["upstream"], code=blocked["code"])
+
+
+def v001_probe(name):
+    """별도 v001 이행 스택에서 호출을 재는 장비 도구. 출력은 측정 JSON 한 개."""
+    spec = os.environ.get("ACC_V001_PROBE")
+    if not spec:
+        raise A.Skip("이행 스택의 호출 시험 장비(ACC_V001_PROBE)가 구성되지 않음")
+    done = A.run([*json.loads(spec), name], timeout=900)
+    return json.loads(done.stdout)
+
+
+@scenario("confirmation_v001_isolation")
+def confirmation_v001_isolation(ctx):
+    observe(ctx, **v001_probe("confirmation_v001_isolation"))
+
+
+# ================================================================ 인증·화면 9종(+이행 1종)
+
+SESSION_COOKIE = "__Host-mint_session"
+
+
+def console_user(role, name_prefix="acc"):
+    """사람 사용자와 키, 그 사용자에 결속된 운영자 행(role이 None이면 운영자 행 없음)."""
+    user = new_user()
+    key, kid = new_key(user)
+    if role:
+        cli("operator", "add", f"{name_prefix}-{uuid.uuid4().hex[:8]}", "--role", role,
+            "--user-id", user)
+    return user, key, kid
+
+
+def console_login(key):
+    import httpx
+
+    client = httpx.Client(base_url=site()["api"], timeout=30, follow_redirects=False)
+    reply = client.post("/login", data={"key": key})
+    found = re.search(re.escape(SESSION_COOKIE) + r"=([^;]+)", reply.headers.get("set-cookie", ""))
+    return client, reply, found.group(1) if found else None
+
+
+def console_request(client, method, path, session, body=None, *, csrf="valid"):
+    from mint_litellm.control.services.console_sessions import csrf_token
+
+    headers = {"Cookie": f"{SESSION_COOKIE}={session}"}
+    if csrf == "valid":
+        headers["X-CSRF-Token"] = csrf_token(session)
+    elif csrf == "wrong":
+        headers["X-CSRF-Token"] = "0" * 64
+    return client.request(method, path, json=body, headers=headers)
+
+
+def sessions_of(user, active_only=False):
+    return n(f"SELECT count(*) FROM mint.console_sessions WHERE instance_id={lit(iid())} "
+             f"AND user_id={lit(user)}" + (" AND revoked_at IS NULL AND idle_expiry > now() "
+                                          "AND absolute_expiry > now()" if active_only else ""))
+
+
+def org_probe(name):
+    return n(f"SELECT count(*) FROM mint.orgs WHERE instance_id={lit(iid())} "
+             f"AND org_id={lit(name)}")
+
+
+@scenario("auth_no_plaintext", undo=cleanup)
+def auth_no_plaintext(ctx):
+    user, key, _ = console_user("viewer")
+    client, reply, session = console_login(key)
+    if reply.status_code != 303 or not session:
+        raise SystemExit(f"로그인 실패(HTTP {reply.status_code})")
+    for path in ("/api/v1/overview", "/api/v1/servers", "/api/v1/ledger"):
+        console_request(client, "GET", path, session, csrf="none")
+    pg, su = A.env("ACC_PG_SERVICE", "postgres"), A.env("ACC_PG_SUPERUSER", "postgres")
+    found, complete = {}, True
+
+    def search(name, text_or_none):
+        nonlocal complete
+        if text_or_none is None:
+            complete = False
+            found[name] = 0
+        else:
+            found[name] = text_or_none.count(key)
+
+    dump = A.compose("exec", "-T", pg, "pg_dump", "-U", su, "-d", "mint", "--data-only",
+                     check=False, timeout=600)
+    search("database", dump.stdout if dump.returncode == 0 else None)
+    logs = A.compose("logs", "--no-color", check=False, timeout=300)
+    search("logs", logs.stdout + logs.stderr if logs.returncode == 0 else None)
+    rows = A.psql("SELECT coalesce(string_agg(s::text, E'\\n'), '') FROM mint.console_sessions s "
+                  f"WHERE user_id={lit(user)}", "mint")
+    search("sessions", rows)
+    buffer = A.compose("exec", "-T", os.environ.get("ACC_BUFFER_SERVICE", "litellm"), "sh", "-c",
+                       'grep -rF -- "$1" "$2" 2>/dev/null; true', "_", key,
+                       os.environ.get("ACC_BUFFER_CONTAINER_DIR", "/var/lib/mint/buffer"),
+                       check=False, timeout=300)
+    search("buffer", buffer.stdout if buffer.returncode == 0 else None)
+    observe(ctx, matches=sum(found.values()), per_location=found, search_complete=complete,
+            searched_locations=sorted(found), sentinel_sha256=sha(key))
+
+
+def session_end(ctx, how):
+    user, key, _ = console_user("viewer")
+    client, reply, session = console_login(key)
+    if reply.status_code != 303 or not session:
+        raise SystemExit(f"로그인 실패(HTTP {reply.status_code})")
+    started = A.psql("SELECT clock_timestamp()", "mint")
+    if how == "block":
+        lite("POST", "/key/block", {"key": key})
+    else:
+        lite("POST", "/key/delete", {"keys": [key]})
+    wait(lambda: sessions_of(user, active_only=True) == 0, 360, "세션 종료", step=5)
+    ended = float(A.psql("SELECT extract(epoch FROM max(revoked_at) - "
+                         f"{lit(started)}::timestamptz) FROM mint.console_sessions "
+                         f"WHERE instance_id={lit(iid())} AND user_id={lit(user)}", "mint"))
+    after = console_request(client, "GET", "/api/v1/overview", session, csrf="none")
+    observe(ctx, ended_seconds=round(ended, 1), active_sessions=sessions_of(user, True),
+            api_status_after=after.status_code)
+
+
+@scenario("auth_blocked_key", undo=cleanup)
+def auth_blocked_key(ctx):
+    session_end(ctx, "block")
+
+
+@scenario("auth_deleted_key", undo=cleanup)
+def auth_deleted_key(ctx):
+    session_end(ctx, "delete")
+
+
+@scenario("auth_unbound_viewer", undo=cleanup)
+def auth_unbound_viewer(ctx):
+    user, key, _ = console_user(None)  # 사람 키이지만 운영자 행이 없는 사용자
+    _, reply, session = console_login(key)
+    observe(ctx, http_status=reply.status_code, sessions_created=sessions_of(user),
+            cookie_issued=session is not None)
+
+
+@scenario("auth_viewer_write", undo=cleanup)
+def auth_viewer_write(ctx):
+    _, key, _ = console_user("viewer")
+    client, reply, session = console_login(key)
+    if reply.status_code != 303 or not session:
+        raise SystemExit(f"로그인 실패(HTTP {reply.status_code})")
+    org = "acc-w-" + uuid.uuid4().hex[:8]
+    since = db_now()
+    result = console_request(client, "POST", "/api/v1/orgs", session,
+                             {"org_id": org, "name": org})
+    observe(ctx, http_status=result.status_code,
+            mutations=org_probe(org) + n(
+                f"SELECT count(*) FROM mint.events WHERE instance_id={lit(iid())} "
+                f"AND kind='org_created' AND inserted_at >= {lit(since)}"))
+
+
+@scenario("auth_csrf", undo=cleanup)
+def auth_csrf(ctx):
+    _, key, _ = console_user("admin")
+    client, reply, session = console_login(key)
+    if reply.status_code != 303 or not session:
+        raise SystemExit(f"로그인 실패(HTTP {reply.status_code})")
+    since = db_now()
+    org = "acc-c-" + uuid.uuid4().hex[:8]
+    missing = console_request(client, "POST", "/api/v1/orgs", session,
+                              {"org_id": org, "name": org}, csrf="none")
+    wrong = console_request(client, "POST", "/api/v1/orgs", session,
+                            {"org_id": org + "x", "name": org}, csrf="wrong")
+    observe(ctx, http_status=missing.status_code, wrong_token_status=wrong.status_code,
+            mutations=org_probe(org) + org_probe(org + "x") + n(
+                f"SELECT count(*) FROM mint.events WHERE instance_id={lit(iid())} "
+                f"AND kind='org_created' AND inserted_at >= {lit(since)}"))
+
+
+@scenario("auth_escape", undo=cleanup)
+def auth_escape(ctx):
+    _, key, _ = console_user("admin")
+    marker = "acc" + uuid.uuid4().hex[:6]
+    payload = f"<script>document.title='{marker}'</script><img src=x onerror=alert(1)>"
+    cli("org", "add", "acc-e-" + uuid.uuid4().hex[:8], "--name", payload)
+    client, reply, session = console_login(key)
+    if reply.status_code != 303 or not session:
+        raise SystemExit(f"로그인 실패(HTTP {reply.status_code})")
+    page = console_request(client, "GET", "/admin", session, csrf="none")
+    html = page.text
+    raw_tags = html.count("<script>document.title") + html.count("<img src=x onerror")
+    csp = page.headers.get("content-security-policy", "")
+    observe(ctx, executed_scripts=raw_tags,
+            escaped=("&lt;script&gt;" in html and marker in html and raw_tags == 0),
+            csp_default_src_self="default-src 'self'" in csp, page_status=page.status_code)
+
+
+@scenario("auth_staff_write")
+def auth_staff_write(ctx):
+    raise A.Skip("직원 화면(G8b, PR #35) 미병합: 직원 세션의 관리자 API·승인·거부·정책 시도 4종")
+
+
+@scenario("auth_screens_13")
+def auth_screens_13(ctx):
+    raise A.Skip("직원 화면(G8b, PR #35) 미병합: 화면 13개(직원 화면 11~13 포함)와 수동 검수")
+
+
+# ================================================================ 이행 1종
+
+STAGE1_TABLES = ("orgs", "servers", "usage_relations", "approvals", "call_approvals")
+
+
+def psql_in(database, sql, *, check=True):
+    pg, su = A.env("ACC_PG_SERVICE", "postgres"), A.env("ACC_PG_SUPERUSER", "postgres")
+    return A.compose("exec", "-T", pg, "psql", "-U", su, "-d", database, "-X", "-q", "-v",
+                     "ON_ERROR_STOP=1", "-1", "-f", "-", stdin=sql, check=check, timeout=300)
+
+
+def scalar_in(database, sql):
+    pg, su = A.env("ACC_PG_SERVICE", "postgres"), A.env("ACC_PG_SUPERUSER", "postgres")
+    return A.compose("exec", "-T", pg, "psql", "-U", su, "-d", database, "-X", "-A", "-t", "-c",
+                     sql).stdout.strip()
+
+
+def schema_of(database):
+    has = scalar_in(database, "SELECT count(*) FROM information_schema.columns WHERE "
+                    "table_schema='mint' AND table_name='servers' "
+                    "AND column_name='contract_status'")
+    return "v002" if has != "0" else "v001"
+
+
+def drop_migration_db(ctx):
+    name = A.state_file("migration-db")
+    if name.exists():
+        pg, su = A.env("ACC_PG_SERVICE", "postgres"), A.env("ACC_PG_SUPERUSER", "postgres")
+        A.compose("exec", "-T", pg, "psql", "-U", su, "-d", "postgres", "-X", "-q", "-c",
+                  f"DROP DATABASE IF EXISTS {name.read_text(encoding='utf-8')} WITH (FORCE)",
+                  check=False)
+        name.unlink()
+
+
+@scenario("migration_v001", undo=drop_migration_db)
+def migration_v001(ctx):
+    from mint_litellm.control.db import migrate
+
+    if not os.environ.get("ACC_V001_PROBE"):  # 호출 시험 장비가 없으면 DB 준비 전에 건너뛴다
+        v001_probe("migration_v001")
+    database = "mint_v001_" + uuid.uuid4().hex[:8]
+    pg, su = A.env("ACC_PG_SERVICE", "postgres"), A.env("ACC_PG_SUPERUSER", "postgres")
+    A.compose("exec", "-T", pg, "psql", "-U", su, "-d", "postgres", "-X", "-q", "-c",
+              f"CREATE DATABASE {database}")
+    A.state_file("migration-db").write_text(database, encoding="utf-8")
+    files = migrate._migration_files()
+    first, rest = files[0], files[1:]
+    instance = iid()
+    registry = ("CREATE TABLE IF NOT EXISTS mint.schema_migrations (name text PRIMARY KEY, "
+                "sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());")
+
+    def record(name, text):
+        return (f"INSERT INTO mint.schema_migrations (name, sha256) VALUES "
+                f"({lit(name)}, {lit(hashlib.sha256(text.encode('utf-8')).hexdigest())});")
+
+    psql_in(database, first[1] + "\n" + registry + record(*first))
+    before_schema = schema_of(database)
+    psql_in(database, (
+        f"INSERT INTO mint.orgs (instance_id, org_id, name) VALUES ({lit(instance)}, 'legacy', "
+        "'legacy');"
+        "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256, transport, "
+        f"auth_type, registered_by) VALUES (gen_random_uuid(), {lit(instance)}, 'legacy-server', "
+        f"'awaiting_approval', {lit(sha('https://legacy.invalid'))}, 'http', 'none', 'legacy');"
+        "UPDATE mint.servers SET status='approved' WHERE server_id='legacy-server';"
+        "INSERT INTO mint.usage_relations (id, instance_id, org_id, purpose, server_id) VALUES "
+        f"(gen_random_uuid(), {lit(instance)}, 'legacy', 'legacy', 'legacy-server');"
+        "INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256, bundle_sha256) VALUES "
+        f"({lit(instance)}, 'legacy-policy', {lit(sha('c'))}, {lit(sha('b'))});"
+        "INSERT INTO mint.approvals (id, instance_id, org_id, relation_id, class, server_id, "
+        "tools, scope_type, scope_id, valid_from, valid_until, basis, granted_by, requested_by, "
+        f"status) SELECT gen_random_uuid(), {lit(instance)}, 'legacy', id, 'standard', "
+        "'legacy-server', ARRAY['echo'], 'user', 'legacy-user', now(), now() + interval '1 day', "
+        "'{\"text\":\"legacy\"}'::jsonb, 'legacy', 'legacy-user', 'active' FROM "
+        "mint.usage_relations WHERE server_id='legacy-server';"
+        "INSERT INTO mint.call_approvals (id, instance_id, org_id, principal_type, principal_id, "
+        "server_id, tool, args_fp, fp_key_version, policy_version_id, status, requested_by, "
+        f"expires_at) VALUES (gen_random_uuid(), {lit(instance)}, 'legacy', 'user', "
+        f"'legacy-user', 'legacy-server', 'echo', {lit(sha('legacy'))}, 1, 'legacy-policy', "
+        "'pending', 'legacy-user', now() + interval '1 day');"
+        "UPDATE mint.call_approvals SET status='approved', approved_by='legacy' "
+        "WHERE principal_id='legacy-user';"))
+    rows_before = sum(int(scalar_in(database, f"SELECT count(*) FROM mint.{t}"))
+                      for t in STAGE1_TABLES)
+    for name, text in rest:
+        psql_in(database, text + "\n" + record(name, text))
+    after_schema = schema_of(database)
+    rows_after = sum(int(scalar_in(database, f"SELECT count(*) FROM mint.{t}"))
+                     for t in STAGE1_TABLES)
+    contract = scalar_in(database, "SELECT string_agg(DISTINCT contract_status, ',') FROM "
+                         "mint.servers WHERE server_id='legacy-server'")
+    # 수용검증이 진행 중인 서버는 1단계 승인 전이로 승인되지 않는다(전이 트리거가 마지막 방어선)
+    psql_in(database, (
+        "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256, transport, "
+        f"auth_type, registered_by) VALUES (gen_random_uuid(), {lit(instance)}, 'intake-server', "
+        f"'awaiting_approval', {lit(sha('https://intake.invalid'))}, 'http', 'none', 'acc');"
+        "INSERT INTO mint.intakes (id, instance_id, org_id, server_id, source) VALUES "
+        f"(gen_random_uuid(), {lit(instance)}, 'legacy', 'intake-server', 'operator');"))
+    refused = A.compose("exec", "-T", pg, "psql", "-U", su, "-d", database, "-X", "-q", "-c",
+                        "UPDATE mint.servers SET status='approved' WHERE server_id='intake-server'",
+                        check=False)
+    measured = v001_probe("migration_v001")  # 이행된 DB를 쓰는 별도 스택의 호출 시험
+    observe(ctx, before_schema=before_schema, after_schema=after_schema,
+            stage1_rows_before=rows_before, stage1_rows_after=rows_after,
+            legacy_contract_status=contract, pending_intake_server_approve_exit=refused.returncode,
+            migration_database=database, **measured)

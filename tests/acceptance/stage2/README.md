@@ -87,6 +87,18 @@ DB 복원은 시험 스택에 한정한다. 24시간 시험은 timeout을 최소
 `ACC_PLUGIN_DATABASE_URL`, `ACC_ADMIN_TOKEN`, `ACC_STATE_DIR`. 시험 시작 전에 한 번
 `adapters snapshot`으로 기준 스냅숏을 만들고, 사례마다 `case_setup`이 그것으로 복원한다.
 
+시나리오 어댑터(`scenarios.py`)가 추가로 읽는 값: `ACC_SITE`(또는 `MINT_ACC_SITE`, 없으면
+`.runtime/site.json`)에서 서버·신청 입력·계수기·로그 명령을 읽는다. 환경변수는 `ACC_LITELLM_ADMIN_URL`
+과 `ACC_LITELLM_ADMIN_KEY`(시험 주체 생성·삭제용 관리 키), `ACC_SUBMIT_KEY`(조직에 묶인 사용자의
+비관리자 팀 범위 제출 키), `ACC_ADMIN_TOKEN`·`ACC_APPROVER_TOKEN`·`ACC_ADMIN2_TOKEN`(서로 다른 사용자의
+운영자 토큰), `MINT_DATABASE_URL`(제어 역할)·`ACC_STAFF_DATABASE_URL`(직원 역할)·`ACC_PLUGIN_DATABASE_URL`,
+`MINT_EXPORT_HMAC_KEY`(키 교체 시험의 원래 값), `ACC_PLUGIN_SERVICES`(키 교체 때 다시 만들 서비스, 기본
+`litellm worker`), `ACC_BUFFER_SERVICE`·`ACC_BUFFER_CONTAINER_DIR`(버퍼 검색), `ACC_STEADY_SECONDS`
+(24시간 시험 길이, 합격 기준은 86400), `ACC_V001_PROBE`(JSON argv 배열: 이행된 v001 DB를 쓰는 별도
+스택에서 호출을 재고 측정 JSON을 출력하는 장비 도구). 합성 서버 `mode`에 `unauthorized`(MCP 요청에 401)가
+추가되었다. 접근 로그를 세는 시험(`unpin_calls`·`test_route_calls`·`reject_calls`)은 `decision_logs`의
+`docker logs`에 `--since`를 붙여 센다.
+
 ```bash
 .venv/bin/python -m tests.acceptance.stage2.adapters emit-site --repo "$PWD"   > tests/acceptance/stage2/.runtime/site-faults.json   # faults, case_setup 조각을 site.json에 합친다
 ```
