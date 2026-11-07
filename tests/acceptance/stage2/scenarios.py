@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import shlex
 import subprocess
 import sys
@@ -1067,20 +1066,37 @@ def request_row(principal, args_fp, *, display=None, key_token="acc-k1"):
             return conn.execute(REQUEST_SQL, params).rowcount
 
 
-def staff_confirm(user_id, key_token, confirmation_id):
-    """직원 서비스 계층으로 확인한다(세션을 만들고 확인). 같은 키면 분리 규칙 위반으로 예외."""
-    import psycopg
+STAFF_COOKIE = "__Host-mint_staff"
 
-    from mint_litellm.control.services import staff
 
-    with psycopg.connect(A.env("ACC_STAFF_DATABASE_URL")) as staff_conn, \
-            psycopg.connect(A.env("MINT_DATABASE_URL")) as control_conn:
-        sctx = staff.StaffContext(staff_conn, control_conn, iid(), user_id)
-        session = sha(secrets.token_urlsafe(32))
-        now = datetime.now(UTC)
-        staff.start_session(sctx, session, key_token, now + timedelta(minutes=30),
-                            now + timedelta(hours=8))
-        staff.confirm(sctx, session, str(confirmation_id))
+def http_login(path, cookie_name, key):
+    """로그인 경로(관리자 /login, 직원 /staff/login)로 세션을 만든다. (클라이언트, 응답, 세션)."""
+    import httpx
+
+    client = httpx.Client(base_url=site()["api"], timeout=30, follow_redirects=False)
+    reply = client.post(path, data={"key": key})
+    found = re.search(re.escape(cookie_name) + r"=([^;]+)", reply.headers.get("set-cookie", ""))
+    return client, reply, found.group(1) if found else None
+
+
+def staff_login(key):
+    return http_login("/staff/login", STAFF_COOKIE, key)
+
+
+def staff_post(client, session, path):
+    from mint_litellm.control.services.console_sessions import csrf_token
+
+    return client.post(path, headers={"Cookie": f"{STAFF_COOKIE}={session}",
+                                      "X-CSRF-Token": csrf_token(session)})
+
+
+def staff_confirm(key, confirmation_id):
+    """직원 화면 경로로 확인한다(그 키로 로그인해 확인 동작). 응답 상태를 돌려준다."""
+    client, reply, session = staff_login(key)
+    if reply.status_code != 303 or not session:
+        raise SystemExit(f"직원 로그인 실패(HTTP {reply.status_code})")
+    return staff_post(client, session, f"/staff/confirmations/{confirmation_id}/confirm"
+                      ).status_code
 
 
 def confirmation_rows(**where):
@@ -1144,17 +1160,19 @@ def confirmation_expiry_10m(ctx):
             display=after["display"])
 
 
-@scenario("confirmation_replica_unique")
+@scenario("confirmation_replica_unique", undo=cleanup)
 def confirmation_replica_unique(ctx):
     import psycopg
 
     from mint_litellm.plugin.snapshot import CONSUME_CONFIRMATION_SQL
 
-    principal = "acc-" + uuid.uuid4().hex[:8]
+    principal = new_user()
+    _, k1h = new_key(principal)
+    k2, _ = new_key(principal)
     fp = sha(principal)
     results = []
-    threads = [threading.Thread(target=lambda: results.append(request_row(principal, fp)))
-               for _ in range(2)]  # 복제본 2개가 같은 호출을 동시에 요청
+    threads = [threading.Thread(target=lambda: results.append(
+        request_row(principal, fp, key_token=k1h))) for _ in range(2)]  # 복제본 2개가 동시에 요청
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -1163,7 +1181,8 @@ def confirmation_replica_unique(ctx):
     A.psql("INSERT INTO mint.org_bindings (id, instance_id, org_id, subject_type, subject_id, "
            f"created_by) VALUES (gen_random_uuid(), {lit(iid())}, "
            f"{lit(relation(sv())['org_id'])}, 'user', {lit(principal)}, 'acceptance')", "mint")
-    staff_confirm(principal, "acc-k2", rows[0]["id"])
+    if staff_confirm(k2, rows[0]["id"]) != 303:
+        raise SystemExit("다른 키 확인 실패")
     row = q1(f"SELECT * FROM mint.self_confirmations WHERE id={lit(rows[0]['id'])}")
     consumed = []
 
@@ -1194,7 +1213,7 @@ def conf_world(*, team=False, call_approval=False):
     user = new_user()
     team_id = new_team([server]) if team else None
     k1, k1h = new_key(user, team_id, servers=[server])
-    _, k2h = new_key(user)
+    k2, k2h = new_key(user)
     rel = relation(server)
     cli("org", "bind", "--org", rel["org_id"], *(("--team", team_id) if team else ("--user", user)))
     scope = ("team", team_id) if team else ("key", k1h)
@@ -1206,8 +1225,8 @@ def conf_world(*, team=False, call_approval=False):
     approval = cli(*args)[1]["id"]
     A.psql("UPDATE mint.approvals SET conditions = conditions || "
            f"{lit(json.dumps(CONFIRM_CONDITION))}::jsonb WHERE id={lit(approval)}", "mint")
-    return {"user": user, "k1": k1, "k1h": k1h, "k2h": k2h, "org": rel["org_id"], "tool": tool,
-            "approval": approval}
+    return {"user": user, "k1": k1, "k1h": k1h, "k2": k2, "k2h": k2h,
+            "org": rel["org_id"], "tool": tool, "approval": approval}
 
 
 def wcall(w, args):
@@ -1228,7 +1247,8 @@ def invocation_of(mark):
 def confirm_pending(w):
     row = wait(lambda: next(iter(confirmation_rows(principal_id=w["user"], status="pending")),
                             None), 30, "확인 행 생성")
-    staff_confirm(w["user"], w["k2h"], row["id"])
+    if staff_confirm(w["k2"], row["id"]) != 303:
+        raise SystemExit("다른 키 확인 실패")
     return row["id"]
 
 
@@ -1241,9 +1261,17 @@ def consumed_count(w):
              f"AND principal_id={lit(w['user'])} AND status='consumed'")
 
 
-@scenario("confirmation_same_key")
+@scenario("confirmation_same_key", undo=cleanup)
 def confirmation_same_key(ctx):
-    raise A.Skip("직원 화면(G8b, PR #35) 미병합: 같은 키 확인 거부의 HTTP 403은 그 경로가 필요")
+    w = conf_world()
+    wcall(w, fresh_args())
+    row = wait(lambda: next(iter(confirmation_rows(principal_id=w["user"], status="pending")),
+                            None), 30, "확인 행 생성")
+    status = staff_confirm(w["k1"], row["id"])  # 호출한 키와 같은 키로 로그인해 확인 시도
+    observe(ctx, http_status=status, consumed=consumed_count(w),
+            confirmed=n(f"SELECT count(*) FROM mint.self_confirmations WHERE "
+                        f"instance_id={lit(iid())} AND principal_id={lit(w['user'])} "
+                        "AND status IN ('confirmed','consumed')"))
 
 
 @scenario("confirmation_other_key_once", undo=cleanup)
@@ -1572,14 +1600,88 @@ def auth_escape(ctx):
             csp_default_src_self="default-src 'self'" in csp, page_status=page.status_code)
 
 
-@scenario("auth_staff_write")
+STAFF_FORBIDDEN_HTTP = (
+    ("POST", "/api/v1/orgs", {"org_id": "acc-staff", "name": "acc-staff"}),
+    ("POST", "/api/v1/approvals", {"relation_id": "x", "scope_type": "key", "scope_id": "x",
+                                   "tools": ["x"], "basis": "x", "requested_by": "x",
+                                   "state_version": 1}),
+    ("POST", "/api/v1/denials", {"scope_type": "server", "scope_id": "x", "reason": "x"}),
+    ("POST", "/api/v1/settings/mode", {"mode": "observe", "state_version": 1}),
+)
+STAFF_FORBIDDEN_SQL = (
+    "INSERT INTO mint.orgs (instance_id, org_id, name) VALUES ('{iid}', 'acc-staff-db', 'x')",
+    "INSERT INTO mint.denials (id, instance_id, scope_type, scope_id, reason, created_by) "
+    "VALUES (gen_random_uuid(), '{iid}', 'server', 'x', 'x', 'staff')",
+    "UPDATE mint.approvals SET status = 'revoked' WHERE instance_id = '{iid}'",
+    "SELECT mint.raise_epoch('{iid}', 1000000)",
+)
+
+
+def mutation_marks():
+    return [n(f"SELECT count(*) FROM mint.{t} WHERE instance_id={lit(iid())}")
+            for t in ("orgs", "denials", "events", "approvals")] + [
+        n(f"SELECT count(*) FROM mint.approvals WHERE instance_id={lit(iid())} "
+          "AND status='revoked'"), epoch()]
+
+
+@scenario("auth_staff_write", undo=cleanup)
 def auth_staff_write(ctx):
-    raise A.Skip("직원 화면(G8b, PR #35) 미병합: 직원 세션의 관리자 API·승인·거부·정책 시도 4종")
+    from mint_litellm.control.services.console_sessions import csrf_token
+
+    _, key, _ = console_user(None)  # 운영자 행이 없는 직원
+    client, reply, session = staff_login(key)
+    if reply.status_code != 303 or not session:
+        raise SystemExit(f"직원 로그인 실패(HTTP {reply.status_code})")
+    before = mutation_marks()
+    accepted = 0
+    for method, path, body in STAFF_FORBIDDEN_HTTP:
+        # 직원 쿠키를 관리자 쿠키 이름으로도 실어 보낸다(어느 쪽으로도 인증되면 안 된다)
+        headers = {"Cookie": f"{STAFF_COOKIE}={session}; {SESSION_COOKIE}={session}",
+                   "X-CSRF-Token": csrf_token(session)}
+        result = client.request(method, path, json=body, headers=headers)
+        accepted += int(200 <= result.status_code < 300)
+    refused = sum(int(A.as_role("ACC_STAFF_DATABASE_URL", statement.format(iid=iid()))[1]
+                      is not None) for statement in STAFF_FORBIDDEN_SQL)
+    after = mutation_marks()
+    observe(ctx, api_mutations=accepted,
+            db_mutations=sum(abs(a - b) for a, b in zip(before, after, strict=True)),
+            forbidden_operations_tested=len(STAFF_FORBIDDEN_HTTP), db_refused=refused,
+            db_attempted=len(STAFF_FORBIDDEN_SQL))
 
 
-@scenario("auth_screens_13")
+SCREEN_PATHS = ("/", "/servers", "/intakes", "/approvals", "/contracts", "/revocations",
+                "/call-approvals", "/ledger", "/policy", "/admin", "/staff",
+                "/staff/confirmations", "/staff/consents")
+
+
+@scenario("auth_screens_13", undo=cleanup)
 def auth_screens_13(ctx):
-    raise A.Skip("직원 화면(G8b, PR #35) 미병합: 화면 13개(직원 화면 11~13 포함)와 수동 검수")
+    """화면 13개를 실제 세션으로 열고, 스크린샷·대비·키보드·문구 검수는 장비 도구가 맡는다."""
+    spec = os.environ.get("ACC_UI_AUDIT_CMD")
+    if not spec or not os.environ.get("ACC_UI_REVIEWER"):
+        raise A.Skip("화면 검수 장비(ACC_UI_AUDIT_CMD, 검수자 ACC_UI_REVIEWER) 미구성")
+    _, admin_key, _ = console_user("admin")
+    _, staff_key, _ = console_user(None)
+    admin, admin_reply, admin_session = http_login("/login", SESSION_COOKIE, admin_key)
+    staff, staff_reply, staff_session = staff_login(staff_key)
+    if admin_reply.status_code != 303 or staff_reply.status_code != 303:
+        raise SystemExit("화면 시험 로그인 실패")
+    reachable = []
+    for path in SCREEN_PATHS:
+        client, cookie = ((staff, f"{STAFF_COOKIE}={staff_session}") if path.startswith("/staff")
+                          else (admin, f"{SESSION_COOKIE}={admin_session}"))
+        if client.get(path, headers={"Cookie": cookie}).status_code == 200:
+            reachable.append(path)
+    done = A.run([*json.loads(spec)], stdin=json.dumps({
+        "base": site()["api"], "paths": reachable,
+        "cookies": {"admin": [SESSION_COOKIE, admin_session],
+                    "staff": [STAFF_COOKIE, staff_session]}}), timeout=1800)
+    audit = json.loads(done.stdout)
+    observe(ctx, screen_count=len(reachable), reachable=reachable,
+            screenshots=audit["screenshots"], reviewer=os.environ["ACC_UI_REVIEWER"],
+            explanatory_paragraphs=audit["explanatory_paragraphs"],
+            english_enums=audit["english_enums"], contrast_min=audit["contrast_min"],
+            keyboard_failures=audit["keyboard_failures"])
 
 
 # ================================================================ 이행 1종

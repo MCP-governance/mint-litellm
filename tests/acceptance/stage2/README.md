@@ -98,7 +98,9 @@ DB 복원은 시험 스택에 한정한다. 24시간 시험은 timeout을 최소
 `MINT_EXPORT_HMAC_KEY`(키 교체 시험의 원래 값), `ACC_PLUGIN_SERVICES`(키 교체 때 다시 만들 서비스, 기본
 `litellm worker`), `ACC_BUFFER_SERVICE`·`ACC_BUFFER_CONTAINER_DIR`(버퍼 검색), `ACC_STEADY_SECONDS`
 (24시간 시험 길이, 합격 기준은 86400), `ACC_V001_PROBE`(JSON argv 배열: 이행된 v001 DB를 쓰는 별도
-스택에서 호출을 재고 측정 JSON을 출력하는 장비 도구). 합성 서버 `mode`에 `unauthorized`(MCP 요청에 401)가
+스택에서 호출을 재고 측정 JSON을 출력하는 장비 도구), `ACC_UI_AUDIT_CMD`(JSON argv: stdin의
+`{base, paths, cookies}`로 스크린샷 13개·대비·키보드·문구 검수를 하고 결과 JSON을 출력하는 도구)와
+`ACC_UI_REVIEWER`(검수자). 직원 확인은 직원 화면 경로(`/staff/login`, `/staff/confirmations/{id}/confirm`)로 한다. 합성 서버 `mode`에 `unauthorized`(MCP 요청에 401)가
 추가되었다. 접근 로그를 세는 시험(`unpin_calls`·`test_route_calls`·`reject_calls`)은 `decision_logs`의
 `docker logs`에 `--since`를 붙여 센다.
 
