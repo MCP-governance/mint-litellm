@@ -38,6 +38,19 @@ CALL_APPROVAL = {
     "expired": Status("만료", "off"),
     "consumed": Status("사용됨", "off"),
 }
+SELF_CONFIRMATION = {
+    "pending": Status("확인 대기", "wait"),
+    "confirmed": Status("확인됨", "ok"),
+    "rejected": Status("거절됨", "block"),
+    "cancelled": Status("취소됨", "off"),
+    "expired": Status("만료", "off"),
+    "consumed": Status("사용됨", "off"),
+}
+CONSENT = {
+    "active": Status("유효", "ok"),
+    "revoked": Status("철회됨", "block"),
+    "expired": Status("만료", "off"),
+}
 RELATION = {
     "active": Status("이용 중", "ok"),
     "terminating": Status("종료 중", "wait"),
@@ -175,6 +188,22 @@ EVENT_KIND = {
     "deployment_contract_superseded": "배포 계약 교체",
 }
 
+CONFIRMATION_EVENT = {
+    "call_approval_approved": "본인 확인 확정",
+    "call_approval_rejected": "본인 확인 거절",
+    "call_approval_cancelled": "본인 확인 취소",
+}
+STAFF_SESSION_EVENT = {
+    "console_session_started": "직원 화면 로그인",
+    "console_session_ended": "직원 화면 로그아웃",
+}
+
+CONSENT_TEXT_VERSION = "v1"
+CONSENT_TEXT = {
+    "v1": "선택한 서버가 위 목적과 범위로 내 데이터를 처리하는 데 동의합니다. "
+          "동의는 유효 기간이 끝나기 전에도 이 화면에서 철회할 수 있습니다.",
+}
+
 SESSION_END_REASON = {
     "logout": "로그아웃",
     "key_gone": "키 삭제",
@@ -201,6 +230,11 @@ NOTICES = {
     "org_closed": "조직을 닫았습니다.",
     "allowlist_added": "허용 목록에 추가했습니다.",
     "mode_set": "모드를 변경했습니다.",
+    "staff_confirmed": "확인했습니다.",
+    "staff_rejected": "거절했습니다.",
+    "staff_cancelled": "취소했습니다.",
+    "consent_given": "동의를 등록했습니다.",
+    "consent_withdrawn": "동의를 철회했습니다.",
 }
 
 

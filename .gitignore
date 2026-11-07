@@ -16,3 +16,4 @@ tmp/
 .DS_Store
 .pyhome/
 .uv-cache/
+tests/integration/config/verified.generated.yaml

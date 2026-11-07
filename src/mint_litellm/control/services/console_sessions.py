@@ -7,6 +7,7 @@ SHA-256(``key_token``),
 
 import hashlib
 import hmac
+import json
 import secrets
 from dataclasses import dataclass
 
@@ -110,14 +111,15 @@ def revoke(
         row = fetchone(
             conn,
             "UPDATE mint.console_sessions SET revoked_at = now() WHERE instance_id = %s"
-            " AND id_hash = %s AND revoked_at IS NULL RETURNING user_id",
+            " AND id_hash = %s AND revoked_at IS NULL RETURNING user_id, subject",
             (instance_id, id_hash),
         )
         if row is None:
             return False
         ledger.record(
             conn, instance_id, EventKind.CONSOLE_SESSION_ENDED, entity_id=id_hash,
-            state_version=2, actor=actor, payload={"user_id": row["user_id"], "reason": reason},
+            state_version=2, actor=actor,
+            payload={"user_id": row["user_id"], "reason": reason, "subject": row["subject"]},
         )
     return True
 
@@ -125,11 +127,13 @@ def revoke(
 def revoke_user_sessions(
     conn: psycopg.Connection, instance_id: str, user_id: str, *, actor: str, reason: str
 ) -> int:
-    """그 사용자의 활성 세션을 모두 폐기한다(운영자 행을 지우거나 역할을 바꿀 때 부른다)."""
+    """그 사용자의 활성 관리자 세션을 모두 폐기한다(운영자 행을 지우거나 역할을 바꿀 때 부른다).
+
+직원 세션은 운영자 행과 무관하므로 건드리지 않는다."""
     rows = fetchall(
         conn,
         "SELECT id_hash FROM mint.console_sessions WHERE instance_id = %s AND user_id = %s"
-        " AND revoked_at IS NULL",
+        " AND subject = 'admin' AND revoked_at IS NULL",
         (instance_id, user_id),
     )
     return sum(revoke(conn, instance_id, r["id_hash"], actor=actor, reason=reason) for r in rows)
@@ -138,12 +142,29 @@ def revoke_user_sessions(
 def active_sessions(conn: psycopg.Connection, instance_id: str) -> list[dict]:
     return fetchall(
         conn,
-        "SELECT id_hash, user_id, key_token, role,"
+        "SELECT id_hash, user_id, key_token, role, subject,"
         " EXTRACT(EPOCH FROM now() - last_verified_at) AS unverified_seconds"
         " FROM mint.console_sessions"
         " WHERE instance_id = %s AND revoked_at IS NULL AND absolute_expiry > now()"
-        " AND idle_expiry > now() AND subject = 'admin'",
+        " AND idle_expiry > now()",
         (instance_id,),
+    )
+
+
+def teams_of(key_info: dict) -> tuple[str, ...]:
+    """키 정보의 team_id(문자열일 때만). 화면 입력이나 사용자 정보는 쓰지 않는다."""
+    team = key_info.get("team_id")
+    return (team,) if isinstance(team, str) and team else ()
+
+
+def set_teams(
+    conn: psycopg.Connection, instance_id: str, id_hash: str, team_ids: tuple[str, ...]
+) -> None:
+    """직원 세션의 소속 팀을 본인 키 정보에서 읽은 값으로 맞춘다(로그인 직후와 재확인 때)."""
+    conn.execute(
+        "UPDATE mint.console_sessions SET team_ids = %s::jsonb WHERE instance_id = %s"
+        " AND id_hash = %s AND subject = 'staff' AND team_ids IS DISTINCT FROM %s::jsonb",
+        (json.dumps(list(team_ids)), instance_id, id_hash, json.dumps(list(team_ids))),
     )
 
 
