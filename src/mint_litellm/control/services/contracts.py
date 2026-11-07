@@ -68,11 +68,14 @@ def diff(ctx: Context, server_id: str) -> dict:
     return current
 
 
-@service("contract reapprove")
 def request_deployment(
     ctx: Context, server_id: str, candidate_id: str, *, expected_version: int | None = None
 ) -> None:
-    """수용검증이 만든 배포 후보를 재승인 대기 상태로 기록한다."""
+    """수용검증이 만든 배포 후보를 재승인 대기 상태로 기록한다.
+
+    관측 기록은 작업 실행기 역할만 쓰므로 운영자 명령이 아니라 작업 실행기의 같은 트랜잭션에서
+    부른다(역할 확인 없음, 호출한 작업이 이미 신청 경로를 거쳤다).
+    """
     from mint_litellm.control.contract_observe import _alert, _observe
 
     server = fetchone(

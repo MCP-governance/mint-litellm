@@ -221,6 +221,18 @@ class LiteLLMSync(LiteLLMAdmin):
             "PUT", "/v1/mcp/server", {"server_id": server_id, "allow_all_keys": False}
         )
 
+    def pin(self, server_id: str) -> dict:
+        """서버 도구를 지금 값으로 고정한다. 응답은 ``{도구: {description, input_schema}}``이다."""
+        quoted = urllib.parse.quote(server_id, safe="")
+        body = self._write("POST", f"/v1/mcp/server/{quoted}/pin")
+        if not isinstance(body, dict):
+            raise LiteLLMError("pin 응답 형식이 올바르지 않습니다.")
+        return body
+
+    def unpin(self, server_id: str) -> None:
+        quoted = urllib.parse.quote(server_id, safe="")
+        self._write("DELETE", f"/v1/mcp/server/{quoted}/pin")
+
     def approve_server(self, server_id: str) -> dict | None:
         quoted = urllib.parse.quote(server_id, safe="")
         return self._write("PUT", f"/v1/mcp/server/{quoted}/approve")
