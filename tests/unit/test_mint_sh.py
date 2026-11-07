@@ -105,10 +105,12 @@ def test_first_run_generates_export_key_and_worker_passwords_once_with_private_e
 def test_up_hands_worker_and_staff_passwords_to_init_and_starts_the_worker(tmp_path):
     (tmp_path / "deploy").mkdir()
     (tmp_path / "deploy" / "litellm.config.example.yaml").write_text("{}\n", encoding="utf-8")
-    result, _, _ = run(tmp_path, "POSTGRES_PASSWORD=x\n", "up")
+    result, env_file, _ = run(tmp_path, "POSTGRES_PASSWORD=x\n", "up")
     assert result.returncode == 0, result.stderr
     log = (tmp_path / "docker.log").read_text(encoding="utf-8")
-    assert "MINT_WORKER_DB_PASSWORD=" in log and "MINT_STAFF_DB_PASSWORD=" in log
+    assert "-e MINT_WORKER_DB_PASSWORD" in log and "-e MINT_STAFF_DB_PASSWORD" in log
+    values = dict(ln.split("=", 1) for ln in env_file.read_text(encoding="utf-8").splitlines())
+    assert values["MINT_WORKER_DB_PASSWORD"] not in log  # 값은 인자가 아니라 환경으로 간다
     assert "--profile worker up -d worker" in log
 
 
@@ -117,3 +119,12 @@ def test_compose_refuses_to_start_litellm_without_an_export_key():
     litellm = text.split("\n  litellm:\n", 1)[1].split("\n  control:\n", 1)[0]
     assert "MINT_EXPORT_HMAC_KEY: ${MINT_EXPORT_HMAC_KEY:?" in litellm
     assert "export:/var/lib/mint/export:ro" in litellm
+
+
+def test_values_are_appended_on_their_own_line_when_env_lacks_a_trailing_newline(tmp_path):
+    result, env_file, _ = run(tmp_path, "POSTGRES_PASSWORD=x", "cli", "status")
+    assert result.returncode == 0, result.stderr
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "POSTGRES_PASSWORD=x"
+    assert any(ln.startswith("MINT_SECRETS_DIR=") for ln in lines)
+    assert any(ln.startswith("MINT_EXPORT_HMAC_KEY=") for ln in lines)
