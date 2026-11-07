@@ -24,41 +24,83 @@ EXPORT_MISSING = "export_missing"
 EXPORT_UNVERIFIED = "export_unverified"
 EXPORT_CONFIG_MISSING = "export_config_missing"
 
-# 부정 상태 항목은 행이 있고 state_version이 파일 값 이상이며 상태 열도 파일과 같아야 한다.
-# (값이 안 바뀐 UPDATE도 버전을 올리므로 버전만으로는 되돌림을 가릴 수 있다. 정상 해제·변경은
-# 새 부정 상태 파일을 내므로 파일이 따라온다.)
-FACTS_SQL = """
-WITH f AS (
+# 부정 상태 항목 대조. 항목마다 DB 행을 파일의 행 스냅숏과 비교한다.
+# - 판본이 파일보다 낮으면 되돌림(``reapply``).
+# - 판본이 같으면 행 내용이 파일 스냅숏과 같아야 한다(다르면 ``content``). 두 쪽에 모두 있는
+#   열만 비교한다(스키마 변경으로 열이 늘거나 줄어도 오탐하지 않는다). 시각은 UTC 문자열로 맞춘다.
+# - 판본이 더 높으면 그 행이 여전히 부정 상태이거나, 파일 이후 봉인된 원장에 같은 id의 정당한
+#   해제 사건(``denial_lifted``·``server_resumed``)이 있어야 한다. 아니면 ``reapply``.
+# 값이 안 바뀐 UPDATE도 판본을 올리므로 판본만으로는 되돌림을 가릴 수 있다. 정상 해제·변경은 새
+# 부정 상태 파일을 내므로 파일이 따라온다.
+ITEM_CHECK_CTE = """
+f AS (
   SELECT * FROM jsonb_to_recordset(%(items)s::jsonb)
-    AS x(kind text, id text, state_version bigint, state text)
+    AS x(kind text, id text, state_version bigint, state text, row jsonb)
 ), rows AS (
-  SELECT 'approval' AS kind, id::text AS id, state_version, status AS state FROM mint.approvals
-    WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'approval')
-  UNION ALL SELECT 'denial', id::text, state_version,
-      CASE WHEN lifted_at IS NULL THEN 'active' ELSE 'lifted' END FROM mint.denials
-    WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'denial')
-  UNION ALL SELECT 'server', server_id, state_version, status FROM mint.servers
-    WHERE instance_id = %(i)s AND server_id IN (SELECT id FROM f WHERE kind = 'server')
-  UNION ALL SELECT 'relation', id::text, state_version, status FROM mint.usage_relations
-    WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'relation')
-  UNION ALL SELECT 'org', org_id, state_version, status FROM mint.orgs
-    WHERE instance_id = %(i)s AND org_id IN (SELECT id FROM f WHERE kind = 'org')
-  UNION ALL SELECT 'allowlist', id::text, state_version, status FROM mint.allowlists
-    WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'allowlist')
-  UNION ALL SELECT 'consent', id::text, state_version,
-      CASE WHEN revoked_at IS NULL THEN 'active' ELSE 'revoked' END FROM mint.consents
-    WHERE instance_id = %(i)s AND id::text IN (SELECT id FROM f WHERE kind = 'consent')
+  SELECT 'approval' AS kind, t.id::text AS id, t.state_version, t.status AS state,
+         t.status = 'revoked' AS neg, mint.row_json(t) AS row
+    FROM mint.approvals t
+    WHERE t.instance_id = %(i)s AND t.id::text IN (SELECT id FROM f WHERE kind = 'approval')
+  UNION ALL SELECT 'denial', t.id::text, t.state_version,
+      CASE WHEN t.lifted_at IS NULL THEN 'active' ELSE 'lifted' END,
+      t.lifted_at IS NULL, mint.row_json(t)
+    FROM mint.denials t
+    WHERE t.instance_id = %(i)s AND t.id::text IN (SELECT id FROM f WHERE kind = 'denial')
+  UNION ALL SELECT 'server', t.server_id, t.state_version, t.status,
+      t.status IN ('rejected', 'suspended', 'terminating', 'terminated'), mint.row_json(t)
+    FROM mint.servers t
+    WHERE t.instance_id = %(i)s AND t.server_id IN (SELECT id FROM f WHERE kind = 'server')
+  UNION ALL SELECT 'relation', t.id::text, t.state_version, t.status,
+      t.status IN ('terminating', 'terminated'), mint.row_json(t)
+    FROM mint.usage_relations t
+    WHERE t.instance_id = %(i)s AND t.id::text IN (SELECT id FROM f WHERE kind = 'relation')
+  UNION ALL SELECT 'org', t.org_id, t.state_version, t.status, t.status = 'closed',
+      mint.row_json(t)
+    FROM mint.orgs t
+    WHERE t.instance_id = %(i)s AND t.org_id IN (SELECT id FROM f WHERE kind = 'org')
+  UNION ALL SELECT 'allowlist', t.id::text, t.state_version, t.status, t.status = 'lifted',
+      mint.row_json(t)
+    FROM mint.allowlists t
+    WHERE t.instance_id = %(i)s AND t.id::text IN (SELECT id FROM f WHERE kind = 'allowlist')
+  UNION ALL SELECT 'consent', t.id::text, t.state_version,
+      CASE WHEN t.revoked_at IS NULL THEN 'active' ELSE 'revoked' END,
+      t.revoked_at IS NOT NULL, mint.row_json(t)
+    FROM mint.consents t
+    WHERE t.instance_id = %(i)s AND t.id::text IN (SELECT id FROM f WHERE kind = 'consent')
+), checked AS (
+  SELECT f.kind, f.id, r.state AS db_state, CASE
+    WHEN r.id IS NULL THEN 'missing_row'
+    WHEN r.state_version < f.state_version THEN 'reapply'
+    WHEN r.state_version = f.state_version AND f.row IS NOT NULL AND
+         (r.row - ARRAY(SELECT jsonb_object_keys(r.row) EXCEPT SELECT jsonb_object_keys(f.row)))
+         <> (f.row - ARRAY(SELECT jsonb_object_keys(f.row) EXCEPT SELECT jsonb_object_keys(r.row)))
+      THEN 'content'
+    WHEN r.state_version = f.state_version AND r.state <> f.state THEN 'reapply'
+    WHEN r.state_version > f.state_version AND NOT r.neg AND NOT EXISTS (
+         SELECT 1 FROM mint.events e
+         WHERE e.instance_id = %(i)s AND e.seal_seq > coalesce(%(seq)s::bigint, 0)
+           AND e.kind = CASE f.kind WHEN 'denial' THEN 'denial_lifted'
+                                    WHEN 'server' THEN 'server_resumed' END
+           AND starts_with(e.source_key, f.kind || ':' || f.id || ':'))
+      THEN 'reapply'
+  END AS problem
+  FROM f LEFT JOIN rows r ON r.kind = f.kind AND r.id = f.id
 )
+"""
+
+ITEM_PROBLEMS_SQL = (
+    "WITH" + ITEM_CHECK_CTE
+    + "SELECT kind, id, problem, db_state FROM checked WHERE problem IS NOT NULL"
+)
+
+FACTS_SQL = "WITH" + ITEM_CHECK_CTE + """
 SELECT (SELECT epoch FROM mint.state_epoch WHERE instance_id = %(i)s) AS epoch,
-  EXISTS (SELECT 1 FROM mint.exports WHERE instance_id = %(i)s AND status = 'written')
-    AS has_written,
+  (EXISTS (SELECT 1 FROM mint.exports WHERE instance_id = %(i)s AND status = 'written')
+   OR EXISTS (SELECT 1 FROM mint.restore_requests WHERE instance_id = %(i)s
+              AND status = 'pending')) AS has_written,
   EXISTS (SELECT 1 FROM mint.exports WHERE instance_id = %(i)s AND status = 'written'
           AND kind = 'negative_state') AS has_negative_written,
-  (SELECT count(*) FROM f WHERE NOT EXISTS (
-     SELECT 1 FROM rows r
-     WHERE r.kind = f.kind AND r.id = f.id AND r.state_version >= f.state_version
-       AND r.state = f.state
-  )) AS missing,
+  (SELECT count(*) FROM checked WHERE problem IS NOT NULL) AS missing,
   CASE WHEN %(seq)s::bigint IS NULL THEN true ELSE EXISTS (
     SELECT 1 FROM mint.seal_batches WHERE instance_id = %(i)s AND to_seal_seq = %(seq)s::bigint
       AND encode(tail_hash, 'hex') = %(tail)s) END AS anchor_ok

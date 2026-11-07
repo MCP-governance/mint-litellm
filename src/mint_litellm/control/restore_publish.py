@@ -5,6 +5,10 @@
 ``restored/<요청>/``로 보관 -> 새 부정 상태·체크포인트 파일 게시와 검증 -> ``latest.json``은 맨
 마지막 -> 요청 ``published``. 중간에 죽거나 임대를 잃으면 ``latest.json``이 없어 차단이 유지되고
 다시 실행하면 이어서 끝낸다. 같은 인스턴스의 게시는 자문 잠금으로 한 번에 하나다.
+
+요청은 만들어진 시점의 ``latest.json`` 해시에 결속한다. 게시 직전의 해시가 다르면
+요청을 거절하고 경보를 낸다. 게시를 끝내면 ``restored/<요청>/.done``을 남기고, 표지가 있는 요청은
+DB에서 ``pending``으로 되살아나도 다시 게시하지 않는다(최신 증거를 옛 요청이 덮지 못한다).
 """
 
 import shutil
@@ -13,16 +17,17 @@ from typing import Any
 
 import psycopg
 
-from mint_litellm.control import exports
+from mint_litellm.control import alerts, exports
 from mint_litellm.control.db.connection import fetchone
 from mint_litellm.control.errors import ControlError
-from mint_litellm.control.jobs import JobContext
+from mint_litellm.control.jobs import JobContext, PermanentFailure
 from mint_litellm.control.services import restore as restore_service
 from mint_litellm.restore import files, judge
 from mint_litellm.types.events import EventKind
 
 _MARKER = ".archived"  # 보관을 시작했다(이동 전에 쓴다)
 _MOVED = ".moved"  # 이동을 끝냈다
+_DONE = ".done"  # 게시와 검증을 모두 끝냈다(DB 확정 전에 죽어도 다시 게시하지 않는다)
 
 
 def _dest(settings, instance_id: str, request_id: str) -> Path:
@@ -44,6 +49,32 @@ def archive(settings, instance_id: str, request_id: str) -> None:
         if source.exists() and not (dest / name).exists():
             shutil.move(str(source), str(dest / name))
     (dest / _MOVED).write_text(files.now(), encoding="utf-8")
+
+
+def _bound_ok(settings, instance_id: str, request: dict[str, Any]) -> bool:
+    """게시 직전의 ``latest.json``(보관했다면 보관본)이 요청에 결속한 해시와 같은가."""
+    dest = _dest(settings, instance_id, str(request["id"]))
+    kept = dest / "latest.json"
+    if kept.exists():
+        current = files.file_sha256(kept)
+    elif (dest / _MOVED).exists():
+        current = "absent"  # 파일이 없던 요청: 보관 뒤에는 새 파일이 생기는 것이 정상이다
+    else:
+        current = files.file_sha256(files.latest_path(settings.export_dir, instance_id))
+    return current == request["bound_latest"]
+
+
+def _reject(job: JobContext, request: dict[str, Any]) -> None:
+    conn, iid = job.conn, job.instance_id
+    with conn.transaction():
+        conn.execute(
+            "UPDATE mint.restore_requests SET status = 'rejected'"
+            " WHERE id = %s AND status = 'pending'", (request["id"],))
+        alerts.raise_alert(
+            conn, iid, kind="restore_request_rejected", severity="critical",
+            dedup_key=f"restore_request_rejected:{request['id']}",
+            subject={"request_id": str(request["id"]), "reason": "latest_changed"})
+    raise PermanentFailure("restore_binding_mismatch")
 
 
 def _event(conn: psycopg.Connection, iid: str, kind: EventKind, request_id: str):
@@ -89,14 +120,20 @@ def _original_items(settings, iid: str, request_id: str, archived: bool) -> list
     return files.read_verified(path, keys).get("items") or []
 
 
-def _anchor_ok(conn, iid: str, settings, request_id: str, archived: bool) -> bool:
-    """원본 ``latest.json``의 봉인 끝이 DB의 ``seal_batches``와 같은가. 읽지 못하면 거짓이다."""
+def _original_latest(conn, iid: str, settings, request_id: str, archived: bool) -> dict | None:
+    """복원 대상이었던 ``latest.json``(보관했다면 보관본). 읽지 못하면 None."""
     path = files.latest_path(settings.export_dir, iid)
     if archived and (_dest(settings, iid, request_id) / "latest.json").exists():
         path = _dest(settings, iid, request_id) / "latest.json"
     try:
-        latest = files.read_verified(path, exports.keys(settings))
+        return files.read_verified(path, exports.keys(settings))
     except (FileNotFoundError, files.ExportUnverified):
+        return None
+
+
+def _anchor_ok(conn, iid: str, latest: dict | None) -> bool:
+    """원본 ``latest.json``의 봉인 끝이 DB의 ``seal_batches``와 같은가. 읽지 못하면 거짓이다."""
+    if latest is None:
         return False
     seq = latest.get("to_seal_seq")
     if seq is None:
@@ -129,14 +166,18 @@ def validate(job: JobContext, request: dict[str, Any]) -> None:
             and epoch >= request["target_epoch"]
         )
         if ok:
+            latest = _original_latest(conn, iid, settings, request_id, archived)
             items = _original_items(settings, iid, request_id, archived)
-            ok = not restore_service.compare(conn, iid, items)
-        if ok and not _anchor_ok(conn, iid, settings, request_id, archived):
-            # 요청의 cause 값을 믿지 않고 원본 latest.json 기준으로 다시 계산한 결과다
-            # 앵커 불일치: admin 2인이고 사건의 두 번째 승인자가 요청과 같아야 한다
-            ok = event["payload"].get("second_approver") == request["second_approver"] and (
-                _two_admins(conn, iid, request["requested_by"], request["second_approver"])
-            )
+            bad = restore_service.compare(
+                conn, iid, items, None if latest is None else latest.get("to_seal_seq"))
+            # 같은 판본의 내용 차이(content)는 admin 2인이 인정한 경우만 허용한다
+            ok = all(p["problem"] == "content" for p in bad)
+            if ok and (bad or not _anchor_ok(conn, iid, latest)):
+                # 요청의 cause 값을 믿지 않고 원본 latest.json 기준으로 다시 계산한 결과다
+                # 앵커 불일치·내용 차이: admin 2인이고 사건의 두 번째 승인자가 요청과 같아야 한다
+                ok = event["payload"].get("second_approver") == request["second_approver"] and (
+                    _two_admins(conn, iid, request["requested_by"], request["second_approver"])
+                )
     else:
         event = _event(conn, iid, EventKind.RESTORE_STALE_ACCEPTED, request_id)
         ok = (
@@ -160,7 +201,13 @@ def publish(job: JobContext) -> None:
     )
     if request is None:
         raise ControlError("복원 요청이 없습니다.")
-    if request["status"] == "published":
+    if request["status"] != "pending":
+        return
+    if (_dest(settings, iid, str(request["id"])) / _DONE).exists():
+        # 이미 게시를 끝낸 요청이 DB 복구로 되살아났다: 파일은 건드리지 않고 상태만 맞춘다.
+        conn.execute(
+            "UPDATE mint.restore_requests SET status = 'published', published_at = now()"
+            " WHERE id = %s AND status = 'pending'", (request["id"],))
         return
     lock = f"mint.restore_publish:{iid}"
     got = fetchone(conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok", (lock,))["ok"]
@@ -168,6 +215,10 @@ def publish(job: JobContext) -> None:
         raise exports.ExportFailed("다른 실행기가 복원 파일을 게시하는 중입니다.")
     try:
         job.checkpoint()
+        if request["bound_latest"] is None:  # 복원 명령이 만들지 않은 요청
+            raise ControlError("복원 요청에 외부 기준(latest.json 해시) 결속이 없습니다.")
+        if not _bound_ok(settings, iid, request):
+            _reject(job, request)
         validate(job, request)
         archive(settings, iid, str(request["id"]))
         job.checkpoint()
@@ -185,6 +236,8 @@ def publish(job: JobContext) -> None:
         state = judge.read_files(settings.export_dir, iid, exports.keys(settings))
         if state.error is not None or state.latest is None:
             raise exports.ExportFailed("게시한 파일을 다시 읽어 검증하지 못했습니다.")
+        done = _dest(settings, iid, str(request["id"])) / _DONE
+        done.write_text(files.now(), encoding="utf-8")  # 완료 표지는 DB 확정보다 먼저 남긴다
         conn.execute(
             "UPDATE mint.restore_requests SET status = 'published', published_at = now()"
             " WHERE id = %s AND status = 'pending'", (request["id"],),

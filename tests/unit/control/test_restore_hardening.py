@@ -1,0 +1,259 @@
+"""2단계 보강: 복원 요청의 외부 기준 결속과 부정 상태 행 내용 대조. 실 Postgres."""
+
+import pytest
+from ctl_fixtures import make_ctx
+
+from control import test_restore_acceptance as base
+from control.test_restore_acceptance import (
+    INSTANCE,
+    KEY,
+    add_admins,
+    attest_restored,
+    overtake_epoch,
+    revoke_and_export,
+    run_worker,
+)
+
+world = base.world  # 같은 시험 세계(픽스처)를 쓴다
+
+psycopg = pytest.importorskip("psycopg")
+
+from mint_litellm.control import exports, seal  # noqa: E402
+from mint_litellm.control.context import Operator  # noqa: E402
+from mint_litellm.control.db.connection import fetchone  # noqa: E402
+from mint_litellm.control.errors import ControlError  # noqa: E402
+from mint_litellm.control.services import restore  # noqa: E402
+from mint_litellm.restore import files, judge  # noqa: E402
+
+
+def _publish_once(world):
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    assert run_worker(world).state == judge.OK
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        request = fetchone(conn, "SELECT * FROM mint.restore_requests")
+    assert request["status"] == "published" and request["bound_latest"] != "absent"
+    return request
+
+
+def _snapshot_dir(root):
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*"))
+            if p.is_file()}
+
+
+# --- -----------------------------------------------------------------------------
+
+
+def test_a_completed_request_revived_as_pending_does_not_rewrite_the_evidence(
+    world, monkeypatch
+):
+    """DB가 복구돼 완료 요청이 pending으로 되살아나도 최신 증거를 덮지 않는다(.done 표지)."""
+    request = _publish_once(world)
+    settings = world["settings"]
+    done = settings.export_dir / INSTANCE / "restored" / str(request["id"]) / ".done"
+    assert done.exists()
+    before = _snapshot_dir(settings.export_dir / INSTANCE)
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        conn.execute("SET session_replication_role = replica")  # 복구 DB의 옛 행을 흉내 낸다
+        conn.execute("UPDATE mint.restore_requests SET status = 'pending', published_at = NULL")
+        conn.execute("UPDATE mint.jobs SET status = 'pending', run_after = now() - interval"
+                     " '1 second', lease_owner = NULL, lease_until = NULL"
+                     " WHERE kind = 'restore_publish'")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("완료 표지가 있는 요청은 다시 게시하지 않는다")
+
+    monkeypatch.setattr(exports, "write_export", forbidden)
+    monkeypatch.setattr(exports, "write_latest_file", forbidden)
+    run_worker(world)
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "published"
+        assert fetchone(conn, "SELECT status FROM mint.jobs WHERE kind = 'restore_publish'"
+                        )["status"] == "done"
+    assert _snapshot_dir(settings.export_dir / INSTANCE) == before
+
+
+def test_a_request_is_rejected_when_latest_changed_after_it_was_made(world):
+    """요청 뒤에 latest.json이 바뀌면 게시하지 않고 거절·경보한다."""
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    settings = world["settings"]
+    path = files.latest_path(settings.export_dir, INSTANCE)
+    doc = files.read_verified(path, exports.keys(settings))
+    doc["written_at"] = "2031-01-01T00:00:00Z"  # 다른 곳에서 최신 증거가 게시됐다
+    files.atomic_write(path, files.sign(doc, KEY.encode()))
+    before = _snapshot_dir(settings.export_dir / INSTANCE)
+    run_worker(world)
+    assert _snapshot_dir(settings.export_dir / INSTANCE) == before  # 보관도 게시도 없다
+    assert not (settings.export_dir / INSTANCE / "restored").exists()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "rejected"
+        job = fetchone(conn, "SELECT status, last_error_code FROM mint.jobs"
+                       " WHERE kind = 'restore_publish'")
+        assert job["status"] == "failed" and job["last_error_code"] == "restore_binding_mismatch"
+        alert = fetchone(conn, "SELECT severity FROM mint.alerts"
+                         " WHERE kind = 'restore_request_rejected'")
+        assert alert["severity"] == "critical"
+
+
+def test_a_pending_restore_request_holds_the_evidence_jobs_until_it_is_published(
+    world,
+):
+    """대기 중인 복원 요청이 있는 동안 정상 체크포인트가 latest.json을 바꾸지 않는다."""
+    from control.test_restore_acceptance import url_for
+    from mint_litellm.control.worker import RestoreCheck, Worker
+
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    settings = world["settings"]
+    worker = Worker(url_for(world["restored"], world["clone"], "mint_worker"), INSTANCE,
+                    settings, restore_check=RestoreCheck(settings, 0))
+    try:
+        worker.open()
+        assert worker._restore_in_flight() is True
+        while worker.step():
+            pass
+        assert worker._restore_in_flight() is False
+    finally:
+        worker.close()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "published"
+
+
+def test_a_crash_between_archive_and_publish_keeps_the_block_without_exports_rows(
+    world, monkeypatch
+):
+    """복구 DB에 내보내기 행이 없어도 복원 진행 중 파일 없음은 첫 설치가 아니라 차단이다."""
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    settings = world["settings"]
+
+    def dying(*args, **kwargs):
+        raise OSError("killed")
+
+    monkeypatch.setattr(exports, "write_export", dying)
+    run_worker(world)
+    assert not files.latest_path(settings.export_dir, INSTANCE).exists()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT count(*) AS n FROM mint.exports"
+                        " WHERE status = 'written'")["n"] == 0
+        verdict = judge.Judge().evaluate(conn, settings.export_dir, INSTANCE,
+                                         exports.keys(settings))
+    assert verdict.blocked and verdict.cause == judge.EXPORT_MISSING
+    monkeypatch.undo()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'")
+    assert run_worker(world).state == judge.OK
+
+
+# --- -----------------------------------------------------------------------------
+
+
+def _verdicts(url, settings, count=2):
+    with psycopg.connect(url, autocommit=True) as conn:
+        j = judge.Judge()
+        keys = exports.keys(settings)
+        return [j.evaluate(conn, settings.export_dir, INSTANCE, keys) for _ in range(count)]
+
+
+def test_same_version_with_different_row_content_is_a_mismatch_even_with_the_same_anchor(
+    world,
+):
+    revoke_and_export(world)
+    settings = world["settings"]
+    assert _verdicts(world["live"], settings, 1)[0].state == judge.OK
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        conn.execute("SET session_replication_role = replica")  # 판본을 올리지 않는 변조
+        conn.execute("UPDATE mint.orgs SET name = '다른 이름' WHERE org_id = 'acme'")
+    first, second = _verdicts(world["live"], settings)
+    assert first.state == judge.HOLD and second.blocked
+    assert second.detail["anchor_ok"] is True and second.detail["missing_items"] == 1
+
+
+def test_a_higher_version_that_is_still_negative_is_not_a_mismatch(world):
+    revoke_and_export(world)
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        conn.execute("UPDATE mint.orgs SET name = name WHERE org_id = 'acme'")
+        assert fetchone(conn, "SELECT state_version FROM mint.orgs")["state_version"] > 2
+    assert _verdicts(world["live"], world["settings"])[1].state == judge.OK
+
+
+def test_a_version_overtake_that_leaves_the_negative_state_is_a_mismatch(world):
+    revoke_and_export(world)
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        conn.execute("SET session_replication_role = replica")
+        conn.execute("UPDATE mint.orgs SET status = 'active', state_version = state_version + 5"
+                     " WHERE org_id = 'acme'")
+    first, second = _verdicts(world["live"], world["settings"])
+    assert first.state == judge.HOLD and second.blocked
+
+
+def _lift_denial(conn, denial_id, sealed_release):
+    conn.execute("UPDATE mint.denials SET lifted_at = now(), lifted_by = 'root'"
+                 " WHERE id = %s", (denial_id,))
+    if sealed_release:
+        version = fetchone(conn, "SELECT state_version FROM mint.denials WHERE id = %s",
+                           (denial_id,))["state_version"]
+        conn.execute(
+            "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload)"
+            " VALUES (gen_random_uuid(), %s, 'denial_lifted', %s, 'root', '{}')",
+            (INSTANCE, f"denial:{denial_id}:{version}:denial_lifted"))
+        old = seal.SETTLE_SECONDS
+        seal.SETTLE_SECONDS = -1
+        try:
+            seal.seal_once(conn, INSTANCE)
+        finally:
+            seal.SETTLE_SECONDS = old
+
+
+@pytest.mark.parametrize("sealed_release", [True, False])
+def test_a_lifted_denial_needs_a_sealed_release_event_after_the_file(
+    world, sealed_release
+):
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        denial = fetchone(conn, "INSERT INTO mint.denials (id, instance_id, org_id, scope_type,"
+                          " scope_id, reason, created_by) VALUES (gen_random_uuid(), %s, 'acme',"
+                          " 'org', 'acme', '유출 의심', 'root') RETURNING id", (INSTANCE,))["id"]
+        old = seal.SETTLE_SECONDS
+        seal.SETTLE_SECONDS = -1
+        try:
+            seal.seal_once(conn, INSTANCE)
+        finally:
+            seal.SETTLE_SECONDS = old
+        exports.write_export(conn, INSTANCE, world["settings"], "negative_state")
+        exports.write_export(conn, INSTANCE, world["settings"], "checkpoint")
+        assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK
+        _lift_denial(conn, denial, sealed_release)
+    first, second = _verdicts(world["live"], world["settings"])
+    if sealed_release:
+        assert first.state == judge.OK and second.state == judge.OK
+    else:
+        assert first.state == judge.HOLD and second.blocked
+
+
+def test_attest_refuses_a_content_difference_without_a_second_admin_and_accepts_with_two(
+    world,
+):
+    revoke_and_export(world)
+    settings = world["settings"]
+    add_admins(world["live"])
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        conn.execute("SET session_replication_role = replica")
+        conn.execute("UPDATE mint.orgs SET name = '다른 이름' WHERE org_id = 'acme'")
+    with psycopg.connect(world["live"]) as conn:
+        report = restore.check(conn, INSTANCE, settings)
+        assert [(i["id"], i["problem"]) for i in report["items"]] == [("acme", "content")]
+        with pytest.raises(ControlError, match="두 번째 승인"):
+            restore.attest(make_ctx(conn), settings, "내용 차이 확인")
+        conn.rollback()
+        out = restore.attest(make_ctx(conn), settings, "내용 차이 확인",
+                             Operator("second", "admin", "u2"))
+        conn.commit()
+    assert out["reapplied"] == []
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        row = fetchone(conn, "SELECT cause, second_approver FROM mint.restore_requests")
+    assert row == {"cause": "content", "second_approver": "second"}

@@ -135,5 +135,13 @@ def newest_negative(export_dir: Path, instance_id: str) -> Path | None:
     return max(names, key=lambda p: int(p.stem), default=None)
 
 
+def file_sha256(path: Path) -> str:
+    """파일 바이트의 SHA-256. 파일이 없으면 ``absent``(복원 요청의 결속값)."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "absent"
+
+
 def now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
