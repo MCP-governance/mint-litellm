@@ -186,3 +186,45 @@ test_r2_r3_r4_collects_both_obligations if {
 	d.policy_ids == ["R3"]
 	d.obligations == [{"type": "require_call_approval"}, {"type": "require_consent", "purpose": "use"}]
 }
+
+confirm_condition(tools) := {"require_user_confirmation": {"tools": tools, "purpose": "use", "display_fields": ["text"]}}
+
+test_confirmation_obligation if {
+	a := object.union(sample.approval, {"conditions": confirm_condition(["read"])})
+	d := evaluate(object.union(sample, {"approval": a}))
+	d.decision == "Allow"
+	d.policy_ids == []
+	d.missing_inputs == []
+	d.obligations == [{"type": "require_user_confirmation", "purpose": "use", "display_fields": ["text"]}]
+}
+
+test_confirmation_other_tool_has_no_obligation if {
+	a := object.union(sample.approval, {"conditions": confirm_condition(["write"])})
+	d := evaluate(object.union(sample, {"approval": a}))
+	d.obligations == []
+}
+
+test_confirmation_without_display_fields if {
+	c := {"require_user_confirmation": {"tools": ["read"], "purpose": "use"}}
+	d := evaluate(object.union(sample, {"approval": object.union(sample.approval, {"conditions": c})}))
+	d.obligations == [{"type": "require_user_confirmation", "purpose": "use", "display_fields": []}]
+}
+
+test_confirmation_with_call_approval_orders_obligations if {
+	c := object.union(confirm_condition(["read"]), {"high_risk_tools": ["read"]})
+	d := evaluate(object.union(sample, {"approval": object.union(sample.approval, {"conditions": c})}))
+	d.decision == "RequireApproval"
+	d.obligations == [
+		{"type": "require_call_approval"},
+		{"type": "require_user_confirmation", "purpose": "use", "display_fields": ["text"]},
+	]
+}
+
+test_confirmation_malformed_condition_is_missing_input if {
+	every bad in [{"tools": [], "purpose": "use"}, {"tools": ["read"], "purpose": " "}, {"tools": "read", "purpose": "use"}, {"tools": ["read"], "purpose": "use", "display_fields": [1]}, {"tools": [""], "purpose": "use"}, {"tools": ["read", " "], "purpose": "use"}, {"tools": ["read"], "purpose": "use", "display_fields": [""]}, {"tools": ["read"], "purpose": "use", "display_fields": ["  "]}] {
+		c := {"require_user_confirmation": bad}
+		d := evaluate(object.union(sample, {"approval": object.union(sample.approval, {"conditions": c})}))
+		"approval.conditions.require_user_confirmation" in d.missing_inputs
+		d.obligations == []
+	}
+}
