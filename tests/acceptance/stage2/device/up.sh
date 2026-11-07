@@ -40,5 +40,12 @@ docker run --rm -v "${COMPOSE_PROJECT_NAME}_export:/x" --entrypoint sh mint-lite
 set -a; . ./.env; set +a
 "${C[@]}" exec -T postgres psql -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='litellm_plain'" | grep -q 1 \
   || "${C[@]}" exec -T postgres psql -U postgres -d postgres -c "CREATE DATABASE litellm_plain"
-"${C[@]}" up -d litellm litellm2 litellm-plain
+# LiteLLM 복제본이 같은 DB에 동시에 마이그레이션하면 교착으로 마이그레이션 기록이 어긋나므로 하나씩 올린다.
+wait_ready() { for _ in $(seq 1 90); do curl -fs "http://127.0.0.1:$1/health/readiness" >/dev/null && return 0; sleep 5; done; echo "준비 안 됨: $1" >&2; return 1; }
+"${C[@]}" up -d litellm
+wait_ready 4300
+"${C[@]}" up -d litellm2
+wait_ready 4301
+"${C[@]}" up -d litellm-plain
+wait_ready 4310
 echo up-done
