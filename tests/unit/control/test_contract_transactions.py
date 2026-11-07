@@ -391,3 +391,47 @@ def test_login_roles_split_observation_planning_and_pin_writes(contract_db, fres
     assert plan["status"] == "completed"
     grant = fetchone(conn, "SELECT observed FROM mint.litellm_grants WHERE item='pin'")
     assert grant["observed"] is True
+
+
+def test_failed_pin_confirmation_lowers_the_pin_row_after_unpin(contract_db):
+    conn, ctx, old = contract_db
+    observe(conn, ctx, {"read": NEW})
+    candidate = add_tool(conn, NEW)
+    iid = evidence(conn, candidate)
+    conn.execute(
+        "INSERT INTO mint.litellm_grants(id,instance_id,target_type,target_id,item,server_id,"
+        "applied_sha256,observed) VALUES (%s,'i','server','s','pin','s',%s,true)",
+        (new_uuid7(), "a" * 64),
+    )
+    pin = Pin(conn, old, candidate, {"read": TOOL})  # 응답이 후보와 다르면 확정 실패
+    with pytest.raises(AdminError):
+        reapprove(ctx, pin, "s", iid, [str(candidate)])
+    assert pin.unpins == 1
+    row = fetchone(conn, "SELECT observed FROM mint.litellm_grants WHERE item='pin'")
+    assert row["observed"] is False
+
+
+def test_contract_observe_reads_tools_through_the_g2_client(contract_db):
+    from mint_litellm.control.contract_observe import handle
+    from mint_litellm.control.errors import ControlError
+    from mint_litellm.control.jobs import JobContext
+
+    conn, ctx, _ = contract_db
+    seen = []
+
+    class Client:
+        def test_tools_list(self, spec):
+            seen.append(spec)
+            return {"tools": [{"name": "read", **NEW, "inputSchema": NEW["input_schema"]}]}
+
+    job = {"target_ref": "contract_observe"}
+    handle(JobContext(conn, "i", job, litellm=Client()))
+    assert seen == [{"server_id": "s"}]
+    assert fetchone(conn, "SELECT drift FROM mint.tool_contracts WHERE status='approved'")[
+        "drift"
+    ] == "input_schema"
+    Client.test_tools_list = lambda self, spec: {"status": "error", "message": "down"}
+    with pytest.raises(ControlError):
+        handle(JobContext(conn, "i", job, litellm=Client()))
+    with pytest.raises(ControlError):
+        handle(JobContext(conn, "i", job))

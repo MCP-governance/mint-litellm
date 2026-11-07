@@ -22,6 +22,7 @@ def test_drift_classification():
         None,
         {},
         {"tools": [], "error": True},
+        {"status": "error", "message": "unreachable"},
         {"tools": [{"name": "x"}]},
         {"tools": [{"name": "x", "inputSchema": {}}] * 2},
         {"tools": [{"name": "x", "inputSchema": {}}] * 501},

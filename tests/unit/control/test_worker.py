@@ -161,14 +161,30 @@ def test_job_kinds_follow_the_registration_rules(url, all_handlers):
             base.enqueue_job(ctx, "seal", "x")  # 예약·키 작업은 키가 있다
 
 
-def test_a_known_kind_can_be_registered_before_its_handler_is_connected(url):
+def test_a_known_kind_without_a_handler_is_registered_but_never_leased(
+    make_worker, admin, url, monkeypatch
+):
+    """처리기가 없는 알려진 종류도 등록은 받고, 실행기는 처리기가 붙기 전까지 임대하지 않는다."""
+    monkeypatch.delitem(jobs.HANDLERS, "sync_server", raising=False)
     with psycopg.connect(url) as conn:
         ensure(conn, INSTANCE)
         ctx = make_ctx(conn)
-        for kind, key in (("session_verify", "s:x"), ("submission_poll", "p:x")):
-            assert kind not in jobs.HANDLERS
-            assert base.enqueue_job(ctx, kind, "x", key)
-        assert base.enqueue_job(ctx, "approval_expiry_scan", "x", "approval_expiry_scan:t")
+        job_id = base.enqueue_job(ctx, "sync_server", "x")
+        assert base.enqueue_job(ctx, "sync_server", "x") == job_id  # 수렴
+        conn.commit()
+    worker = make_worker()
+    assert worker.step() is False
+    assert job(admin, job_id)["status"] == "pending"
+    monkeypatch.setitem(jobs.HANDLERS, "sync_server", lambda ctx: None)  # 처리기가 붙으면 실행된다
+    assert worker.step() is True
+    assert job(admin, job_id)["status"] == "done"
+
+
+def test_an_unknown_kind_is_still_refused(url):
+    with psycopg.connect(url) as conn:
+        ensure(conn, INSTANCE)
+        with pytest.raises(ValueError, match="알 수 없는"):
+            base.enqueue_job(make_ctx(conn), "nothing", "x", "k")
 
 
 def test_a_pending_job_is_not_leased_while_the_same_target_runs(

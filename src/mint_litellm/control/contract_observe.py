@@ -17,7 +17,12 @@ from mint_litellm.types.ids import new_uuid7
 
 def normalize_tools(body: Any) -> dict[str, dict]:
     """불완전한 목록을 도구 삭제로 오인하지 않도록 전체 응답을 먼저 검사한다."""
-    if not isinstance(body, dict) or body.get("error") or not isinstance(body.get("tools"), list):
+    if (
+        not isinstance(body, dict)
+        or body.get("error")
+        or body.get("status") == "error"
+        or not isinstance(body.get("tools"), list)
+    ):
         raise ValueError("upstream tool listing failed")
     if len(body["tools"]) > 500 or len(canonical_text(body).encode("utf-8")) > 2 * 1024 * 1024:
         raise ValueError("upstream tool listing exceeds limits")
@@ -293,7 +298,6 @@ def consume_deployment_events(ctx: Context) -> None:
 
 
 def handle(job) -> None:
-    from mint_litellm.control.config import ControlConfig
     from mint_litellm.types.canonical import credential_scope
 
     ctx = Context(job.conn, job.instance_id, Operator("contract-observer", "admin", None))
@@ -307,10 +311,9 @@ def handle(job) -> None:
     )
     if not servers:
         return
-    client = ControlConfig.from_env().litellm()
-    test_tools_list = getattr(client, "test_tools_list", None)
-    if test_tools_list is None:
-        raise ControlError("수용검증 클라이언트의 test_tools_list 연결이 필요합니다.")
+    if job.litellm is None:
+        raise ControlError("MINT_LITELLM_URL과 MINT_LITELLM_KEY가 필요합니다.")
+    test_tools_list = job.litellm.test_tools_list
     failed = False
     for server in servers:
         job.checkpoint()
