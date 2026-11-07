@@ -142,6 +142,7 @@ services:
     environment:
       MINT_INSTANCE_ID: ${MINT_INSTANCE_ID:-default}
       MINT_DATABASE_URL: postgresql://mint_control_app:${MINT_CONTROL_DB_PASSWORD:?MINT_CONTROL_DB_PASSWORD를 .env에 설정하십시오}@postgres:5432/mint
+      MINT_STAFF_DATABASE_URL: postgresql://mint_staff_app:${MINT_STAFF_DB_PASSWORD:?MINT_STAFF_DB_PASSWORD를 .env에 설정하십시오}@postgres:5432/mint
       MINT_LITELLM_URL: http://litellm:4000
       MINT_LITELLM_KEY: ${MINT_LITELLM_KEY:-}
       MINT_EXPORT_DIR: /var/lib/mint/export

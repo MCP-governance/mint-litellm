@@ -83,6 +83,15 @@
 - **HTTP API** `/api/v1/<자원>`: 세션 쿠키 또는 `Authorization: Bearer <운영자 토큰>`. 변경 요청은 대상의 `state_version`을 보내야 하며 다르면 `409 MINT-ADMIN-CONFLICT`이다. 오류 본문은 `{code, message, reference}`이고 `X-Request-Id` 응답 헤더가 `reference`와 같다(사건이 있는 오류는 사건 키). 자원: `overview`, `servers`, `relations`, `approvals`, `denials`, `call-approvals`, `orgs`, `operators`, `allowlists`, `settings`, `policy/versions`, `ledger`(`/ledger/export?format=csv|json`).
 - 승인(`POST /approvals`)·운영자 등록·서버 등록은 LiteLLM 읽기가 필요하다. 콘솔은 제어 평면 키(`MINT_LITELLM_KEY`)를 읽기 경로 전용 클라이언트로만 쓰며(쓰기는 작업 실행기만) 설치 기본은 키를 설정하는 것이다. 키가 없으면 이 동작은 거부되고 명령줄에서 한다. 오류 코드는 `MINT-ADMIN-<이유>`(`…-INVALID-INPUT`·`…-UNAVAILABLE` 포함)이다.
 
+### 직원 화면
+
+같은 콘솔 프로세스가 `/staff` 아래에 직원 화면을 연다. 직원 화면의 연결은 `MINT_STAFF_DATABASE_URL`(`mint_staff_app` 로그인의 주소)로 따로 만들며, 이 값이 없으면 직원 화면은 열리지 않는다. 직원 로그인은 관리자와 같은 본인 키 확인이지만 운영자 행이 필요 없고, 세션 쿠키 `__Host-mint_staff`는 관리자 세션과 따로다. 세션에는 로그인 때 본인 키 정보와 사용자 정보에서 읽은 소속 팀이 함께 저장되며 작업 실행기의 재확인이 새 값으로 갱신한다. 화면 입력으로 팀을 받는 곳은 없다.
+
+- **쓸 수 있는 서버·도구**: 소속 조직의 이용 관계가 있는 승인된 서버와, 본인·본인 팀·본인 조직·본인 키 범위의 유효한 승인이 허용하는 도구.
+- **본인 확인 요청**: 정책이 본인 확인을 요구해 만든 요청을 확인·거절·취소한다. 확인은 호출한 키와 다른 키로 로그인한 세션에서만 된다(`require_separate_confirm_key`). 화면에 보이는 인자 값은 필드당 256자까지이며 요청이 끝나면 데이터베이스에서 지워진다.
+- **동의 관리와 내 기록**: 목적별 동의 등록·철회(유효 기간 상한 `MINT_STAFF_CONSENT_MAX_DAYS`, 기본 90일)와 본인 범위의 기록.
+- 직원 로그인 역할은 표를 직접 읽거나 쓰지 못하고 `mint.staff_*` 함수만 실행한다. 이 함수들은 슈퍼유저가 아닌 전용 역할(`mint_staff_owner`)이 소유하며 그 역할은 함수가 쓰는 표·열 권한만 가진다.
+
 ## 작업 실행기 `mint-litellm worker`
 
 `mint-litellm worker`는 운영자 명령이 아니라 상주 프로세스다(토큰·사건 없음). 같은 이미지를 `mint_worker_app` 로그인(제어·작업·봉인 그룹)으로 접속해 띄우며, 복제본을 여럿 띄워도 안전하다. `MINT_DATABASE_URL`은 이 로그인의 주소여야 하고, 다른 로그인이면 기동을 거부한다. `MINT_EXPORT_DIR`·`MINT_EXPORT_HMAC_KEY`가 없거나 `MINT_WEBHOOK_URLS`가 있는데 `MINT_WEBHOOK_HMAC_KEY`가 없으면 기동을 거부한다.
@@ -142,6 +151,8 @@ HMAC 키를 교체하려면 새 키를 `MINT_EXPORT_HMAC_KEY`, 옛 키를 `MINT_
 | `MINT_OPERATOR_TOKEN` | 운영자 토큰. `--token-file <파일>`로 대신할 수 있다. | 인증이 필요한 명령에서 필수 |
 | `MINT_LITELLM_URL` | LiteLLM 관리 API 주소 | `server register`·`operator add`·`approve`·`consent add`·`check`·`status`에서 필요 |
 | `MINT_LITELLM_KEY` | 제어 평면 LiteLLM 키(`proxy_admin`, `allowed_routes` 7개로 제한) | 위와 같음 |
+| `MINT_STAFF_DATABASE_URL` | 콘솔 직원 화면이 쓰는 `mint_staff_app` 로그인의 데이터베이스 주소 | 없으면 직원 화면을 열지 않음 |
+| `MINT_STAFF_CONSENT_MAX_DAYS` | 직원 본인 동의의 유효 기간 상한(일, 1~365) | `90` |
 | `MINT_CONSOLE_URL` | 경보 본문의 `console_url`에 넣을 콘솔 주소(선택). 없으면 `null`이다. | 없음 |
 | `MINT_LITELLM_CONFIG` | `check`·`status`가 읽는 LiteLLM `config.yaml` 경로. `--config`로 대신할 수 있다. | 없음 |
 | `MINT_MODE` | 모드 상한. `enforce`이면 `settings mode observe`가 거부된다. | `enforce` |
