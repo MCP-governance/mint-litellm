@@ -42,7 +42,7 @@
   <h3>서버 재개</h3>
   <form method="post" action="/servers/{{ s.server_id }}/resume" class="form">
     {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ s.state_version }}">
-    <div class="actions"><button type="submit" class="primary">승인 상태로 되돌리기</button></div>
+    <div class="actions"><button type="submit" class="primary">서버 재개</button></div>
   </form>
   {% endif %}
 </div>

@@ -80,7 +80,7 @@ def verify(litellm_url: str, key: str, *, timeout: float = 10.0) -> Identity:
             raise LoginRefused("만료된 키입니다.")
         user_id = info.get("user_id")
         if not isinstance(user_id, str) or not user_id:
-            raise LoginRefused("사람 사용자에 결속된 키가 아닙니다.")
+            raise LoginRefused("사람 사용자에 연결된 키가 아닙니다.")
         response = _get(client, base, "/user/info", key)
         if response.status_code != 200:
             raise LoginRefused("사용자를 확인할 수 없습니다.")

@@ -85,7 +85,7 @@ def approval_conditions(body: "ApprovalBody") -> dict[str, Any]:
         conditions["allowed_arg_keys"] = body.allowed_arg_keys
     if body.paths_mode == "listed":
         if not body.allowed_paths:
-            raise ControlError("허용 경로를 하나 이상 입력하거나 다른 선택을 고르십시오.")
+            raise ControlError("허용 경로를 하나 이상 입력하거나 다른 옵션을 선택하십시오.")
         conditions["allowed_paths"] = body.allowed_paths
     elif body.paths_mode == "unrestricted":
         conditions["allowed_paths_unrestricted"] = True
@@ -211,7 +211,7 @@ def list_servers(actor: Actor = Depends(api_actor)):
 def get_server(server_id: str, actor: Actor = Depends(api_actor)):
     row = reads.server(actor.conn, actor.instance, server_id)
     if row is None:
-        raise AdminError(AdminCode.NOT_FOUND, f"서버 {server_id}이(가) 없습니다.")
+        raise AdminError(AdminCode.NOT_FOUND, f"서버 {server_id}을(를) 찾을 수 없습니다.")
     return public(row)
 
 

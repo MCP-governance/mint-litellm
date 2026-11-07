@@ -78,7 +78,7 @@ def servers(request: Request, actor: Actor = Depends(page_actor)):
 def server_page(request: Request, actor: Actor, server_id: str, error=None, status=200):
     row = reads.server(actor.conn, actor.instance, server_id)
     if row is None:
-        raise AdminError(AdminCode.NOT_FOUND, f"서버 {server_id}이(가) 없습니다.")
+        raise AdminError(AdminCode.NOT_FOUND, f"서버 {server_id}을(를) 찾을 수 없습니다.")
     return render(
         request, "server_detail.html", {"s": row, "error": error}, actor=actor, status=status
     )

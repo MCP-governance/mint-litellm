@@ -131,7 +131,7 @@ def test_a_viewer_sees_no_action_buttons(world):
     viewer = world.session_client("viewer")
     assert "서버 중지" not in viewer.get("/servers/srv-ok").text
     assert 'name="deny"' not in viewer.get("/revocations").text
-    assert "조직 만들기" not in viewer.get("/admin").text
+    assert "조직 생성" not in viewer.get("/admin").text
 
 
 def test_the_review_form_is_prefilled_with_the_default_period(admin, world):

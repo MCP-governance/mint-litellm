@@ -188,7 +188,7 @@ SESSION_END_REASON = {
 
 NOTICES = {
     "suspended": "서버를 중지했습니다.",
-    "resumed": "서버를 다시 승인 상태로 되돌렸습니다.",
+    "resumed": "서버를 재개했습니다.",
     "approved": "승인했습니다.",
     "revoked": "승인을 철회했습니다.",
     "revoked_denied": "승인을 철회하고 거부를 등록했습니다.",
@@ -197,10 +197,10 @@ NOTICES = {
     "call_approved": "호출을 승인했습니다.",
     "call_rejected": "호출을 거부했습니다.",
     "call_cancelled": "승인 요청을 취소했습니다.",
-    "org_added": "조직을 만들었습니다.",
+    "org_added": "조직을 생성했습니다.",
     "org_closed": "조직을 닫았습니다.",
     "allowlist_added": "허용 목록에 추가했습니다.",
-    "mode_set": "모드를 바꿨습니다.",
+    "mode_set": "모드를 변경했습니다.",
 }
 
 
