@@ -29,8 +29,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: integration-${{ github.ref }}
-  cancel-in-progress: true
+  group: integration-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  # main 푸시는 커밋마다 그룹이 달라(sha) 서로 취소하지 않는다. PR은 같은 그룹이라 새 푸시가 이전 실행을 취소한다.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   integration:
