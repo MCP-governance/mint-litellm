@@ -164,11 +164,14 @@ def db_restore(ctx):
     """직전 db_backup(없으면 snapshot)으로 되돌린다. 복제본·작업 실행기는 멈춘 상태에서 복원한다."""
     marker = state_file("last-backup")
     source = marker.read_text(encoding="utf-8") if marker.exists() else "baseline"
+    pg = env("ACC_PG_SERVICE", "postgres")
+    user = env("ACC_PG_SUPERUSER", "postgres")
+    # 덤프가 없으면 아무것도 멈추거나 지우기 전에 중단한다(지운 뒤 복원이 실패하면 빈 DB가 남는다).
+    for database in ("mint", "litellm"):
+        compose("exec", "-T", pg, "test", "-s", f"/tmp/{source}-{database}.dump")
     services = [s for s in ("litellm", "worker", "console") if running(s)]
     if services:
         compose("stop", *services)
-    pg = env("ACC_PG_SERVICE", "postgres")
-    user = env("ACC_PG_SUPERUSER", "postgres")
     try:
         for database in ("mint", "litellm"):
             # 새로 만든 표까지 지우려고 DB째 다시 만든다(역할은 클러스터 전역이라 남는다).
