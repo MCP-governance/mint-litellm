@@ -47,6 +47,9 @@
 | `mint-litellm settings observable` | `admin` | 관측 모드로 전환할 수 있는 사유 계열과 정책을 정한다. | - | `settings_changed` |
 | `mint-litellm policy activate` | `admin` | 정책 번들을 검증하고 정책 엔진에 적재한 뒤 활성 판본으로 전환한다. | - | `policy_activated` |
 | `mint-litellm ledger list` | 모든 역할 | 원장 사건을 종류·기간·호출 식별자로 조회한다. | - | - |
+| `mint-litellm alert list` | 모든 역할 | 경보를 상태(`--status`)별로 조회한다. | - | - |
+| `mint-litellm alert ack` | `admin` | 열린 경보(`alert_id`)를 확인 처리한다. 확인한 운영자 이름이 남는다. | - | `alert_acknowledged` |
+| `mint-litellm alert resolve` | `admin` | 경보(`alert_id`)를 해결됨으로 닫는다. 같은 원인이 다시 생기면 새 경보가 열린다. | - | `alert_resolved` |
 
 ## 정책 활성화 실패와 복원
 
@@ -84,6 +87,7 @@
 | `MINT_OPERATOR_TOKEN` | 운영자 토큰. `--token-file <파일>`로 대신할 수 있다. | 인증이 필요한 명령에서 필수 |
 | `MINT_LITELLM_URL` | LiteLLM 관리 API 주소 | `server register`·`operator add`·`approve`·`consent add`·`check`·`status`에서 필요 |
 | `MINT_LITELLM_KEY` | 제어 평면 LiteLLM 키(`proxy_admin`, `allowed_routes` 7개로 제한) | 위와 같음 |
+| `MINT_CONSOLE_URL` | 경보 본문의 `console_url`에 넣을 콘솔 주소(선택). 없으면 `null`이다. | 없음 |
 | `MINT_LITELLM_CONFIG` | `check`·`status`가 읽는 LiteLLM `config.yaml` 경로. `--config`로 대신할 수 있다. | 없음 |
 | `MINT_MODE` | 모드 상한. `enforce`이면 `settings mode observe`가 거부된다. | `enforce` |
 | `MINT_REPLICAS` | `check`가 공유 캐시 설정을 판단할 때 쓰는 복제본 수 | `1` |
@@ -166,6 +170,23 @@
 - `--args-fp <지문>`: 차단 사건에 기록된 지문(소문자 16진 64자)을 그대로 넣는다.
 
 키가 없으면 인자 원문으로는 요청할 수 없고, 지문 키가 설정되어 있지 않으면 플러그인에서 호출별 승인은 항상 요구 상태로 남는다.
+
+## 경보와 웹훅
+
+경보는 종류와 대상으로 묶인다. 같은 묶음의 미해결 경보가 있으면 새로 만들지 않고 `count`와 `last_at`만 올린다. `job_failed`는 작업이 최대 시도 횟수를 넘겨 실패할 때, 같은 종류·대상의 작업이 이후 성공하면 해결된다. `approval_expiring`은 7일 안에 만료될 대기·확정 건마다 한 번 열리며, 운영자가 닫은 뒤에는 다시 열리지 않는다.
+
+경보가 열리면 `alert_opened`(순번 0), 확인되면 `alert_acknowledged`(순번 1), 해결되면 `alert_resolved`(순번 2) 사건을 같은 트랜잭션에 남긴다.
+
+`MINT_WEBHOOK_URLS`를 설정하면 새로 열린 경보마다 주소별로 전송 작업이 하나 생긴다. 주소는 `https`만 받고, 호스트는 이 목록의 호스트로 한정한다. 전송은 총 3회 시도하며 요청마다 5초 제한을 둔다. 3번 모두 실패하면 전송 행을 `failed`로 두고 작업은 완료로 끝난다. 응답 본문은 저장하지 않는다.
+
+서명 형식(수신 쪽이 검증하는 방법):
+
+- 요청 헤더 `X-MINT-Signature`는 `t=<유닉스 초>,v1=<서명>`이다.
+- 서명은 `HMAC-SHA256(키, "<t>.<본문>")`의 16진수 소문자 64자이며, `<본문>`은 요청 본문의 바이트 그대로다. 키는 `MINT_WEBHOOK_HMAC_KEY`다.
+- 헤더 `X-MINT-Delivery`는 전송 식별자이며 수신 쪽이 중복을 거를 때 쓴다. 재시도는 같은 식별자로 새 서명을 붙여 보낸다.
+- 수신 쪽은 `t`와 현재 시각의 차이가 5분을 넘으면 거부하고, 서명을 상수 시간 비교로 확인한다. 구현 예시는 `mint_litellm.control.webhook.verify`다.
+
+본문 `console_url`은 `MINT_CONSOLE_URL`(선택)을 그대로 쓰며, 설정이 없으면 `null`이다.
 
 ## 원장 조회
 

@@ -38,6 +38,7 @@ from mint_litellm.control.db.migrate import apply_migrations
 from mint_litellm.control.db.roles import LOGIN_PASSWORD_VARIABLES, LOGIN_ROLES, ensure_login_roles
 from mint_litellm.control.errors import AuthError, ControlError
 from mint_litellm.control.litellm_admin import LiteLLMAdmin
+from mint_litellm.control.services import alerts as alert_service
 from mint_litellm.control.services import allowlists as allowlist_service
 from mint_litellm.control.services import approvals as approval_service
 from mint_litellm.control.services import call_approvals as call_approval_service
@@ -394,6 +395,16 @@ def _policy_activate(run: Run) -> None:
     run.data["id"] = a.version
 
 
+def _alert_list(run: Run) -> None:
+    rows = alert_service.list_alerts(run.context(), status=run.args.status, limit=run.args.limit)
+    run.data["alerts"] = [json.loads(json.dumps(row, default=str)) for row in rows]
+    for row in rows:
+        run.say(
+            f"{row['id']}	{row['kind']}	{row['severity']}	{row['status']}	"
+            f"{row['count']}	{row['last_at'].isoformat()}"
+        )
+
+
 def _server_register(run: Run) -> None:
     server_service.register(
         run.context(),
@@ -507,6 +518,9 @@ HANDLERS: dict[str, Handler] = {
     "operator add": _operator_add,
     "operator bootstrap": _operator_bootstrap,
     "server register": _server_register,
+    "alert list": _alert_list,
+    "alert ack": _done(alert_service.acknowledge, "alert_id"),
+    "alert resolve": _done(alert_service.resolve, "alert_id"),
     "server suspend": _done(server_service.suspend, "server_id"),
     "server resume": _done(server_service.resume, "server_id"),
     "relation add": lambda r: _created(
@@ -561,9 +575,16 @@ _CONFIG = _a("--config", help="LiteLLM config.yaml 경로(기본: MINT_LITELLM_C
 _ENV_FILE = _a("--env-file", help="LiteLLM 환경 파일(KEY=VALUE)")
 _SECOND = _a("--second-approver", help="요청자와 다른 사용자의 운영자 토큰(또는 @파일)")
 _SERVER_ID = _a("server_id", help="LiteLLM 서버 식별자")
+_ALERT_ID = _a("alert_id", help="경보 식별자")
 
 
 ARGUMENTS: dict[str, list[Any]] = {
+    "alert list": [
+        _a("--status", choices=["open", "acknowledged", "resolved"], help="상태로 거른다"),
+        _a("--limit", type=int, default=100, help="최대 개수(기본 100)"),
+    ],
+    "alert ack": [_ALERT_ID],
+    "alert resolve": [_ALERT_ID],
     "init": [
         _a("--org-id", default="default", help="기본 조직 식별자"),
         _a("--org-name", default="기본 조직", help="기본 조직 이름"),
