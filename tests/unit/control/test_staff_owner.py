@@ -23,7 +23,7 @@ LOCK_COLUMN = {"orgs": "state_version", "org_bindings": "state_version",
 SELECTABLE = READ_ONLY | {"console_sessions", "self_confirmations", "consents", "events"}
 INSERTABLE = {
     "console_sessions": {"id_hash", "instance_id", "subject", "user_id", "key_token", "role",
-                         "idle_expiry", "absolute_expiry"},
+                         "idle_expiry", "absolute_expiry", "team_ids"},
     "consents": {"id", "instance_id", "org_id", "human_user_id", "server_id", "purpose",
                  "data_scope", "text_version", "source", "granted_at", "valid_until",
                  "registered_by"},
@@ -231,7 +231,7 @@ def test_the_migrations_apply_for_a_role_that_is_not_a_superuser():
                                                   password="pw"))) as conn:
             assert not scalar(conn, "SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
             applied = migrate.apply_migrations(conn)
-            assert applied[-1] == "010_staff_owner"
+            assert "010_staff_owner" in applied
             owners = {r[0] for r in conn.execute(
                 "SELECT pg_get_userbyid(p.proowner) FROM pg_proc p JOIN pg_namespace n ON"
                 " n.oid = p.pronamespace WHERE n.nspname = 'mint' AND p.proname LIKE 'staff\\_%'")}
