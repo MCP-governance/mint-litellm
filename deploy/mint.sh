@@ -26,9 +26,26 @@ ensure_secrets() {
     chmod 700 "$dir"
 }
 
+# 비밀값은 .env에 없거나 비어 있을 때만 새로 만든다(base64url, 무작위 32바이트). 이미 있는 값은 바꾸지 않는다.
+random_secret() {
+    head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n'
+}
+
+ensure_generated() {
+    local name
+    for name in MINT_EXPORT_HMAC_KEY MINT_WORKER_DB_PASSWORD MINT_STAFF_DB_PASSWORD; do
+        if [ -z "$(env_value "$name")" ]; then
+            sed -i "/^${name}=/d" .env
+            printf '%s=%s\n' "$name" "$(random_secret)" >> .env
+        fi
+    done
+    chmod 600 .env
+}
+
 require_env() {
     [ -f .env ] || fail ".env가 없습니다. .env.example을 복사해 값을 채우십시오."
     ensure_secrets
+    ensure_generated
 }
 
 # 관리자 권한(마이그레이션·역할 생성)이 필요한 명령은 슈퍼유저 접속으로 실행한다.
@@ -37,6 +54,8 @@ admin_cli() {
         -e "MINT_DATABASE_URL=postgresql://postgres:$(env_value POSTGRES_PASSWORD)@postgres:5432/mint" \
         -e "MINT_PLUGIN_DB_PASSWORD=$(env_value MINT_PLUGIN_DB_PASSWORD)" \
         -e "MINT_CONTROL_DB_PASSWORD=$(env_value MINT_CONTROL_DB_PASSWORD)" \
+        -e "MINT_WORKER_DB_PASSWORD=$(env_value MINT_WORKER_DB_PASSWORD)" \
+        -e "MINT_STAFF_DB_PASSWORD=$(env_value MINT_STAFF_DB_PASSWORD)" \
         control "$@"
 }
 
@@ -65,6 +84,7 @@ cmd_up() {
     admin_cli init --out /app/config/litellm.mint.yaml >/dev/null
     ensure_bundle
     "${COMPOSE[@]}" up -d opa litellm
+    "${COMPOSE[@]}" --profile worker up -d worker
     echo "기동했습니다. 상태: ./mint.sh status"
 }
 
@@ -97,6 +117,7 @@ cmd_upgrade() {
     "${COMPOSE[@]}" up -d --wait postgres
     admin_cli init --out /app/config/litellm.mint.yaml >/dev/null
     "${COMPOSE[@]}" up -d litellm
+    "${COMPOSE[@]}" --profile worker up -d worker
     echo "업그레이드했습니다."
 }
 
