@@ -103,8 +103,9 @@ class FakeLiteLLM:
         if method != "GET":
             if self.before_write is not None:
                 self.before_write(method, path, body)
-            if path in self.fail_writes:
-                return self.fail_writes[path], {"error": "forced"}
+            forced = self.fail_writes.get(f"{method} {path}", self.fail_writes.get(path))
+            if forced is not None:
+                return forced, {"error": "forced"}
         if method == "GET" and path == "/key/info":
             key = self.keys.get(params.get("key", ""))
             return (200, {"key": key["key"], "info": copy.deepcopy(key)}) if key else (404, {})

@@ -18,7 +18,7 @@ from typing import Any
 import psycopg
 
 from mint_litellm.control.db.connection import fetchall, fetchone
-from mint_litellm.types.canonical import sha256
+from mint_litellm.types.canonical import credential_scope, sha256
 from mint_litellm.types.ids import new_uuid7
 
 ACTOR = "mint-worker"
@@ -47,35 +47,47 @@ class Desired:
     approvals: tuple[str, ...] = ()
 
 
-def expected_pin(
-    conn: psycopg.Connection, instance_id: str, server_id: str
-) -> dict[str, str] | None:
-    """계약을 관리하는 서버의 승인 계약 ``{도구: pin 해시}``. 관리 서버가 아니거나 없으면 None."""
-    managed = fetchone(
+def server_scope(conn: psycopg.Connection, instance_id: str, server_id: str) -> str | None:
+    """계약을 관리하는 서버의 자격 범위 하나(배포 계약의 인증 방식에서). 관리 서버가 아니면 None."""
+    row = fetchone(
         conn,
-        "SELECT 1 AS x FROM mint.servers WHERE instance_id = %s AND server_id = %s"
+        "SELECT auth_type FROM mint.servers WHERE instance_id = %s AND server_id = %s"
         " AND contract_status = 'managed'",
         (instance_id, server_id),
     )
-    if managed is None:
+    return None if row is None else credential_scope(row["auth_type"])
+
+
+def expected_pin(
+    conn: psycopg.Connection, instance_id: str, server_id: str
+) -> dict[str, str] | None:
+    """계약을 관리하는 서버의 승인 계약 ``{도구: pin 해시}``(그 서버의 자격 범위 하나만).
+
+    관리 서버가 아니면 None, 승인 계약이 하나도 없으면 빈 맵이다.
+    """
+    scope = server_scope(conn, instance_id, server_id)
+    if scope is None:
         return None
     rows = fetchall(
         conn,
         "SELECT tool, pin_sha256 FROM mint.tool_contracts WHERE instance_id = %s"
-        " AND server_id = %s AND status = 'approved' ORDER BY credential_scope DESC, tool",
-        (instance_id, server_id),
+        " AND server_id = %s AND credential_scope = %s AND status = 'approved' ORDER BY tool",
+        (instance_id, server_id, scope),
     )
-    return {r["tool"]: r["pin_sha256"] for r in rows} or None
+    return {r["tool"]: r["pin_sha256"] for r in rows}
 
 
 def pin_satisfied(conn: psycopg.Connection, instance_id: str, server_id: str) -> bool:
     """서버의 고정(pin)이 승인 계약과 맞는가. 계약을 관리하지 않는 서버는 언제나 참이다.
 
     맞다는 것은 ``observed``이고 ``applied_sha256``이 승인 계약의 해시 맵과 같다는 뜻이다.
+    승인 계약이 하나도 없는 관리 서버는 거짓이다(활성화하지 않는다).
     """
     expected = expected_pin(conn, instance_id, server_id)
     if expected is None:
         return True
+    if not expected:
+        return False
     row = fetchone(
         conn,
         "SELECT observed, applied_sha256 FROM mint.litellm_grants WHERE instance_id = %s"

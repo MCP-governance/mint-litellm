@@ -29,7 +29,6 @@ from .test_sync import (  # noqa: E402
     grant,
     job_rows,
     past,
-    reconcile,
 )
 
 url = test_sync.url
@@ -43,13 +42,15 @@ NEW = {**TOOL, "input_schema": {"type": "object", "properties": {"q": {"type": "
 DIGEST = sha256({"read": pin_sha256(TOOL)})
 
 
-def add_contract(admin, tool_name="read", value=TOOL, status="approved", server="srv-1") -> str:
+def add_contract(
+    admin, tool_name="read", value=TOOL, status="approved", server="srv-1", scope="server"
+) -> str:
     cid = new_uuid7()
     admin.execute(
         "INSERT INTO mint.tool_contracts(id,instance_id,server_id,credential_scope,tool,"
         "canonical_text,sha256,pin_sha256,risk_grade,action_type,source)"
-        " VALUES (%s,%s,%s,'server',%s,%s,%s,%s,'low','read','intake')",
-        (cid, INSTANCE, server, tool_name, canonical_text(value), sha256(value),
+        " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'low','read','intake')",
+        (cid, INSTANCE, server, scope, tool_name, canonical_text(value), sha256(value),
          pin_sha256(value)))
     if status == "approved":
         admin.execute("UPDATE mint.tool_contracts SET status = 'approved' WHERE id = %s", (cid,))
@@ -121,12 +122,84 @@ def test_a_different_tool_set_is_a_mismatch_in_both_directions(admin, fake, work
     enqueue(admin, "sync_server", "srv-1")
     drain(worker)
     assert alerts(admin, "sync_divergence")[0]["subject"]["tools"] == ["extra"]
+    admin.execute("UPDATE mint.servers SET deployment_drift = false,"
+                  " deployment_drift_fields = NULL")
     fake.servers["srv-1"]["tools"] = {}  # 승인된 도구가 없어졌다
-    reconcile(admin)
     enqueue(admin, "sync_server", "srv-1")
     drain(worker)
-    assert alerts(admin, "sync_divergence")[0]["count"] >= 2
+    assert alerts(admin, "sync_divergence")[0]["count"] == 2
     assert grant(admin, "pin", "server", "srv-1", "srv-1")["applied_sha256"] is None
+
+
+def test_a_mismatch_creates_pin_candidates_blocks_the_server_and_requests_reapproval(
+    admin, fake, worker
+):
+    managed_world(admin, fake, tools={"read": NEW, "added": TOOL})
+    enqueue(admin, "sync_server", "srv-1")
+    drain(worker)
+    rows = admin.execute(
+        "SELECT tool, status, source, drift FROM mint.tool_contracts ORDER BY tool, status"
+    ).fetchall()
+    assert rows == [("added", "candidate", "pin", "none"),
+                    ("read", "approved", "intake", "input_schema"),  # 승인본은 드리프트로 막힌다
+                    ("read", "candidate", "pin", "none")]
+    server = fetchone(admin, "SELECT deployment_drift, deployment_drift_fields FROM mint.servers")
+    assert server == {"deployment_drift": True, "deployment_drift_fields": ["pin_reapproval"]}
+    requested = events(admin, "reapproval_requested")
+    assert sorted(e["payload"]["tool"] for e in requested) == ["added", "read"]
+    assert all(e["payload"]["source"] == "pin" for e in requested)
+    assert len(events(admin, "contract_drift_detected")) == 1
+    assert len(alerts(admin, "sync_divergence")) == 1  # 경보도 그대로 낸다
+    enqueue(admin, "sync_server", "srv-1")  # 드리프트 중에는 다시 고정하지 않고 후보도 늘지 않는다
+    drain(worker)
+    assert len(pin_calls(fake)) == 1
+    assert len(events(admin, "reapproval_requested")) == 2
+
+
+def test_only_the_contracts_of_the_servers_one_scope_are_used(admin, fake, worker):
+    managed_world(admin, fake)
+    add_contract(admin, "read", NEW, scope="per_user")
+    assert sync_state.expected_pin(admin, INSTANCE, "srv-1") == {"read": pin_sha256(TOOL)}
+    admin.execute("UPDATE mint.servers SET auth_type = 'oauth_delegate'")  # 범위가 바뀐다
+    assert sync_state.expected_pin(admin, INSTANCE, "srv-1") == {"read": pin_sha256(NEW)}
+
+
+def test_a_managed_server_without_approved_contracts_is_never_satisfied(admin, fake, worker):
+    approval = managed_world(admin, fake)
+    admin.execute("UPDATE mint.tool_contracts SET status = 'superseded'")
+    assert sync_state.expected_pin(admin, INSTANCE, "srv-1") == {}
+    assert sync_state.pin_satisfied(admin, INSTANCE, "srv-1") is False
+    enqueue(admin, "sync_server", "srv-1")
+    drain(worker)
+    assert pin_calls(fake) == []
+    assert approval_status(admin, approval) == "pending"
+
+
+def test_a_failed_unpin_is_alerted_retried_and_keeps_the_drift_marker(admin, fake, worker):
+    managed_world(admin, fake, tools={"read": NEW})
+    fake.fail_writes["DELETE /v1/mcp/server/srv-1/pin"] = 500
+    enqueue(admin, "sync_server", "srv-1")
+    drain(worker)
+    assert fake.servers["srv-1"]["pinned"] is True  # 풀지 못했다
+    reasons = sorted(a["subject"]["reason"] for a in alerts(admin, "sync_divergence"))
+    assert reasons == ["pin_mismatch", "unpin_failed"]
+    marker = "SELECT deployment_drift, deployment_drift_fields FROM mint.servers"
+    assert fetchone(admin, marker)["deployment_drift"] is True
+    [job] = job_rows(admin, "sync_server")
+    assert (job["status"], job["last_error_code"]) == ("pending", "litellm_http_500")
+    past(admin)
+    drain(worker)  # 여전히 실패: 표지는 유지되고 다시 시도한다
+    assert fetchone(admin, marker)["deployment_drift"] is True
+    assert len(pin_calls(fake, "DELETE")) == 2
+    fake.fail_writes.clear()
+    past(admin)
+    drain(worker)
+    assert fake.servers["srv-1"]["pinned"] is False  # 다음 실행이 다시 풀었다
+    assert fetchone(admin, marker)["deployment_drift"] is True  # 재승인 전까지 막힌다
+    failed = [a for a in alerts(admin, "sync_divergence")
+              if a["subject"]["reason"] == "unpin_failed"]
+    assert failed[0]["status"] == "resolved"
+    assert len(pin_calls(fake)) == 1  # 풀기 재시도는 다시 고정하지 않는다
 
 
 def test_a_mismatch_also_holds_back_key_permissions(admin, fake, worker):
