@@ -16,6 +16,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validato
 from mint_litellm.types.frozen import FrozenDict
 from mint_litellm.types.identity import Principal
 from mint_litellm.types.reason_codes import (
+    NON_OBSERVABLE_DRIFT,
     OBSERVATION_CANDIDATES,
     Reason,
     make_reason_code,
@@ -306,6 +307,8 @@ def _is_converted(
         return False
     if family is Reason.POLICY_DETECT:
         return policy_observable and qualifier in observation.observable_policy_ids
+    if family is Reason.CONTRACT_DRIFT and qualifier in NON_OBSERVABLE_DRIFT:
+        return False
     return True
 
 

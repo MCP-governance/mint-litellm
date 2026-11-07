@@ -195,3 +195,43 @@ def test_legacy_tool_call_and_discovery_are_unchanged(tmp_path):
     assert result.allowed
     contract = next(s for s in result.snapshot.stages if s.stage == Stage.CONTRACT)
     assert contract.missing_reason == "unsupported_stage"
+
+
+@pytest.mark.parametrize(
+    "server_changes,contracts,reason",
+    [
+        ({"pin_blocked": True, "deployment_drift": True}, None, "pin"),
+        ({"pin_blocked": True}, (), "pin"),  # 도구 계약이 없어도 고정 사유가 우선이다
+        ({"approved_contracts": 0}, (), "no_contract"),
+    ],
+)
+def test_pin_safety_blocks_cannot_be_relaxed_by_observe_mode(
+    tmp_path, server_changes, contracts, reason
+):
+    """고정 불일치·해제 미완료·승인 계약 0개는 CONTRACT_DRIFT를 관측으로 설정해도 막는다."""
+    values = {"settings": SettingsRow(mode=Mode.OBSERVE)}
+    if contracts is not None:
+        values["tool_contracts"] = contracts
+    snap = managed(
+        server=server_row(contract_status="managed", last_observed_at=NOW, **server_changes),
+        **values,
+    )
+    h = harness(tmp_path, snap)
+    h.deps.config = replace(h.deps.config, mode_ceiling=Mode.OBSERVE)
+    result = asyncio.run(evaluate_request(request(), h.deps))
+    assert not result.allowed
+    assert f"CONTRACT_DRIFT_{reason}" in [f.reason_code for f in result.snapshot.findings]
+
+
+def test_other_drift_kinds_still_convert_in_observe_mode(tmp_path):
+    """고정 사유가 아닌 계약 사유(배포 변경 등)는 지금처럼 관측 모드에서 허용으로 전환된다."""
+    snap = managed(
+        server=server_row(
+            contract_status="managed", last_observed_at=NOW, deployment_drift=True,
+            approved_contracts=1,
+        ),
+        settings=SettingsRow(mode=Mode.OBSERVE),
+    )
+    h = harness(tmp_path, snap)
+    h.deps.config = replace(h.deps.config, mode_ceiling=Mode.OBSERVE)
+    assert asyncio.run(evaluate_request(request(), h.deps)).allowed

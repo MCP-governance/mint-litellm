@@ -472,8 +472,9 @@ def test_credentials_required_then_registry_first_checks_again_with_the_stored_c
     world.drain()
     row = world.intake(intake_id)
     assert (row["status"], row["needs_registry_credentials"]) == ("passed", False)
-    # 승인 1회, 값이 이미 꺼져 있어도 승인 직후 항상 끄기를 부르고 읽어 확인한다
+    # 승인 1회: 승인 전에 대기 서버를 먼저 끄고, 승인 직후에는 값과 상관없이 다시 끄고 읽어 확인한다
     assert world.stub.writes() == [
+        ("PUT", "/v1/mcp/server"),
         ("PUT", "/v1/mcp/server/sub-1/approve"),
         ("PUT", "/v1/mcp/server"),
     ]
@@ -501,18 +502,20 @@ def registry_first_with_all_keys(world):
 def test_registry_first_closes_allow_all_keys_right_after_the_approval_and_reads_it_back(world):
     intake_id = registry_first_with_all_keys(world)
     assert world.stub.writes() == [
+        ("PUT", "/v1/mcp/server"),  # 승인 전: 대기 중인 서버를 먼저 닫는다
         ("PUT", "/v1/mcp/server/sub-1/approve"),
-        ("PUT", "/v1/mcp/server"),
+        ("PUT", "/v1/mcp/server"),  # 승인 뒤: 다시 닫고 읽어 확인한다
     ]
     order = [
         (m, p)
         for m, p, _ in world.stub.requests
         if p.startswith("/v1/mcp/server/sub-1") or p == "/v1/mcp/server"
     ]
-    put = order.index(("PUT", "/v1/mcp/server"))
+    put = order.index(("PUT", "/v1/mcp/server/sub-1/approve")) + 1
+    assert order[put] == ("PUT", "/v1/mcp/server")
     assert ("GET", "/v1/mcp/server/sub-1") in order[put + 1 :]  # 끈 뒤 다시 읽어 확인
-    update = [b for m, p, b in world.stub.requests if (m, p) == ("PUT", "/v1/mcp/server")][0]
-    assert update == {"server_id": "sub-1", "allow_all_keys": False}
+    updates = [b for m, p, b in world.stub.requests if (m, p) == ("PUT", "/v1/mcp/server")]
+    assert updates == [{"server_id": "sub-1", "allow_all_keys": False}] * 2
     assert world.stub.submissions[0]["allow_all_keys"] is False
     assert world.intake(intake_id)["status"] == "passed"
     assert fetchall(world.conn, "SELECT * FROM mint.alerts") == []
@@ -535,6 +538,18 @@ def test_when_allow_all_keys_cannot_be_closed_the_intake_stops_and_an_alert_open
         "sub-1",
     )
     assert [e["payload"]["kind"] for e in world.events("alert_opened")] == ["sync_divergence"]
+
+
+def test_a_close_that_fails_after_the_approval_isolates_the_submission_with_a_reject(world):
+    world.stub.close_works = False
+    intake_id = registry_first_with_all_keys(world)
+    assert world.intake(intake_id)["status"] == "indeterminate"
+    writes = world.stub.writes()
+    assert ("PUT", "/v1/mcp/server/sub-1/approve") in writes
+    assert writes[-1] == ("PUT", "/v1/mcp/server/sub-1/reject")  # 승인 뒤 못 끄면 격리한다
+    assert world.stub.submissions[0]["approval_status"] == "rejected"
+    assert {a["kind"] for a in fetchall(world.conn, "SELECT kind FROM mint.alerts")} == {
+        "sync_divergence"}
 
 
 def test_a_failed_close_blocks_approve_and_except_but_not_reject(world):
@@ -1155,3 +1170,62 @@ def test_without_bundle_data_the_scan_and_the_grade_are_indeterminate(world):
         "description_scan": "POLICY_DATA_UNAVAILABLE",
         "risk_grade": "POLICY_DATA_UNAVAILABLE",
     }
+
+
+@pytest.mark.parametrize(
+    "flow,expected",
+    [("client_credentials", "pass"), ("authorization_code", "indeterminate"),
+     (None, "indeterminate")],
+)
+def test_an_oauth2_submission_is_a_server_scope_only_with_a_confirmed_client_credentials_flow(
+    world, flow, expected
+):
+    world.allow("auth_server", "https://idp.test")
+    world.stub.submissions = [submission(
+        "sub-1", auth_type="oauth2", issuer="https://idp.test", oauth2_flow=flow)]
+    poll(world)
+    world.call(lambda ctx: svc.create(ctx, world.admin_client, "sub-1", **INPUTS))
+    world.drain()
+    intake_id = str(fetchone(world.conn, "SELECT id FROM mint.intakes")["id"])
+    by_check = {c["check"]: c for c in world.checks(intake_id)}
+    assert by_check["oauth_issuer_allowlist"]["result"] == expected
+    if expected == "indeterminate":
+        assert by_check["oauth_issuer_allowlist"]["reason_code"] == "OAUTH2_FLOW_UNCONFIRMED"
+        assert world.intake(intake_id)["status"] == "indeterminate"
+
+
+def test_a_lost_approval_response_still_closes_the_server_or_isolates_it(world, monkeypatch):
+    """승인이 반영된 뒤 응답이 유실돼도 닫기·reject 경로로 간다(사전 닫기가 실패한 경우 포함)."""
+    from mint_litellm.control.litellm_admin import LiteLLMError
+    from mint_litellm.control.litellm_control import LiteLLMControl
+
+    real = LiteLLMControl.approve_submission
+
+    def lost(self, server_id):
+        real(self, server_id)  # 승인은 반영된다
+        raise LiteLLMError("response lost")
+
+    monkeypatch.setattr(LiteLLMControl, "approve_submission", lost)
+    world.stub.close_works = False  # 사전 닫기도, 승인 뒤 닫기도 반영되지 않는다
+    intake_id = registry_first_with_all_keys(world)
+    writes = world.stub.writes()
+    assert ("PUT", "/v1/mcp/server/sub-1/approve") in writes
+    assert writes[-1] == ("PUT", "/v1/mcp/server/sub-1/reject")  # 열린 채 남지 않는다
+    assert world.stub.submissions[0]["approval_status"] == "rejected"
+    assert world.intake(intake_id)["status"] == "indeterminate"
+
+
+def test_a_lost_approval_response_with_a_working_close_ends_closed_and_active(world, monkeypatch):
+    from mint_litellm.control.litellm_admin import LiteLLMError
+    from mint_litellm.control.litellm_control import LiteLLMControl
+
+    real = LiteLLMControl.approve_submission
+
+    def lost(self, server_id):
+        real(self, server_id)
+        raise LiteLLMError("response lost")
+
+    monkeypatch.setattr(LiteLLMControl, "approve_submission", lost)
+    registry_first_with_all_keys(world)
+    assert world.stub.submissions[0]["allow_all_keys"] is False
+    assert world.stub.submissions[0]["approval_status"] == "active"

@@ -220,12 +220,31 @@ class Worker:
                 ctx.cancel.set()
                 return
 
+    def _restore_in_flight(self) -> bool:
+        """게시를 기다리는 복원 요청이 있는가. 있으면 증거 파일을 쓰지 않는다.
+
+        복원 요청은 만들 때의 ``latest.json``에 결속하므로 그 사이에 정상 체크포인트가 파일을
+        바꾸면 요청이 거절된다. 작업이 이미 실패로 끝난 요청은 세지 않는다(영구 보류 방지).
+        """
+        assert self.conn is not None
+        row = fetchone(
+            self.conn,
+            "SELECT EXISTS (SELECT 1 FROM mint.restore_requests r JOIN mint.jobs j"
+            " ON j.instance_id = r.instance_id AND j.kind = 'restore_publish'"
+            " AND j.target_ref = r.id::text AND j.status IN ('pending', 'running')"
+            " WHERE r.instance_id = %s AND r.status = 'pending') AS busy",
+            (self.instance_id,),
+        )
+        return bool(row and row["busy"])
+
     def _run(self, job: dict) -> None:
         assert self.conn is not None
         conn, job_id = self.conn, job["id"]
         verdict, kind = self.verdict, job["kind"]
-        if (verdict.blocked and jobs.KINDS[kind].external_write) or (
-            verdict.held and kind in jobs.EVIDENCE_KINDS
+        if (
+            (verdict.blocked and jobs.KINDS[kind].external_write)
+            or (verdict.held and kind in jobs.EVIDENCE_KINDS)
+            or (kind in jobs.EVIDENCE_KINDS and self._restore_in_flight())
         ):
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
             return

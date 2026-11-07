@@ -328,6 +328,10 @@ def contract_result(
     if server is None or server.contract_status != "managed":
         return UNSUPPORTED_STAGE
     scope = credential_scope(server.auth_type)
+    if server.pin_blocked:
+        return StageResult.finding(Reason.CONTRACT_DRIFT, "pin")
+    if server.approved_contracts == 0:
+        return StageResult.finding(Reason.CONTRACT_DRIFT, "no_contract")
     contract = next(
         (c for c in snapshot.tool_contracts if c.credential_scope == scope and c.tool == tool), None
     )

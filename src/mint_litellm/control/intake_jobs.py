@@ -98,11 +98,36 @@ def _close_all_keys(job: JobContext, client: Any, server_id: str) -> None:
         raise AllKeysNotClosed
 
 
+def _isolate_submission(job: JobContext, client: Any, server_id: str) -> None:
+    """승인 뒤에도 ``allow_all_keys``를 끄지 못한 서버는 제출 ``reject``로 격리한다(보상 절차).
+
+    열린 채 레지스트리에 남는 것보다 거절 상태가 안전하다. 거절도 못 하면 경보로 남는다.
+    """
+    try:
+        done = client.reject_submission(server_id, "allow_all_keys를 끄지 못해 격리")
+    except LiteLLMError:
+        done = "failed"
+    if done not in ("done", "already"):
+        _alert_divergence(job, server_id, "submission_isolation_failed", result=done)
+
+
+def _status_after_lost_approval(client: Any, server_id: str) -> str | None:
+    """승인 응답이 유실된 뒤 서버의 ``approval_status``. 다시 읽지 못하면 None(불확실)."""
+    try:
+        item = next((i for i in client.list_submissions() if i.get("server_id") == server_id),
+                    None) or client.get_server(server_id)
+    except LiteLLMError:
+        return None
+    return (item or {}).get("approval_status")
+
+
 def _gate(job: JobContext, client: Any, server_id: str, mode: str) -> str | None:
     """연결 검사 직전에 LiteLLM 서버 상태를 맞춘다. 사유 코드가 돌아오면 검사를 하지 않는다.
 
-    ``registry``: 제출을 레지스트리에 올리고(승인) **값과 상관없이** 승인 직후 같은 작업에서
-    ``allow_all_keys``를 끄고 다시 읽어 확인한다. 그 밖의 방식: 이미 레지스트리에 있는 서버가
+    ``registry``: 승인 전에 대기 중인 서버에 쓸 수 있으면 ``allow_all_keys``를 먼저 끈다(두 외부
+    쓰기 사이의 노출을 줄인다). 제출을 레지스트리에 올린(승인) 뒤에는 **값과 상관없이** 같은
+    작업에서 다시 끄고 읽어 확인하며, 그래도 못 끄면 제출을 ``reject``로 격리한다. 그 밖의 방식:
+    이미 레지스트리에 있는 서버가
     열려 있으면(``allow_all_keys=true``) 다시 끈다. 끄지 못하면 ``AllKeysNotClosed``이다.
     """
     if mode == "registry":
@@ -111,9 +136,26 @@ def _gate(job: JobContext, client: Any, server_id: str, mode: str) -> str | None
         if item is None:
             return "SUBMISSION_GONE"
         if item.get("approval_status") == "pending_review":
-            if client.approve_submission(server_id) == "refused":
+            try:  # 대기 중인 서버에 쓸 수 없으면(오류·읽기 불일치) 승인 뒤 절차로 넘어간다
+                client.close_all_keys(server_id)
+            except LiteLLMError:
+                pass
+            lost: LiteLLMError | None = None
+            try:
+                approved = client.approve_submission(server_id)
+            except LiteLLMError as error:  # 응답이 유실됐어도 승인은 반영됐을 수 있다
+                approved, lost = "unknown", error
+            if approved == "refused":
                 return "APPROVE_REFUSED"
-        _close_all_keys(job, client, server_id)
+            if lost is not None and _status_after_lost_approval(client, server_id) not in (
+                "active", None
+            ):
+                raise lost  # 반영되지 않았다: 재시도한다(닫기는 이미 시도했다)
+        try:
+            _close_all_keys(job, client, server_id)
+        except AllKeysNotClosed:
+            _isolate_submission(job, client, server_id)
+            raise
         return None
     entry = client.get_server(server_id)
     if (
@@ -123,6 +165,17 @@ def _gate(job: JobContext, client: Any, server_id: str, mode: str) -> str | None
     ):
         _close_all_keys(job, client, server_id)
     return None
+
+
+def _oauth2_flow(client: Any, server_id: str) -> str | None:
+    """LiteLLM에 저장된 서버 설정의 ``oauth2_flow``. 읽지 못하거나 없으면 None(미확인)."""
+    try:
+        entry = next((i for i in client.list_submissions() if i.get("server_id") == server_id),
+                     None) or client.get_server(server_id)
+    except LiteLLMError:
+        return None
+    flow = (entry or {}).get("oauth2_flow")
+    return flow if isinstance(flow, str) else None
 
 
 def _run_checks(
@@ -159,8 +212,10 @@ def _run_checks(
             out = checks.url_guard(contract and contract["url"], contract and contract["transport"],
                                    allowlists, ports)
         elif name == "oauth_issuer_allowlist":
+            auth = contract and contract["auth_type"]
             out = checks.oauth_issuer_allowlist(
-                contract and contract["auth_type"], contract and contract["issuer"], allowlists)
+                auth, contract and contract["issuer"], allowlists,
+                _oauth2_flow(client, server_id) if auth == "oauth2" else None)
         elif name in ("connection", "definitions"):
             probe = dict(spec or {})
             blocked = None

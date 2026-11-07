@@ -9,6 +9,7 @@
 from typing import Any
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 from mint_litellm.control import exports
 from mint_litellm.control.context import Context, Operator
@@ -17,7 +18,7 @@ from mint_litellm.control.errors import ControlError, forbidden, separation_of_d
 from mint_litellm.control.services import restore_rows
 from mint_litellm.control.services.base import enqueue_job
 from mint_litellm.control.stage2_config import Stage2Settings
-from mint_litellm.restore import judge
+from mint_litellm.restore import files, judge
 from mint_litellm.types.events import EventKind
 from mint_litellm.types.ids import new_uuid7
 
@@ -31,23 +32,24 @@ def _read(settings: Stage2Settings, instance_id: str) -> judge.FileState:
     return judge.read_files(settings.export_dir, instance_id, exports.keys(settings))
 
 
-def compare(conn: psycopg.Connection, instance_id: str, items: list[dict]) -> list[dict]:
-    """파일의 항목마다 DB의 현재 값과 비교해 어긋난 것만 돌려준다."""
+def compare(
+    conn: psycopg.Connection, instance_id: str, items: list[dict], seq: int | None = None
+) -> list[dict]:
+    """파일의 항목마다 DB의 현재 값과 비교해 어긋난 것만 돌려준다(판정과 같은 SQL).
+
+    ``problem``: ``missing_row``(행 없음) · ``reapply``(뒤처짐·정당한 근거 없는 해제) ·
+    ``content``(같은 판본인데 행 내용이 다름). ``seq``는 파일의 봉인 끝(해제 사건 탐색 기준).
+    """
+    if not items:
+        return []
+    rows = fetchall(
+        conn, judge.ITEM_PROBLEMS_SQL, {"i": instance_id, "items": Jsonb(items), "seq": seq})
+    by_key = {(r["kind"], r["id"]): r for r in rows}
     found = []
     for item in items:
-        current = restore_rows._current(conn, instance_id, item["kind"], item["id"])
-        if current is None:
-            found.append({**item, "problem": "missing_row"})
-            continue
-        _table, _column, status, *_ = restore_rows._META[item["kind"]]
-        if status is not None:
-            state = current[status]
-        elif item["kind"] == "denial":
-            state = "active" if current["lifted_at"] is None else "lifted"
-        else:
-            state = "active" if current["revoked_at"] is None else "revoked"
-        if state != item["state"] or current["state_version"] < item["state_version"]:
-            found.append({**item, "problem": "reapply", "db_state": state})
+        row = by_key.get((item["kind"], item["id"]))
+        if row is not None:
+            found.append({**item, "problem": row["problem"], "db_state": row["db_state"]})
     return found
 
 
@@ -77,7 +79,8 @@ def check(conn: psycopg.Connection, instance_id: str, settings: Stage2Settings) 
         "last_export_at": since,
         "anchor_ok": bool(facts["anchor_ok"]),
         "mismatch": verdict.state != judge.OK,
-        "items": [_brief(p) for p in compare(conn, instance_id, negative.get("items") or [])],
+        "items": [_brief(p) for p in compare(
+            conn, instance_id, negative.get("items") or [], latest.get("to_seal_seq"))],
         # 마지막 성공 전송 이후 구간에 활동이 있었던 서버: LiteLLM 권한의 현재값을 점검한다
         "review_servers": [r["server_id"] for r in activity],
     }
@@ -93,16 +96,18 @@ def _sequence(conn: psycopg.Connection, instance_id: str, epoch: int, kind: Even
 
 
 def _request(
-    ctx: Context, kind: str, reason: str, file_epoch: int | None, target: int,
-    cause: str | None, second: str | None,
+    ctx: Context, settings: Stage2Settings, kind: str, reason: str, file_epoch: int | None,
+    target: int, cause: str | None, second: str | None,
 ) -> str:
+    # 요청은 그 시점의 latest.json(외부 기준)에 결속한다. 복원 식별자는 요청 id이다.
     request_id = str(new_uuid7())
+    bound = files.file_sha256(files.latest_path(settings.export_dir, ctx.instance_id))
     ctx.conn.execute(
         "INSERT INTO mint.restore_requests (id, instance_id, kind, reason, requested_by,"
-        " second_approver, file_epoch, target_epoch, cause) VALUES (%s, %s, %s, %s, %s, %s, %s,"
-        " %s, %s)",
+        " second_approver, file_epoch, target_epoch, cause, bound_latest) VALUES (%s, %s, %s, %s,"
+        " %s, %s, %s, %s, %s, %s)",
         (request_id, ctx.instance_id, kind, reason, ctx.operator.name, second, file_epoch,
-         target, cause),
+         target, cause, bound),
     )
     enqueue_job(ctx, "restore_publish", request_id, f"restore_publish:{request_id}")
     return request_id
@@ -135,7 +140,10 @@ def attest(
     items = (state.negative or {}).get("items") or []
     rank = {kind: i for i, kind in enumerate(restore_rows.ORDER)}
     reapplied, failed = [], []
-    pending = compare(ctx.conn, ctx.instance_id, items)
+    seq = state.latest.get("to_seal_seq")
+    pending = compare(ctx.conn, ctx.instance_id, items, seq)
+    # 같은 판본인데 행 내용이 다른 항목은 되돌릴 수 없는 열이라 admin 2인이 인정해야 한다
+    actionable = [p for p in pending if p["problem"] != "content"]
     cause, second_name = None, None
     if not pending:  # 되돌릴 부정 상태가 없으면 봉인 앵커 불일치를 인정하는 일뿐이므로 2인이다
         facts = fetchone(ctx.conn, judge.FACTS_SQL, judge.facts_params(state, ctx.instance_id))
@@ -143,7 +151,7 @@ def attest(
             second_name = _second_admin(ctx, second).name
             cause = "anchor"
     with ctx.conn.transaction():
-        for problem in sorted(pending, key=lambda p: rank[p["kind"]]):
+        for problem in sorted(actionable, key=lambda p: rank[p["kind"]]):
             try:
                 with ctx.conn.transaction():
                     restore_rows.restore_item(ctx.conn, ctx.instance_id, problem)
@@ -158,6 +166,9 @@ def attest(
                 + ", ".join(f"{f['kind']}:{f['id']}({f['reason']})" for f in failed)
                 + ". 부모 행이 없으면 restore accept-stale(admin 2인)을 쓰십시오."
             )
+        if any(p["problem"] == "content" for p in compare(ctx.conn, ctx.instance_id, items, seq)):
+            second_name = _second_admin(ctx, second).name
+            cause = "content"
         target = file_epoch + 1
         current = fetchone(
             ctx.conn, "SELECT epoch FROM mint.state_epoch WHERE instance_id = %s",
@@ -168,7 +179,8 @@ def attest(
             ctx.conn.execute(
                 "SELECT mint.restore_attest_epoch(%s, %s)", (ctx.instance_id, current)
             )
-        request_id = _request(ctx, "attest", reason, file_epoch, current, cause, second_name)
+        request_id = _request(
+            ctx, settings, "attest", reason, file_epoch, current, cause, second_name)
         ctx.emit(EventKind.RESTORE_ATTESTED, file_epoch,
                  _sequence(ctx.conn, ctx.instance_id, file_epoch, EventKind.RESTORE_ATTESTED),
                  {"reason": reason, "file_epoch": file_epoch, "db_epoch": current,
@@ -198,7 +210,8 @@ def accept_stale(
         # 세대를 올려 새 게시가 새 ``exports`` 행(새 해시·봉인 끝)을 갖게 한다
         epoch = current + 1
         ctx.conn.execute("SELECT mint.restore_attest_epoch(%s, %s)", (ctx.instance_id, epoch))
-        request_id = _request(ctx, "stale_accepted", reason, None, epoch, state.error, second.name)
+        request_id = _request(
+            ctx, settings, "stale_accepted", reason, None, epoch, state.error, second.name)
         ctx.emit(EventKind.RESTORE_STALE_ACCEPTED, epoch,
                  _sequence(ctx.conn, ctx.instance_id, epoch, EventKind.RESTORE_STALE_ACCEPTED),
                  {"reason": reason, "second_approver": second.name, "cause": state.error,

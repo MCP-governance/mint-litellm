@@ -90,8 +90,9 @@ def row(url, sql, *params):
         return fetchone(admin, sql, params)
 
 
-def login(world, user=USER, session=SESSION, key=CONSOLE_KEY):
-    staff.start_session(sctx(world, user), session, key, later(minutes=30), later(hours=8))
+def login(world, user=USER, session=SESSION, key=CONSOLE_KEY, teams=()):
+    context = replace(sctx(world, user), team_ids=tuple(teams))
+    staff.start_session(context, session, key, later(minutes=30), later(hours=8))
 
 
 # --- 세션 ------------------------------------------------------------------
@@ -290,7 +291,7 @@ def test_org_membership_is_decided_by_the_first_matching_binding(world):
             " VALUES (gen_random_uuid(), %s, 'beta', 'ops', 'srv')",
             (INSTANCE,),
         )
-    login(world)
+    login(world, teams=("t1",))
     # 사용자 바인딩(acme)이 있으면 팀 바인딩(beta)은 보지 않는다
     with pytest.raises(AdminError) as raised:
         staff.grant_consent(sctx(world), SESSION, **consent_args(org_id="beta"), team_ids=["t1"])
@@ -360,7 +361,6 @@ def test_consent_rechecks_server_after_service_precheck(world, monkeypatch):
 
 @pytest.mark.parametrize("setting", [
     "mint.staff_user_id", "mint.staff_instance_id", "mint.staff_session_id_hash",
-    "mint.staff_team_ids",
 ])
 @pytest.mark.parametrize("empty", [False, True])
 def test_direct_staff_writes_deny_missing_and_empty_context(world, setting, empty):
@@ -368,7 +368,7 @@ def test_direct_staff_writes_deny_missing_and_empty_context(world, setting, empt
     login(world)
     values = {
         "mint.staff_user_id": USER, "mint.staff_instance_id": INSTANCE,
-        "mint.staff_session_id_hash": SESSION, "mint.staff_team_ids": "[]",
+        "mint.staff_session_id_hash": SESSION,
     }
     # 새 연결은 GUC 자체가 없는 경우도 시험한다(풀의 빈 값으로 초기화된 경우와 분리).
     with as_login(world[0], "mint_staff") as conn:
@@ -399,7 +399,7 @@ def test_direct_same_key_confirmation_is_refused_by_db_even_if_service_is_skippe
 
 
 def test_team_bindings_in_several_orgs_allow_only_members_of_that_set(world):
-    login(world)
+    login(world, teams=("team-a", "team-b"))
     with psycopg.connect(world[0]) as admin:
         admin.execute("DELETE FROM mint.org_bindings WHERE subject_type = 'user'")
         for org in ("beta", "gamma"):
@@ -559,3 +559,54 @@ def test_a_staff_write_that_waits_on_a_state_change_is_refused_after_it_commits(
         admin.commit()
     worker.join(10)
     assert isinstance(result["error"], psycopg.errors.InsufficientPrivilege)
+
+
+def test_a_staff_session_not_verified_within_the_window_cannot_write_or_be_found(world):
+    url = world[0]
+    cid = add_confirmation(url)
+    login(world)
+    with psycopg.connect(url) as admin:
+        admin.execute("UPDATE mint.console_sessions SET last_verified_at ="
+                      " now() - interval '11 minutes'")
+    assert staff.find_session(world[2], INSTANCE, SESSION) is None
+    with pytest.raises(AdminError) as raised:
+        staff.confirm(sctx(world), SESSION, cid)
+    assert raised.value.code == AdminCode.FORBIDDEN
+    assert row(url, "SELECT status FROM mint.self_confirmations")["status"] == "pending"
+    # 확인 기한을 넉넉히 준 맥락에서는 같은 세션이 통과하고, DB 함수도 같은 기한을 쓴다
+    wide = staff.StaffContext(world[1], world[2], INSTANCE, USER, consent_max_days=90,
+                              verify_window_seconds=3600)
+    staff.confirm(wide, SESSION, cid)
+    assert row(url, "SELECT status FROM mint.self_confirmations")["status"] == "confirmed"
+
+
+def test_the_database_uses_the_locked_session_teams_not_the_request_teams(world):
+    """요청이 팀 A를 읽은 뒤 재확인이 세션을 팀 B로 바꿔도 쓰기는 B로 판정된다."""
+    url = world[0]
+    with psycopg.connect(url) as admin:
+        admin.execute("INSERT INTO mint.orgs (instance_id, org_id, name) VALUES (%s, 'beta', 'B')",
+                      (INSTANCE,))
+        admin.execute(
+            "INSERT INTO mint.usage_relations (id, instance_id, org_id, server_id, purpose)"
+            " VALUES (gen_random_uuid(), %s, 'beta', 'srv', 'ops')", (INSTANCE,))
+        for team, org in (("team-a", "acme"), ("team-b", "beta")):
+            admin.execute(
+                "INSERT INTO mint.org_bindings (id, instance_id, org_id, subject_type, subject_id,"
+                " created_by) VALUES (gen_random_uuid(), %s, %s, 'team', %s, 'root')",
+                (INSTANCE, org, team))
+        admin.execute("DELETE FROM mint.org_bindings WHERE subject_type = 'user'")
+    login(world, teams=("team-a",))
+    stale = replace(sctx(world), team_ids=("team-a", "team-b"))  # 요청이 읽은 값(GUC로 보내도)
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with staff._staff_transaction(stale, SESSION) as conn:
+            conn.execute(
+                "SELECT set_config('mint.staff_team_ids', '[\"team-b\"]', true)")
+            conn.execute(
+                "SELECT mint.staff_grant_consent(%s, 'beta', 'srv', 'ops', 'all', 'v1', %s)",
+                (uuid.uuid4(), later(days=1)))
+    with psycopg.connect(url) as admin:  # 재확인이 세션 팀을 B로 바꾼다
+        admin.execute("UPDATE mint.console_sessions SET team_ids = '[\"team-b\"]'::jsonb")
+    with staff._staff_transaction(sctx(world), SESSION) as conn:
+        conn.execute(
+            "SELECT mint.staff_grant_consent(%s, 'beta', 'srv', 'ops', 'all', 'v1', %s)",
+            (uuid.uuid4(), later(days=1)))
