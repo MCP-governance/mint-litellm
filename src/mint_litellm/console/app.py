@@ -19,6 +19,7 @@ from mint_litellm.console.core import (
     error_response,
     login_redirect,
     require_csrf,
+    require_origin,
 )
 from mint_litellm.console.templating import render
 from mint_litellm.control.errors import AdminCode, AdminError, ControlError
@@ -31,7 +32,7 @@ CSP = "default-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 
 HEADERS = {
     "Content-Security-Policy": CSP,
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
     "X-Frame-Options": "DENY",
     "Cross-Origin-Opener-Policy": "same-origin",
 }
@@ -96,7 +97,7 @@ def create_app(
     def login_form(request: Request) -> Response:
         return render(request, "login.html", {"error": None})
 
-    @app.post("/login", dependencies=[Depends(require_csrf)])
+    @app.post("/login", dependencies=[Depends(require_origin)])
     def login_submit(
         request: Request, key: str = Form(""), conn: psycopg.Connection = Depends(db)
     ) -> Response:

@@ -124,3 +124,4 @@ pre.json { background: var(--bg-subtle); border: 1px solid var(--border); border
 .login { max-width: 400px; margin: 96px auto; padding: var(--s4); border: 1px solid var(--border); border-radius: 6px; }
 .login h1 { font-size: 20px; }
 .login input { width: 100%; }
+h1 .badge { font-size: 14px; margin-left: var(--s2); vertical-align: middle; }

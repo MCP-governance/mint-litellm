@@ -226,3 +226,25 @@ def test_the_console_refuses_to_start_without_required_settings():
 def test_the_control_key_constant_is_not_used_for_login(world):
     attempt(world, Keys.admin)
     assert all(bearer != CONTROL_KEY for _, bearer, _ in world.stub.requests)
+
+
+def test_logging_in_again_works_while_a_stale_session_cookie_is_present(world):
+    client = world.session_client()
+    world.query("UPDATE mint.console_sessions SET revoked_at = now()")
+    response = client.post("/login", data={"key": Keys.admin})
+    assert response.status_code == 303
+    assert client.get("/").status_code == 200
+
+
+def test_the_login_form_refuses_a_request_from_another_site(world):
+    response = world.client.post(
+        "/login", data={"key": Keys.admin}, headers={"Sec-Fetch-Site": "cross-site"})
+    assert response.status_code == 403
+    assert world.query("SELECT count(*) FROM mint.console_sessions")[0][0] == 0
+
+
+def test_a_browser_that_sends_origin_null_is_accepted_when_fetch_metadata_says_same_origin(world):
+    response = world.client.post(
+        "/login", data={"key": Keys.admin},
+        headers={"Origin": "null", "Sec-Fetch-Site": "same-origin"})
+    assert response.status_code == 303

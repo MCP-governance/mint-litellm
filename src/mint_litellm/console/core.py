@@ -105,15 +105,31 @@ def db(request: Request) -> Iterator[psycopg.Connection]:
         yield conn
 
 
-async def require_csrf(request: Request) -> None:
-    """세션 쿠키로 인증한 변경 요청은 CSRF 토큰(헤더 또는 폼 필드)과 출처가 맞아야 한다."""
+def require_origin(request: Request) -> None:
+    """변경 요청은 같은 출처에서 와야 한다(Fetch Metadata가 있으면 그것을, 없으면 Origin을 본다)."""
     if request.method not in UNSAFE:
         return
     if request.headers.get("authorization", "").lower().startswith("bearer "):
         return
+    site = request.headers.get("sec-fetch-site")
     origin = request.headers.get("origin")
-    if origin is not None and origin.rstrip("/") != f"{request.url.scheme}://{request.url.netloc}":
+    if site is not None:
+        foreign = site not in ("same-origin", "none")
+    else:
+        foreign = origin is not None and origin.rstrip("/") != (
+            f"{request.url.scheme}://{request.url.netloc}"
+        )
+    if foreign:
         raise AdminError(AdminCode.FORBIDDEN, "다른 출처에서 보낸 요청입니다.")
+
+
+async def require_csrf(request: Request) -> None:
+    """세션 쿠키로 인증한 변경 요청은 CSRF 토큰(헤더 또는 폼 필드)과 출처가 맞아야 한다."""
+    require_origin(request)
+    if request.method not in UNSAFE:
+        return
+    if request.headers.get("authorization", "").lower().startswith("bearer "):
+        return
     cookie = request.cookies.get(COOKIE)
     if not cookie:
         return  # 세션이 없으면 인증 단계가 거부한다(로그인 요청은 출처만 확인한다)

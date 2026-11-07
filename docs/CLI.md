@@ -61,13 +61,22 @@
 
 승인을 모두 철회해도 서버 상태는 바뀌지 않는다. 서버 전체를 막으려면 `server suspend`를 쓴다. 특정 주체를 더 넓은 승인까지 포함해 막으려면 `revoke --deny`를 쓴다.
 
+## 관리자 콘솔 `mint-litellm console`
+
+`mint-litellm console`은 상주 프로세스다. FastAPI와 서버 렌더링 화면(Jinja2, HTMX, ECharts)을 한 프로세스로 띄우며 빌드 단계와 외부 자산이 없다(응답 헤더 `Content-Security-Policy: default-src 'self'`). `MINT_DATABASE_URL`은 `mint_control_app` 로그인의 주소여야 하고, `MINT_LITELLM_URL`(로그인 확인용)과 `MINT_EXPORT_DIR`·`MINT_EXPORT_HMAC_KEY`가 없으면 기동을 거부한다. `--host`(기본 `localhost`)·`--port`(기본 8080)·`--ssl-certfile`·`--ssl-keyfile`을 받는다. 쿠키는 항상 `Secure`이므로 브라우저는 HTTPS(또는 `localhost`)로 접속해야 한다.
+
+- **로그인**: 사람이 자기 LiteLLM 키를 낸다. 콘솔은 그 키로 `GET /key/info`와 `GET /user/info`를 부르고(키가 차단·만료·미등록이거나 마스터 키이거나 사용자에 결속되지 않았거나 사람 사용자가 아니면 거부) 평문 키를 바로 버린다. 그 사용자에 결속된 유효한 운영자(`operators`) 행이 있어야 하고, 화면 권한은 그 행의 역할이다.
+- **세션**: `__Host-mint_session` 쿠키(`HttpOnly`·`Secure`·`SameSite=Strict`), 유휴 30분·절대 8시간(`MINT_SESSION_IDLE_SECONDS`·`MINT_SESSION_ABSOLUTE_SECONDS`). 변경 요청은 CSRF 토큰(`X-CSRF-Token` 헤더 또는 폼 필드 `csrf`)과 같은 출처가 필요하다. 작업 실행기가 `MINT_SESSION_VERIFY_SECONDS`(기본 300)마다 제어 평면 키로 세션의 키·사용자·운영자 행을 다시 확인하고 맞지 않으면 폐기한다(그래서 작업 실행기에는 `MINT_LITELLM_URL`·`MINT_LITELLM_KEY`가 필요하다).
+- **HTTP API** `/api/v1/<자원>`: 세션 쿠키 또는 `Authorization: Bearer <운영자 토큰>`. 변경 요청은 대상의 `state_version`을 보내야 하며 다르면 `409 MINT-ADMIN-CONFLICT`이다. 오류 본문은 `{code, message, reference}`이고 `X-Request-Id` 응답 헤더가 `reference`와 같다(사건이 있는 오류는 사건 키). 자원: `overview`, `servers`, `relations`, `approvals`, `denials`, `call-approvals`, `orgs`, `operators`, `allowlists`, `settings`, `policy/versions`, `ledger`(`/ledger/export?format=csv|json`).
+- 승인(`POST /approvals`)·운영자 등록·서버 등록은 LiteLLM 읽기가 필요하다. 콘솔 프로세스에 `MINT_LITELLM_KEY`가 없으면 거부하고, 그 변경은 명령줄에서 한다.
+
 ## 작업 실행기 `mint-litellm worker`
 
 `mint-litellm worker`는 운영자 명령이 아니라 상주 프로세스다(토큰·사건 없음). 같은 이미지를 `mint_worker_app` 로그인(제어·작업·봉인 그룹)으로 접속해 띄우며, 복제본을 여럿 띄워도 안전하다. `MINT_DATABASE_URL`은 이 로그인의 주소여야 하고, 다른 로그인이면 기동을 거부한다. `MINT_EXPORT_DIR`·`MINT_EXPORT_HMAC_KEY`가 없거나 `MINT_WEBHOOK_URLS`가 있는데 `MINT_WEBHOOK_HMAC_KEY`가 없으면 기동을 거부한다.
 
 - 주기가 된 일정(`schedules`)을 한 주기에 한 번 작업으로 등록하고, 임대가 만료된 `running` 작업을 `pending`으로 되돌리고(시도 한 번으로 센다), 대기 작업을 하나씩 임대해 실행한다. 실행 중에는 임대(`MINT_WORKER_LEASE_SECONDS`, 기본 60초)를 1/3마다 연장하고, 연장에 실패하면 그 작업의 외부 호출을 멈춘다.
 - 실패한 작업은 `min(2^시도 횟수 × 5초, 10분)` 뒤에 다시 시도하고, 시도 8번째 실패에서 `failed`가 되며 경보 `job_failed`(같은 종류·대상은 한 건으로 묶고 횟수만 올린다)를 남긴다. 오류 메시지는 저장하지 않고 오류 코드만 남긴다.
-- 이 판본에서 처리기가 있는 작업은 `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시)뿐이다. 나머지 종류(동기화·관측·봉인·내보내기·경보 전송 등)는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
+- 이 판본에서 처리기가 있는 작업은 `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시)과 `session_verify`(콘솔 세션 재확인)뿐이다. 나머지 종류(동기화·관측·봉인·내보내기·경보 전송 등)는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
 - 되돌림 판정은 아직 없어 언제나 정상으로 본다. 판정이 들어오면 되돌림 상태에서 외부 쓰기 작업은 실행되지 않고 `restore_blocked`로 대기한다.
 - SIGTERM·SIGINT를 받으면 실행 중인 작업에 취소를 알린다. 작업이 그대로 끝나면 완료로 기록하고, 취소를 받아 멈추면 시도 횟수를 올리지 않고 임대를 놓은 뒤 종료한다.
 
