@@ -258,7 +258,7 @@ def prepare_bundle(
     _validate_hours(json.loads(source[DATA_FILE])["business_hours"])
     catalog = (root / "policy" / "catalog.json").read_bytes()
     catalog_data = json.loads(catalog)
-    if {rule["id"] for rule in catalog_data["rules"]} != {"R1", "R2", "R3", "R4"}:
+    if not {"R1", "R2", "R3", "R4"} <= {rule["id"] for rule in catalog_data["rules"]}:
         raise ValueError("invalid catalog")
     command = [opa] if isinstance(opa, str) else list(opa)
     subprocess.run(

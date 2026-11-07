@@ -63,12 +63,24 @@ class BufferWriteError(Exception):
 class ConsumptionLost(Exception):
     """호출별 승인을 소비하지 못했다. 같은 트랜잭션의 사건 기록도 되돌려졌다."""
 
+    def __init__(self, reason: str = "CALL_APPROVAL_REQUIRED") -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class ConfirmationConsume:
+    id: UUID
+    org_id: str
+    fp_key_version: int
+    state_version: int
+
 
 @dataclass(frozen=True)
 class ConsumeRequest:
     """승인된 호출별 승인을 한 번 소비하는 조건. 모든 항목이 현재 호출과 일치해야 한다."""
 
-    call_approval_id: UUID
+    call_approval_id: UUID | None
     invocation_id: UUID
     principal_type: str
     principal_id: str
@@ -77,6 +89,7 @@ class ConsumeRequest:
     args_fp: str
     policy_version_id: str
     state_version: int
+    confirmation: ConfirmationConsume | None = None
 
 
 class EventStore(Protocol):
@@ -408,6 +421,7 @@ class Recorded(Protocol):
 class DatabaseResult:
     stored: bool
     consumption_lost: bool = False
+    consumption_reason: str = "CALL_APPROVAL_REQUIRED"
 
 
 class EvidenceRecorder:
@@ -448,8 +462,10 @@ class EvidenceRecorder:
         try:
             async with asyncio.timeout(self._budget if timeout is None else timeout):
                 inserted = await self._store.insert_event(event, consume)
-        except ConsumptionLost:
-            return DatabaseResult(stored=False, consumption_lost=True)
+        except ConsumptionLost as exc:
+            return DatabaseResult(
+                stored=False, consumption_lost=True, consumption_reason=exc.reason
+            )
         except Exception as exc:
             log.debug(
                 "사건 기록 실패: %s sqlstate=%s", type(exc).__name__, getattr(exc, "sqlstate", None)

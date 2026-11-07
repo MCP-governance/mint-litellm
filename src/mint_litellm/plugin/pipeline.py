@@ -10,24 +10,28 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import posixpath
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from mint_litellm.compat.litellm_1_106 import HookData, ServerResolutionError
-from mint_litellm.plugin.buffer import ConsumeRequest, EvidenceRecorder
+from mint_litellm.plugin.buffer import ConfirmationConsume, ConsumeRequest, EvidenceRecorder
 from mint_litellm.plugin.config import PluginConfig
 from mint_litellm.plugin.obligations import (
     AlertObligation,
     RequireCallApproval,
     RequireConsent,
+    RequireUserConfirmation,
     normalize_policy_output,
 )
 from mint_litellm.plugin.policy.input import policy_input as make_policy_input
 from mint_litellm.plugin.policy.opa_client import Evaluation
+from mint_litellm.plugin.policy.patterns import compute_patterns
 from mint_litellm.plugin.snapshot import (
     ApprovalRow,
     CallApprovalRow,
@@ -89,6 +93,8 @@ class Deadline:
 class SnapshotSource(Protocol):
     async def read_snapshot(self, query: SnapshotQuery) -> Snapshot: ...
 
+    async def request_confirmation(self, params: Mapping[str, Any]) -> None: ...
+
 
 @dataclass
 class PipelineDeps:
@@ -97,7 +103,10 @@ class PipelineDeps:
     recorder: EvidenceRecorder
     evaluate: PolicyEvaluate | None
     verified: Callable[[], bool]
+    # 호출을 막는 사유(되돌림 판정의 cause). 없으면 None. 메모리 값만 읽는다.
+    unverified_cause: Callable[[], str | None] = lambda: None
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    secret_markers: Callable[..., Awaitable[tuple[str, ...] | None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -151,9 +160,12 @@ class _Stages:
         return [r for _, r in self.items if isinstance(r, StageResult)]
 
 
-def context_result(req: CallRequest, verified: bool) -> StageResult | None:
+def context_result(
+    req: CallRequest, verified: bool, cause: str | None = None
+) -> StageResult | None:
     if not verified:
-        return StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED)
+        detail = None if cause is None else f"cause={cause}"
+        return StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED, detail=detail)
     if req.principal.principal_type is PrincipalType.MASTER_KEY:
         return StageResult.stop(Reason.MASTER_KEY_FORBIDDEN)
     if req.resolution_failure is not None:
@@ -308,6 +320,41 @@ def _argument_sizes(arguments: Mapping[str, Any]) -> dict[str, int]:
     return sizes
 
 
+def _condition_list(conditions: Mapping[str, Any], key: str) -> list[str]:
+    values = conditions.get(key, [])
+    if not isinstance(values, list) or not all(isinstance(v, str) and v for v in values):
+        raise InputError(f"{key} must be a list of non-empty strings")
+    return values
+
+
+def _host_of(value: str) -> str:
+    value = value.strip().lower()
+    try:
+        host = urlsplit(value if "://" in value else "//" + value).hostname or ""
+    except ValueError:
+        return ""
+    return host.removeprefix("*.").rstrip(".")
+
+
+def _argument_patterns(
+    snapshot: Snapshot,
+    principal: Principal,
+    conditions: Mapping[str, Any],
+    arguments: Mapping[str, Any],
+    secret_markers: Sequence[str],
+) -> dict[str, bool]:
+    hosts = {_host_of(h) for h in _condition_list(conditions, "allowed_hosts")}
+    hosts |= {_host_of(v) for v, org in snapshot.egress_targets if org in (None, principal.org_id)}
+    raw_paths = _condition_list(conditions, "allowed_paths")
+    paths = [posixpath.normpath(p.replace("\\", "/")) for p in raw_paths]
+    return compute_patterns(
+        arguments,
+        allowed_hosts={h for h in hosts if h},
+        allowed_paths=paths,
+        secret_markers=secret_markers,
+    )
+
+
 def build_policy_input(
     *,
     snapshot: Snapshot,
@@ -319,8 +366,9 @@ def build_policy_input(
     mode: Mode,
     operation: OperationType,
     high_risk_tools: frozenset[str],
+    secret_markers: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """정책 입력. 인자 원문은 넣지 않고, 1단계에 없는 값은 키를 만들지 않는다."""
+    """정책 입력. 인자 원문은 넣지 않고(패턴 불리언만), 값이 없는 입력은 키를 만들지 않는다."""
     now = snapshot.now
     server = snapshot.server
     allowed_kinds = (
@@ -342,6 +390,9 @@ def build_policy_input(
         "provider_allowed": "provider" in allowed_kinds,
         "auth_server_allowed": "auth_server" in allowed_kinds,
     }
+    managed = server is not None and server.contract_status == "managed"
+    if managed:
+        server_doc["contract_status"] = "managed"
 
     if selected is None:
         approval: dict[str, Any] = {"present": False}
@@ -376,6 +427,14 @@ def build_policy_input(
         high_risk_tools=sorted(high_risk_tools),
         mode=mode.value,
         operation=operation.value,
+        # 인자 패턴 정책은 계약 관리 서버에만 판정한다. 1단계 서버는 입력도 만들지 않는다.
+        argument_patterns=(
+            _argument_patterns(
+                snapshot, principal, approval.get("conditions", {}), arguments, secret_markers
+            )
+            if managed
+            else None
+        ),
     )
 
 
@@ -551,7 +610,67 @@ def obligation_check(
                     "revoked": Reason.CONSENT_REVOKED,
                 }[status]
                 return ObligationCheck([StageResult.stop(reason)], None)
+        elif isinstance(obligation, RequireUserConfirmation):
+            failure, confirmation = match_confirmation(
+                snapshot, principal, resolved, tool, arguments, config, invocation_id
+            )
+            if failure is not None:
+                return ObligationCheck([failure], None)
+            assert confirmation is not None
+            consume = (
+                replace(consume, confirmation=confirmation.confirmation)
+                if consume is not None else confirmation
+            )
     return ObligationCheck([], consume)
+
+
+def match_confirmation(
+    snapshot: Snapshot, principal: Principal, resolved: ResolvedServer, tool: str,
+    arguments: Mapping[str, Any], config: PluginConfig, invocation_id: UUID,
+) -> tuple[StageResult | None, ConsumeRequest | None]:
+    if principal.principal_type is not PrincipalType.USER or config.fingerprint_key is None:
+        return StageResult.stop(Reason.CONFIRMATION_REQUIRED), None
+    try:
+        fingerprint = argument_fingerprint(arguments, config.fingerprint_key)
+    except ValueError:
+        return StageResult.stop(Reason.CONFIRMATION_REQUIRED), None
+    candidates = [
+        c for c in snapshot.self_confirmations
+        if c.org_id == principal.org_id and c.principal_id == principal.principal_id
+        and c.confirmed_by_user_id == principal.principal_id
+        and c.server_id == resolved.server_id and c.tool == tool
+        and c.args_fp == fingerprint and c.fp_key_version == config.fingerprint_key_version
+        and c.expires_at > snapshot.now
+        and (snapshot.settings is not None and (
+            not snapshot.settings.require_separate_confirm_key
+            or c.confirmed_by_key_token != c.requested_by_key_token
+        ))
+    ]
+    exact = sorted(
+        (c for c in candidates if snapshot.policy_version is not None
+         and c.policy_version_id == snapshot.policy_version.id), key=lambda c: str(c.id)
+    )
+    if exact:
+        c = exact[0]
+        return None, ConsumeRequest(
+            call_approval_id=None, invocation_id=invocation_id, principal_type="user",
+            principal_id=c.principal_id, server_id=c.server_id, tool=c.tool, args_fp=c.args_fp,
+            policy_version_id=c.policy_version_id, state_version=c.state_version,
+            confirmation=ConfirmationConsume(c.id, c.org_id, c.fp_key_version, c.state_version),
+        )
+    reason = Reason.CONFIRMATION_STALE if candidates else Reason.CONFIRMATION_REQUIRED
+    return StageResult.stop(reason), None
+
+
+def confirmation_display(
+    arguments: Mapping[str, Any], fields: Sequence[str]
+) -> dict[str, Any]:
+    if not fields:
+        return {"keys": sorted(arguments), "sizes": _argument_sizes(arguments)}
+    return {
+        name: (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))[:256]
+        for name in fields if name in arguments for value in (arguments[name],)
+    }
 
 
 _MISSING = {
@@ -574,7 +693,9 @@ _MISSING = {
     "revocation_check": "pending_response",
 }
 
-_OBLIGATION_CLASSES = (AlertObligation, RequireCallApproval, RequireConsent)
+_OBLIGATION_CLASSES = (
+    AlertObligation, RequireCallApproval, RequireConsent, RequireUserConfirmation,
+)
 
 
 @dataclass
@@ -624,7 +745,10 @@ def _decision_snapshot(
         "resolved_auth_type": resolved.auth_type if resolved else None,
         "candidates_with_same_name": resolved.candidates_with_same_name if resolved else None,
         "selected_approval_id": run.selected.id if run.selected else None,
-        "consumed_call_approval_id": str(consumed.call_approval_id) if consumed else None,
+        "consumed_call_approval_id": (
+            str(consumed.call_approval_id)
+            if consumed is not None and consumed.call_approval_id is not None else None
+        ),
     }
     reasons = {k: _MISSING[k] for k, v in values.items() if v is None}
     reasons["revoked_after_snapshot"] = _MISSING["revoked_after_snapshot"]
@@ -694,7 +818,7 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
     req, stages, config = run.req, run.stages, deps.config
     hook, principal = req.hook, req.principal
     run.current = Stage.CONTEXT
-    early = context_result(req, deps.verified())
+    early = context_result(req, deps.verified(), deps.unverified_cause())
     if early is not None:
         stages.add(Stage.CONTEXT, early)
         return
@@ -766,6 +890,26 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
 
     stages.add(Stage.CONTRACT, UNSUPPORTED_STAGE)
     run.current = Stage.POLICY
+    markers: Sequence[str] = ()
+    if (
+        deps.secret_markers is not None
+        and snapshot.policy_version is not None
+        and snapshot.server is not None
+        and snapshot.server.contract_status == "managed"
+    ):
+        try:
+            fetched = await deps.secret_markers(
+                policy_version_id=snapshot.policy_version.id,
+                bundle_sha256=snapshot.policy_version.bundle_sha256,
+                budget_seconds=run.deadline.remaining(),
+            )
+        except Exception:
+            fetched = None
+        if fetched is None:
+            stages.add(Stage.POLICY, StageResult.stop(Reason.DEPENDENCY_FAILURE))
+            stages.dependency = Dependency.OPA
+            return
+        markers = fetched
     try:
         policy_input = build_policy_input(
             snapshot=snapshot,
@@ -777,6 +921,7 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
             mode=run.mode,
             operation=req.operation,
             high_risk_tools=config.high_risk_tools,
+            secret_markers=markers,
         )
     except InputError as exc:
         stages.add(Stage.POLICY, StageResult.stop(Reason.SCHEMA_ERROR, detail=str(exc)[:200]))
@@ -804,6 +949,31 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
     if not check.results:
         stages.add(Stage.OBLIGATIONS, StageResult.passed())
     run.consume = check.consume
+    if (
+        check.results and check.results[0].reason_code in (
+            Reason.CONFIRMATION_REQUIRED, Reason.CONFIRMATION_STALE
+        ) and run.principal.principal_type is PrincipalType.USER
+        and run.principal.key_id and config.fingerprint_key is not None
+    ):
+        obligation = next(
+            o for o in run.policy.obligations if isinstance(o, RequireUserConfirmation)
+        )
+        assert snapshot.policy_version is not None
+        try:
+            async with asyncio.timeout(run.deadline.remaining()):
+                await deps.snapshots.request_confirmation({
+                    "id": new_uuid7(), "iid": config.instance_id,
+                    "org_id": run.principal.org_id, "principal_id": run.principal.principal_id,
+                    "server_id": resolved.server_id, "tool": tool,
+                    "args_fp": argument_fingerprint(hook.arguments, config.fingerprint_key),
+                    "fp_key_version": config.fingerprint_key_version,
+                    "policy_version_id": snapshot.policy_version.id,
+                    "purpose": obligation.purpose, "key_token": run.principal.key_id,
+                    "display": confirmation_display(hook.arguments, obligation.display_fields),
+                })
+        except Exception as exc:
+            # 확인을 만들지 못해도 이미 stop이며, 표시 값은 다른 저장소로 보내지 않는다.
+            log.debug("본인 확인 요청 실패: %s", type(exc).__name__)
 
 
 def _mark_written(run: _Run) -> Callable[[], None]:
@@ -907,7 +1077,8 @@ async def _evaluate(run: _Run, deps: PipelineDeps) -> Outcome:
         run.event_written = True
     else:
         if stored.consumption_lost:
-            conclusion = _block_with(conclusion, StageResult.stop(Reason.CALL_APPROVAL_REQUIRED))
+            reason = Reason(stored.consumption_reason)
+            conclusion = _block_with(conclusion, StageResult.stop(reason))
             consume = None
             event = decision_event(_decision_snapshot(run, conclusion, None))
             retry = await deps.recorder.try_database(event, timeout=run.deadline.remaining())
@@ -960,7 +1131,7 @@ def _context_document(
         "decision_ref": snapshot.decision_ref,
         "consumed_call_approval": (
             {"id": str(consumed.call_approval_id), "state_version": consumed.state_version}
-            if allowed and consumed is not None
+            if allowed and consumed is not None and consumed.call_approval_id is not None
             else None
         ),
         "allowed": allowed,

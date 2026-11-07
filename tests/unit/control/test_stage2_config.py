@@ -86,3 +86,14 @@ def test_staff_consent_ceiling_defaults_and_is_bounded():
     for bad in ("0", "366", "abc", "-1"):
         with pytest.raises(ControlError):
             Stage2Settings.from_env({**BASE, "MINT_STAFF_CONSENT_MAX_DAYS": bad})
+
+
+def test_the_control_instance_id_follows_the_plugin_identifier_rule():
+    import pytest as _pytest
+
+    from mint_litellm.control.config import ControlConfig
+
+    assert ControlConfig.from_env({"MINT_INSTANCE_ID": "ok-1.a"}).instance_id == "ok-1.a"
+    for bad in ("../x", "a/b", "a b", "-x", ""):
+        with _pytest.raises(ControlError):
+            ControlConfig.from_env({"MINT_INSTANCE_ID": bad})

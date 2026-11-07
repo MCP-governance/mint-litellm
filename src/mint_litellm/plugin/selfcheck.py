@@ -35,6 +35,7 @@ from mint_litellm.plugin.pipeline import (
     evaluate_request,
 )
 from mint_litellm.plugin.policy.opa_client import Evaluation, OPAClient
+from mint_litellm.plugin.restore_watch import RestoreWatch
 from mint_litellm.plugin.result import ResultDeps
 from mint_litellm.plugin.snapshot import PluginDatabase, RegisteredServer
 from mint_litellm.types.decision import OperationType
@@ -305,12 +306,14 @@ class PluginRuntime:
     database: PluginDatabase
     recorder: EvidenceRecorder
     evaluate: PolicyEvaluate | None
+    secret_markers: Callable[..., Awaitable[tuple[str, ...] | None]] | None = None
     view_collector: Callable[[], LiteLLMView] = collect_view
     terminate: Callable[[], None] = terminate_process
     readiness: Callable[[str, float], Awaitable[bool]] = wait_for_readiness
     retry_seconds: float = 1.0
     recheck_seconds: float = 30.0
     verified: bool = False
+    restore_watch: Any = None
     logger: Any = None
     guardrail: Any = None
     last_results: list[CheckResult] = field(default_factory=list)
@@ -318,6 +321,7 @@ class PluginRuntime:
     keys: SystemEventKeys = field(default_factory=SystemEventKeys, repr=False)
     _reported: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _restore_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @property
     def deps(self) -> PipelineDeps:
@@ -326,8 +330,14 @@ class PluginRuntime:
             snapshots=self.database,
             recorder=self.recorder,
             evaluate=self.evaluate,
-            verified=lambda: self.verified,
+            secret_markers=self.secret_markers,
+            verified=lambda: self.verified and self._restore_cause() is None,
+            unverified_cause=self._restore_cause,
         )
+
+    def _restore_cause(self) -> str | None:
+        """되돌림 판정이 호출을 막는 사유. 주기 판정이 메모리에 둔 값만 읽는다."""
+        return None if self.restore_watch is None else self.restore_watch.blocked_cause
 
     @property
     def result_deps(self) -> ResultDeps:
@@ -396,6 +406,9 @@ class PluginRuntime:
         return results
 
     async def verify(self) -> bool:
+        # 기동 점검의 재시도(30초)가 판정 주기(60초)를 앞지르지 않도록 첫 판정만 여기서 한다.
+        if self.restore_watch is not None and not self.restore_watch.evaluated:
+            await self.restore_watch.refresh()
         results = await self.run_checks()
         self.verified = all(r.ok for r in results)
         return self.verified
@@ -409,6 +422,8 @@ class PluginRuntime:
         except RuntimeError:
             return
         self._task = loop.create_task(self._startup())
+        if self.restore_watch is not None:
+            self._restore_task = loop.create_task(self.restore_watch.run())
 
     async def _startup(self) -> None:
         self.keys = SystemEventKeys()
@@ -521,6 +536,24 @@ class PolicyEngine:
         self._owner: tuple[int, asyncio.AbstractEventLoop] | None = None
         self._guard: asyncio.Task[None] | None = None
 
+    def _opa(self) -> OPAClient:
+        loop = asyncio.get_running_loop()
+        owner = (os.getpid(), loop)
+        if self._client is None or self._owner != owner:
+            client = OPAClient(self._base_url, self._timeout)
+            self._client, self._owner = client, owner
+            self._guard = loop.create_task(self._close_with_loop(client))
+        return self._client
+
+    async def secret_markers(
+        self, *, policy_version_id: str, bundle_sha256: str, budget_seconds: float | None = None
+    ) -> tuple[str, ...] | None:
+        return await self._opa().secret_markers(
+            policy_version_id=policy_version_id,
+            bundle_sha256=bundle_sha256,
+            budget_seconds=budget_seconds,
+        )
+
     async def evaluate(
         self,
         policy_input: dict[str, Any],
@@ -529,13 +562,7 @@ class PolicyEngine:
         bundle_sha256: str,
         budget_seconds: float | None = None,
     ) -> Evaluation:
-        loop = asyncio.get_running_loop()
-        owner = (os.getpid(), loop)
-        if self._client is None or self._owner != owner:
-            client = OPAClient(self._base_url, self._timeout)
-            self._client, self._owner = client, owner
-            self._guard = loop.create_task(self._close_with_loop(client))
-        return await self._client.evaluate(
+        return await self._opa().evaluate(
             policy_input,
             policy_version_id=policy_version_id,
             bundle_sha256=bundle_sha256,
@@ -578,10 +605,13 @@ def get_runtime(env: Mapping[str, str] | None = None) -> PluginRuntime:
             budget_seconds=config.decision_budget_seconds,
             instance_id=config.instance_id,
         )
+        engine = PolicyEngine(config.opa_url, config.decision_budget_seconds)
         _runtime = PluginRuntime(
             config=config,
             database=database,
             recorder=recorder,
-            evaluate=PolicyEngine(config.opa_url, config.decision_budget_seconds).evaluate,
+            restore_watch=RestoreWatch(config, database),
+            evaluate=engine.evaluate,
+            secret_markers=engine.secret_markers,
         )
     return _runtime

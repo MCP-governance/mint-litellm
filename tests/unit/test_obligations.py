@@ -19,11 +19,12 @@ from mint_litellm.types.errors import error_for_reason
 from mint_litellm.types.settings import Mode, ObservationSettings
 
 
-def test_supported_set_is_the_three_obligations():
+def test_supported_set_is_the_four_obligations():
     assert {o.value for o in SUPPORTED_OBLIGATIONS} == {
         "alert",
         "require_call_approval",
         "require_consent",
+        "require_user_confirmation",
     }
 
 

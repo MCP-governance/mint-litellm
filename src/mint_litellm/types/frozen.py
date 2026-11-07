@@ -30,6 +30,18 @@ class FrozenList(list):
         return (FrozenList, (list(self),))
 
 
+def no_floats(value: object) -> None:
+    """실수 값이 하나라도 있으면 ``ValueError``. 봉인·서명의 정규 JSON은 실수를 받지 않는다."""
+    if isinstance(value, float):
+        raise ValueError("JSON numbers must be integers (floats are not allowed)")
+    if isinstance(value, dict):
+        for item in value.values():
+            no_floats(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            no_floats(item)
+
+
 def json_value(value: object, _depth: int = 0) -> Any:
     """JSON 값(문자열·정수·실수·불리언·None·리스트·문자열 키 딕셔너리)만 받아 동결 사본을 만든다.
 

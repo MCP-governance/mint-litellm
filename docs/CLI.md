@@ -47,6 +47,9 @@
 | `mint-litellm settings observable` | `admin` | 관측 모드로 전환할 수 있는 사유 계열과 정책을 정한다. | - | `settings_changed` |
 | `mint-litellm policy activate` | `admin` | 정책 번들을 검증하고 정책 엔진에 적재한 뒤 활성 판본으로 전환한다. | - | `policy_activated` |
 | `mint-litellm ledger list` | 모든 역할 | 원장 사건을 종류·기간·호출 식별자로 조회한다. | - | - |
+| `mint-litellm alert list` | 모든 역할 | 경보를 상태(`--status`)별로 조회한다. | - | - |
+| `mint-litellm alert ack` | `admin` | 열린 경보(`alert_id`)를 확인 처리한다. 확인한 운영자 이름이 남는다. | - | `alert_acknowledged` |
+| `mint-litellm alert resolve` | `admin` | 경보(`alert_id`)를 해결됨으로 닫는다. 같은 원인이 다시 생기면 새 경보가 열린다. | - | `alert_resolved` |
 
 ## 정책 활성화 실패와 복원
 
@@ -76,9 +79,27 @@
 
 - 주기가 된 일정(`schedules`)을 한 주기에 한 번 작업으로 등록하고, 임대가 만료된 `running` 작업을 `pending`으로 되돌리고(시도 한 번으로 센다), 대기 작업을 하나씩 임대해 실행한다. 실행 중에는 임대(`MINT_WORKER_LEASE_SECONDS`, 기본 60초)를 1/3마다 연장하고, 연장에 실패하면 그 작업의 외부 호출을 멈춘다.
 - 실패한 작업은 `min(2^시도 횟수 × 5초, 10분)` 뒤에 다시 시도하고, 시도 8번째 실패에서 `failed`가 되며 경보 `job_failed`(같은 종류·대상은 한 건으로 묶고 횟수만 올린다)를 남긴다. 오류 메시지는 저장하지 않고 오류 코드만 남긴다.
-- 이 판본에서 처리기가 있는 작업은 `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시)과 `session_verify`(콘솔 세션 재확인)뿐이다. 나머지 종류(동기화·관측·봉인·내보내기·경보 전송 등)는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
-- 되돌림 판정은 아직 없어 언제나 정상으로 본다. 판정이 들어오면 되돌림 상태에서 외부 쓰기 작업은 실행되지 않고 `restore_blocked`로 대기한다.
+- 이 판본에서 처리기가 있는 작업은 `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시), `session_verify`(콘솔 세션 재확인), `seal`(1분마다 미봉인 사건을 해시 연쇄로 봉인), `export_negative_state`(부정 상태 전이가 커밋될 때 등록), `export_checkpoint`(10분마다, 기동 직후 한 번)이다. 나머지 종류는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
+- 60초마다 내보내기 파일과 DB를 대조해 되돌림을 판정한다. 처음 어긋나면 봉인·내보내기를 보류하고, 두 번 연속 어긋나거나 파일이 없거나 검증되지 않으면 외부 쓰기를 모두 멈춘다(`restore_blocked`로 대기, 시도 횟수 불변). 외부 쓰기 직전마다 같은 판정과 임대 유효성을 다시 확인한다.
 - SIGTERM·SIGINT를 받으면 실행 중인 작업에 취소를 알린다. 작업이 그대로 끝나면 완료로 기록하고, 취소를 받아 멈추면 시도 횟수를 올리지 않고 임대를 놓은 뒤 종료한다.
+
+## 봉인·내보내기·복원 명령
+
+운영자 토큰으로 실행한다. `MINT_EXPORT_DIR`·`MINT_EXPORT_HMAC_KEY`(키 교체 중에는 `MINT_EXPORT_HMAC_KEY_PREVIOUS`)가 필요하다.
+
+| 명령 | 역할 | 설명 |
+| --- | --- | --- |
+| `mint-litellm seal verify [--from N --to M]` | 전부 | 봉인 연쇄를 처음부터 다시 계산하고 마지막 체크포인트 파일의 봉인 끝과 대조한다. 어긋나면 종료 코드 1. |
+| `mint-litellm export status` | 전부 | 최근 내보내기와 최신 파일의 서명 키를 보여 주고 옛 키를 빼도 되는지 알려 준다. |
+| `mint-litellm restore check` | admin | 파일의 부정 상태와 DB를 비교해 누락·봉인 앵커·마지막 성공 전송 이후 활동 서버를 보여 준다. |
+| `mint-litellm restore attest --reason <사유>` | admin | 파일에 담긴 부정 상태 행 전체 스냅숏으로 복구 DB를 되돌리고(없는 행은 같은 식별자로 다시 넣고, 뒤처진 행은 파일 내용으로 되돌린다), DB 세대를 파일 세대 + 1로 올리고, 복원 요청과 `restore_attested`를 커밋한다. 부모 행이 없어 되돌릴 수 없는 항목이 있으면 목록과 함께 거부한다. 반복해도 같은 결과다. 명령은 파일을 쓰지 않는다. |
+| `mint-litellm restore accept-stale --reason <사유> --second-approver <토큰>` | admin 2인 | 파일이 없거나 검증되지 않을 때 복원 요청과 `restore_stale_accepted`를 커밋한다. 명령은 파일을 쓰지 않는다. |
+
+복원 요청은 작업 `restore_publish`를 등록하고, 작업 실행기는 되돌림 차단 상태에서도 이 작업만은 실행한다. 순서는 기존 파일을 `restored/<요청>/`로 옮겨 보관, DB 기준 새 부정 상태·체크포인트·`latest.json` 게시, 다시 읽어 서명·내용 검증, `exports` 행 확정이다. 중간에 중단되면 차단이 유지되고 작업이 이어서 끝낸다.
+
+봉인 해시·HMAC·내용 해시가 쓰는 정규 JSON은 `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`를 UTF-8로 인코딩한 것이며(코드의 `restore.files.canonical_json` 한 곳), 실수 값은 거부한다. 서명 입력은 `hmac` 필드를 뺀 본문 전체(`key_id` 포함), 배열은 저장 순서이며 시각은 UTC ISO 8601 초 단위 `Z`다. 허용 자료형은 문자열·정수·참거짓·null·배열·객체뿐이고 사건 본문에도 실수를 넣을 수 없다. 시험 벡터는 `tests/unit/control/test_export.py`에 있다.
+
+HMAC 키를 교체하려면 새 키를 `MINT_EXPORT_HMAC_KEY`, 옛 키를 `MINT_EXPORT_HMAC_KEY_PREVIOUS`에 두고 다시 기동한다. 작업 실행기가 새 키로 체크포인트를 쓰고 최신 부정 상태 파일을 다시 서명하면 `export status`가 옛 키를 빼도 된다고 알려 준다.
 
 ## 서버를 LiteLLM에서 삭제하는 순서
 
@@ -93,6 +114,7 @@
 | `MINT_OPERATOR_TOKEN` | 운영자 토큰. `--token-file <파일>`로 대신할 수 있다. | 인증이 필요한 명령에서 필수 |
 | `MINT_LITELLM_URL` | LiteLLM 관리 API 주소 | `server register`·`operator add`·`approve`·`consent add`·`check`·`status`에서 필요 |
 | `MINT_LITELLM_KEY` | 제어 평면 LiteLLM 키(`proxy_admin`, `allowed_routes` 7개로 제한) | 위와 같음 |
+| `MINT_CONSOLE_URL` | 경보 본문의 `console_url`에 넣을 콘솔 주소(선택). 없으면 `null`이다. | 없음 |
 | `MINT_LITELLM_CONFIG` | `check`·`status`가 읽는 LiteLLM `config.yaml` 경로. `--config`로 대신할 수 있다. | 없음 |
 | `MINT_MODE` | 모드 상한. `enforce`이면 `settings mode observe`가 거부된다. | `enforce` |
 | `MINT_REPLICAS` | `check`가 공유 캐시 설정을 판단할 때 쓰는 복제본 수 | `1` |
@@ -116,6 +138,9 @@
 | `--business-hours-only` | `business_hours_only` | 업무 시간 밖의 호출을 차단한다. 업무 시간은 정책 번들의 값이다. |
 | `--business-hours 시간대,요일,시작,끝` | `business_hours` | 이 승인의 업무 시간을 재정의한다(예: `Asia/Seoul,1-5,09:00,18:00`, 요일은 1=월 ~ 7=일). `--business-hours-only`와 함께 쓴다. |
 | `--require-consent 목적` | `require_consent` | 그 목적의 동의가 있어야 호출을 허용한다. |
+| `--allowed-host 호스트` (반복) | `allowed_hosts` | 인자의 URL이 향할 수 있는 호스트(하위 도메인 포함). 계약 관리 서버에만 적용한다. |
+| `--allowed-path 경로` (반복) | `allowed_paths` | 인자의 절대 경로가 있어야 하는 폴더. 계약 관리 서버에만 적용한다. |
+| `--allowed-arg-key 이름` (반복) | `allowed_arg_keys` | 호출이 쓸 수 있는 인자 이름. 이 밖의 이름이 있으면 차단한다. 계약 관리 서버에만 적용한다. |
 
 승인 범위(`--scope key|user|team`)의 대상은 LiteLLM에서 읽어 확인한다. 대상이 없거나, `object_permission.mcp_servers`에 서버 식별자가 아닌 항목(별칭·이름)이 있거나, 대상에 해당 서버의 권한(직접 부여 또는 서버가 속한 접근 그룹)이 없으면 승인은 만들어지지 않는다. 이용 관계에 팀이 있으면 `team` 범위는 그 팀, `key` 범위는 팀이 같은 키, `user` 범위는 그 팀에 속한 사용자여야 한다. 팀이 없는 관계에서는 `team` 범위가 그 조직에 묶인 팀이어야 하고, `key`·`user` 범위는 조직 유도 결과(팀 바인딩, 사용자 바인딩, 기본 조직 순)가 관계의 조직과 같아야 한다. `--scope org` 승인은 지원하지 않으므로 조직에 묶인 팀을 `team` 범위로 승인한다.
 
@@ -172,6 +197,23 @@
 - `--args-fp <지문>`: 차단 사건에 기록된 지문(소문자 16진 64자)을 그대로 넣는다.
 
 키가 없으면 인자 원문으로는 요청할 수 없고, 지문 키가 설정되어 있지 않으면 플러그인에서 호출별 승인은 항상 요구 상태로 남는다.
+
+## 경보와 웹훅
+
+경보는 종류와 대상으로 묶인다. 같은 묶음의 미해결 경보가 있으면 새로 만들지 않고 `count`와 `last_at`만 올린다. `job_failed`는 작업이 최대 시도 횟수를 넘겨 실패할 때, 같은 종류·대상의 작업이 이후 성공하면 해결된다. `approval_expiring`은 7일 안에 만료될 대기·확정 건마다 한 번 열리며, 운영자가 닫은 뒤에는 다시 열리지 않는다.
+
+경보가 열리면 `alert_opened`(순번 0), 확인되면 `alert_acknowledged`(순번 1), 해결되면 `alert_resolved`(순번 2) 사건을 같은 트랜잭션에 남긴다.
+
+`MINT_WEBHOOK_URLS`를 설정하면 새로 열린 경보마다 주소별로 전송 작업이 하나 생긴다. 주소는 `https`만 받고, 호스트는 이 목록의 호스트로 한정한다. 전송은 총 3회 시도하며 요청마다 5초 제한을 둔다. 3번 모두 실패하면 전송 행을 `failed`로 두고 작업은 완료로 끝난다. 응답 본문은 저장하지 않는다.
+
+서명 형식(수신 쪽이 검증하는 방법):
+
+- 요청 헤더 `X-MINT-Signature`는 `t=<유닉스 초>,v1=<서명>`이다.
+- 서명은 `HMAC-SHA256(키, "<t>.<본문>")`의 16진수 소문자 64자이며, `<본문>`은 요청 본문의 바이트 그대로다. 키는 `MINT_WEBHOOK_HMAC_KEY`다.
+- 헤더 `X-MINT-Delivery`는 전송 식별자이며 수신 쪽이 중복을 거를 때 쓴다. 재시도는 같은 식별자로 새 서명을 붙여 보낸다.
+- 수신 쪽은 `t`와 현재 시각의 차이가 5분을 넘으면 거부하고, 서명을 상수 시간 비교로 확인한다. 구현 예시는 `mint_litellm.control.webhook.verify`다.
+
+본문 `console_url`은 `MINT_CONSOLE_URL`(선택)을 그대로 쓰며, 설정이 없으면 `null`이다.
 
 ## 원장 조회
 
