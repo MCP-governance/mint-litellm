@@ -66,6 +66,7 @@ class JobContext:
     instance_id: str
     job: dict
     settings: Any = None
+    litellm: Any = None
     cancel: threading.Event = field(default_factory=threading.Event)
     lost: threading.Event = field(default_factory=threading.Event)
 
@@ -78,9 +79,16 @@ def _approval_expiry_scan(job: JobContext) -> None:
     expiry.expire_due(job.conn, job.instance_id)
 
 
+def _session_verify(job: JobContext) -> None:
+    from mint_litellm.control import session_verify
+
+    session_verify.run(job)
+
+
 # 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
 HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "approval_expiry_scan": _approval_expiry_scan,
+    "session_verify": _session_verify,
 }
 
 # 일정(주기 작업): 종류 -> 설정에서 주기(초)를 얻는 함수. 처리기가 있는 종류만 일정을 만든다.

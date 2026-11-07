@@ -13,6 +13,7 @@ import sys
 import threading
 import uuid
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import psycopg
 
@@ -47,12 +48,14 @@ class Worker:
         lease_seconds: float | None = None,
         restore_check: Callable[[psycopg.Connection, str], bool] = no_restore_detected,
         owner: str | None = None,
+        litellm: Any = None,
     ) -> None:
         self.database_url = database_url
         self.instance_id = instance_id
         self.settings = settings
         self.lease_seconds = lease_seconds or settings.worker_lease_seconds
         self.restore_check = restore_check
+        self.litellm = litellm
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.stop = threading.Event()
         self.current: jobs.JobContext | None = None
@@ -131,7 +134,7 @@ class Worker:
         if restored and jobs.KINDS[job["kind"]].external_write:
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
             return
-        ctx = jobs.JobContext(conn, self.instance_id, job, self.settings)
+        ctx = jobs.JobContext(conn, self.instance_id, job, self.settings, self.litellm)
         self.current = ctx
         if self.stop.is_set():
             ctx.cancel.set()
@@ -182,7 +185,8 @@ def main(environ: Mapping[str, str] | None = None) -> int:
     environ = dict(os.environ) if environ is None else dict(environ)
     config = ControlConfig.from_env(environ)
     settings = Stage2Settings.from_env(environ)
-    worker = Worker(config.require_database(), config.instance_id, settings)
+    litellm = config.litellm() if config.litellm_url and config.litellm_key else None
+    worker = Worker(config.require_database(), config.instance_id, settings, litellm=litellm)
     worker.open()
     restore = install_signals(worker)
     print(f"작업 실행기 시작: {worker.owner}", file=sys.stderr, flush=True)

@@ -34,6 +34,14 @@ ENV = {"MINT_EXPORT_DIR": "/tmp/mint-export", "MINT_EXPORT_HMAC_KEY": KEY}
 SETTINGS = Stage2Settings.from_env(ENV)
 
 
+@pytest.fixture(autouse=True)
+def only_the_expiry_schedule(monkeypatch):
+    """이 파일은 일정 등록 규칙을 시험하므로 일정을 하나로 줄인다."""
+    monkeypatch.setattr(
+        jobs, "SCHEDULES", {"approval_expiry_scan": jobs.SCHEDULES["approval_expiry_scan"]}
+    )
+
+
 @pytest.fixture
 def url(fresh_db, login_roles):
     return fresh_db

@@ -1,0 +1,55 @@
+{% extends "base.html" %}{% import "macros.html" as m %}
+{% block title %}운영자·조직 · MINT{% endblock %}
+{% block body %}
+<h1>운영자·조직</h1>
+<h2>운영자</h2>
+{% if operators %}
+<table><thead><tr><th>이름</th><th>역할</th><th>사용자</th><th>만료</th></tr></thead><tbody>
+{% for o in operators %}<tr><td>{{ o.name }}</td><td>{{ L.pick(L.ROLE, o.role) }}</td><td>{{ o.user_id | blank }}</td><td>{{ o.expires_at | when }}</td></tr>{% endfor %}
+</tbody></table>
+{% elif actor.role == 'viewer' %}<p class="muted">조회자는 운영자 목록을 볼 수 없습니다.</p>
+{% else %}<p class="muted">등록된 운영자가 없습니다.</p>{% endif %}
+<h2>조직</h2>
+{% if orgs %}
+<table><thead><tr><th>식별자</th><th>이름</th><th>상태</th><th class="num">연결</th><th class="num">이용 관계</th><th></th></tr></thead><tbody>
+{% for o in orgs %}<tr><td>{{ o.org_id }}</td><td>{{ o.name }}</td><td>{{ m.badge(L.ORG, o.status) }}</td><td class="num">{{ o.bindings }}</td><td class="num">{{ o.relations }}</td>
+<td>{% if actor.role == 'admin' and o.status == 'active' %}
+<form method="post" action="/orgs/{{ o.org_id }}/close" class="filters">
+  {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ o.state_version }}">
+  <label>조직 닫기: 식별자 입력<input name="confirm_name" data-confirm="{{ o.org_id }}" autocomplete="off"></label>
+  <button type="submit" class="danger" data-needs-confirm>조직 닫기</button>
+</form>
+<small>연결 {{ o.bindings }}개와 이용 관계 {{ o.relations }}개에 영향</small>{% endif %}</td></tr>{% endfor %}
+</tbody></table>
+{% else %}<p class="muted">조직이 없습니다.</p>{% endif %}
+{% if bindings %}
+<h3>조직 연결</h3>
+<table><thead><tr><th>조직</th><th>구분</th><th>대상</th><th>등록자</th></tr></thead><tbody>
+{% for b in bindings %}<tr><td>{{ b.org_id }}</td><td>{{ L.pick(L.SCOPE, b.subject_type) }}</td><td>{{ b.subject_id }}</td><td>{{ b.created_by }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+{% if actor.role == 'admin' %}
+<form method="post" action="/orgs" class="filters">
+  {{ m.csrf(actor) }}
+  <label>식별자<input name="org_id" required></label><label>이름<input name="name" required></label>
+  <button type="submit" class="primary">조직 만들기</button>
+</form>
+{% endif %}
+<h2>허용 목록</h2>
+{% if allowlists %}
+<table><thead><tr><th>종류</th><th>값</th><th>유효 기간</th><th>메모</th><th>상태</th><th></th></tr></thead><tbody>
+{% for a in allowlists %}<tr><td>{{ L.pick(L.ALLOWLIST_KIND, a.kind) }}</td><td>{{ a.value }}</td><td>{{ a.valid_from | when }} ~ {{ a.valid_until | when }}</td><td>{{ a.note | blank }}</td><td>{{ m.badge(L.ALLOWLIST, a.status) }}</td>
+<td>{% if a.status == 'active' and actor.role == 'admin' %}<form method="post" action="/allowlists/{{ a.id }}/lift">{{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ a.state_version }}"><button type="submit">해제</button></form>{% endif %}</td></tr>{% endfor %}
+</tbody></table>
+{% else %}<p class="muted">허용 목록이 비어 있습니다.</p>{% endif %}
+{% if actor.role == 'admin' %}
+<form method="post" action="/allowlists" class="filters">
+  {{ m.csrf(actor) }}
+  <label>종류<select name="kind">{% for k, v in L.ALLOWLIST_KIND.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select></label>
+  <label>값<input name="value" required></label>
+  <label>유효 기간(일)<input type="number" name="valid_days" value="90" min="1" max="365"></label>
+  <label>메모<input name="note"></label>
+  <button type="submit" class="primary">추가</button>
+</form>
+{% endif %}
+{% endblock %}
