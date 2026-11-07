@@ -256,6 +256,23 @@ COMMANDS: tuple[CliCommand, ...] = (
         events=(EventKind.POLICY_ACTIVATED,),
     ),
     CliCommand(
+        path=("alert", "list"),
+        summary="경보를 상태별로 조회한다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("alert", "ack"),
+        summary="열린 경보를 확인 처리한다. 확인한 운영자와 함께 사건을 남긴다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.ALERT_ACKNOWLEDGED,),
+    ),
+    CliCommand(
+        path=("alert", "resolve"),
+        summary="경보를 해결됨으로 닫는다. 같은 원인이 다시 생기면 새 경보가 열린다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.ALERT_RESOLVED,),
+    ),
+    CliCommand(
         path=("ledger", "list"),
         summary="원장 사건을 종류·기간·호출 식별자로 조회한다.",
         roles=ALL_ROLES,
