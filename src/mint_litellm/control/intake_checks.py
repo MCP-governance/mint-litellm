@@ -35,6 +35,7 @@ DEFAULT_EVIDENCE_DAYS = 365
 MAX_TOOLS = 500
 MAX_DEPTH = 20
 DEFAULT_PORTS = (443, 8443)
+SERVER_CREDENTIAL_FLOW = "client_credentials"
 OAUTH_AUTH_TYPES = frozenset({"oauth2", "oauth2_token_exchange", "oauth2_id_jag", "oauth_delegate"})
 
 
@@ -217,11 +218,19 @@ def url_guard(
 
 
 def oauth_issuer_allowlist(
-    auth_type: str | None, issuer: str | None, allowlists: list[dict]
+    auth_type: str | None, issuer: str | None, allowlists: list[dict],
+    oauth2_flow: str | None = None,
 ) -> Outcome:
+    """인증 서버 허용 목록 검사. ``oauth2``는 서버 공통 자격(``client_credentials``)이 설정에서
+    확인될 때만 서버 범위로 인정한다(사용자별 토큰이 오가는 흐름이면 계약 범위가 달라진다)."""
     method = "allowlist:auth_server"
     if auth_type not in OAUTH_AUTH_TYPES:
         return _done("oauth_issuer_allowlist", Outcome("pass", None, method, {"applicable": False}))
+    if auth_type == "oauth2" and oauth2_flow != SERVER_CREDENTIAL_FLOW:
+        return _done("oauth_issuer_allowlist", Outcome(
+            "indeterminate", "OAUTH2_FLOW_UNCONFIRMED", method,
+            {"applicable": True, "oauth2_flow": oauth2_flow if isinstance(oauth2_flow, str)
+             else None}))
     if not issuer:
         return _done("oauth_issuer_allowlist",
                      Outcome("indeterminate", "ISSUER_UNDECLARED", method, {"applicable": True}))
