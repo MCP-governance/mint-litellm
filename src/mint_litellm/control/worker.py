@@ -23,6 +23,7 @@ from mint_litellm.control import alerts, exports, jobs, ledger
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.db.connection import connect, fetchone
 from mint_litellm.control.errors import ControlError
+from mint_litellm.control.litellm_write import LiteLLMSync
 from mint_litellm.control.stage2_config import Stage2Settings
 from mint_litellm.restore import judge as restore_judge
 from mint_litellm.types.events import EventKind
@@ -84,6 +85,7 @@ class Worker:
         self.verdict = restore_judge.Verdict(restore_judge.SKIP)
         self._reported_blocks: set[int] = set()
         self._alerted: set[tuple] = set()
+        self.litellm = litellm
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.stop = threading.Event()
         self.current: jobs.JobContext | None = None
@@ -221,7 +223,7 @@ class Worker:
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
             return
         ctx = jobs.JobContext(
-            conn, self.instance_id, job, self.settings, self.litellm,
+            conn, self.instance_id, job, self.settings, litellm=self.litellm,
             verdict=lambda: self.verdict,
         )
         self.current = ctx
@@ -233,6 +235,8 @@ class Worker:
         outcome: str | tuple[str, str] = "ok"
         try:
             jobs.HANDLERS[job["kind"]](ctx)
+        except jobs.PermanentFailure as error:
+            outcome = ("permanent", error.code)
         except jobs.Cancelled:
             outcome = "cancelled"
         except jobs.RestoreBlocked:
@@ -255,6 +259,8 @@ class Worker:
             jobs.release(conn, job_id, self.owner, "shutdown")
         elif outcome == "restore_blocked":
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
+        elif outcome[0] == "permanent":
+            jobs.fail_permanently(conn, job_id, self.owner, outcome[1])
         else:
             jobs.fail(conn, job_id, self.owner, outcome[1])
 
@@ -278,7 +284,9 @@ def main(environ: Mapping[str, str] | None = None) -> int:
     environ = dict(os.environ) if environ is None else dict(environ)
     config = ControlConfig.from_env(environ)
     settings = Stage2Settings.from_env(environ)
-    litellm = config.litellm() if config.litellm_url and config.litellm_key else None
+    litellm = None
+    if config.litellm_url and config.litellm_key:
+        litellm = LiteLLMSync(config.litellm_url, config.litellm_key)
     worker = Worker(config.require_database(), config.instance_id, settings, litellm=litellm)
     worker.open()
     worker.enqueue_startup_checkpoint()

@@ -62,6 +62,14 @@ class Cancelled(Exception):
     """작업 코드가 취소 신호를 보고 외부 호출을 멈추고 끝낼 때 낸다."""
 
 
+class PermanentFailure(Exception):
+    """재시도해도 소용없는 실패. 작업을 바로 ``failed``로 끝낸다(경보는 낸 쪽이 이미 열었다)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class RestoreBlocked(Exception):
     """되돌림 상태라 외부 쓰기를 하지 않는다. 작업은 실패가 아니라 대기로 돌아간다."""
 
@@ -85,6 +93,8 @@ class JobContext:
     litellm: Any = None
     cancel: threading.Event = field(default_factory=threading.Event)
     lost: threading.Event = field(default_factory=threading.Event)
+    # 관리 API 클라이언트(쓰기 가능). 설정이 없으면 None이다.
+    litellm: Any = None
     # 되돌림 판정의 현재 값(작업 실행기가 채운다). 외부 쓰기 경계가 읽는다.
     verdict: Callable[[], Any] = lambda: None
 
@@ -145,6 +155,17 @@ def _alert_deliver(job: JobContext) -> None:
     )
 
 
+def _sync(name: str) -> Callable[[JobContext], None]:
+    """권한 동기화 처리기(``sync_jobs``)를 부를 때 불러온다(모듈 순환을 피한다)."""
+
+    def run(job: JobContext) -> None:
+        from mint_litellm.control import sync_jobs
+
+        getattr(sync_jobs, name)(job)
+
+    return run
+
+
 def _seal(job: JobContext) -> None:
     job.external_write()
     seal.seal_once(job.conn, job.instance_id)
@@ -177,6 +198,10 @@ def _session_verify(job: JobContext) -> None:
 # 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
 HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "approval_expiry_scan": _approval_expiry_scan,
+    "sync_server": _sync("sync_server"),
+    "sync_target": _sync("sync_target"),
+    "sync_reconcile": _sync("sync_reconcile"),
+    "activation_finalize": _sync("activation_finalize"),
     "seal": _seal,
     "export_negative_state": _export_negative_state,
     "export_checkpoint": _export_checkpoint,
@@ -347,6 +372,19 @@ def _requeue(
 def fail(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> str | None:
     """처리기가 실패했다. ``pending``(재시도), ``failed``, 임대를 잃었으면 None을 돌려준다."""
     return _requeue(conn, job_id, "lease_owner = %s", (owner,), code, count=True)
+
+
+def fail_permanently(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> bool:
+    """재시도 없이 ``failed``로 끝낸다. 임대를 잃었으면 거짓이다."""
+    return (
+        conn.execute(
+            "UPDATE mint.jobs SET status = 'failed', last_error_code = %s, lease_owner = NULL,"
+            " lease_until = NULL, updated_at = now()"
+            " WHERE id = %s AND status = 'running' AND lease_owner = %s",
+            (code, job_id, owner),
+        ).rowcount
+        == 1
+    )
 
 
 def release(

@@ -90,6 +90,8 @@ def test_control_plane_routes():
         "/key/list",
         "/team/list",
         "/guardrails/list",
+        "/key/update",
+        "/team/update",
     )
 
 
@@ -135,7 +137,8 @@ def test_command_roles_follow_the_operator_role_model():
             assert OperatorRole.APPROVER in command.roles, command.name
             assert OperatorRole.VIEWER not in command.roles
         elif command.roles == frozenset(OperatorRole):
-            assert command.name in {"check", "status", "ledger list", "alert list"}
+            assert command.name in {"check", "status", "ledger list", "alert list",
+                                    "sync status"}
         else:
             assert command.roles == frozenset({OperatorRole.ADMIN}), command.name
 

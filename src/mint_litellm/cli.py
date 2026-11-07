@@ -51,6 +51,7 @@ from mint_litellm.control.services import policy as policy_service
 from mint_litellm.control.services import relations as relation_service
 from mint_litellm.control.services import servers as server_service
 from mint_litellm.control.services import settings as settings_service
+from mint_litellm.control.services import sync as sync_service
 from mint_litellm.types import fingerprint
 from mint_litellm.types.cli_commands import (
     COMMANDS,
@@ -373,6 +374,17 @@ def _ledger_list(run: Run) -> None:
         run.say(_ledger_line(row))
 
 
+def _sync_status(run: Run) -> None:
+    rows = sync_service.status(run.context(), held_only=run.args.held)
+    run.data["grants"] = [json.loads(json.dumps(row, default=str)) for row in rows]
+    for row in rows:
+        run.say(
+            f"{row['id']}	{row['target_type']}:{row['target_id']}	{row['item']}	"
+            f"{row['server_id']}	관측 {row['observed']}	외부 삭제 {row['missing_count']}	"
+            f"{'보류' if row['held'] else '-'}"
+        )
+
+
 def _policy_activate(run: Run) -> None:
     a, ctx = run.args, run.context()
     source = policy_versions.PolicySource(
@@ -560,6 +572,8 @@ HANDLERS: dict[str, Handler] = {
     ),
     "policy activate": _policy_activate,
     "ledger list": _ledger_list,
+    "sync status": _sync_status,
+    "sync resume": lambda r: sync_service.resume(r.context(), r.args.grant_id),
 }
 
 
@@ -716,6 +730,8 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--opa-url", help="정책 엔진 주소(기본: MINT_OPA_URL)"),
         _a("--timeout", type=float, default=30.0, help="엔진 적재 확인 제한 시간(초)"),
     ],
+    "sync status": [_a("--held", action="store_true", help="보류된 항목만 보인다")],
+    "sync resume": [_a("grant_id", help="동기화 항목 식별자(`sync status`의 첫 열)")],
     "ledger list": [
         _a("--kind"),
         _a("--since", type=_when),
