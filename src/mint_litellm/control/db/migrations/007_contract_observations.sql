@@ -18,7 +18,8 @@ CREATE TABLE mint.contract_observation_receipts (
     event_id uuid NOT NULL,
     PRIMARY KEY (instance_id, event_id)
 );
-GRANT SELECT, INSERT, UPDATE ON mint.contract_observations TO mint_control;
-GRANT SELECT, INSERT ON mint.contract_observation_receipts TO mint_control;
+GRANT SELECT ON mint.contract_observations TO mint_control;
+GRANT SELECT, INSERT, UPDATE ON mint.contract_observations TO mint_worker;
+GRANT SELECT, INSERT ON mint.contract_observation_receipts TO mint_worker;
 GRANT SELECT (version) ON mint.tool_contracts TO mint_plugin;
-GRANT INSERT ON mint.alerts, mint.litellm_grants TO mint_control;
+GRANT INSERT ON mint.alerts TO mint_worker;

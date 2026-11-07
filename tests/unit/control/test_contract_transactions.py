@@ -358,3 +358,36 @@ def test_deployment_proposal_blocks_until_atomic_reapproval(contract_db):
     assert server(conn)["url_sha256"] == url_sha256(definition["url"])
     assert len(events(conn, "deployment_contract_approved")) == 1
     assert len(events(conn, "deployment_contract_superseded")) == 1
+
+
+def test_login_roles_split_observation_planning_and_pin_writes(contract_db, fresh_db, login_roles):
+    import psycopg
+    from ctl_fixtures import as_login
+
+    conn, _, old = contract_db
+    state_version = server(conn)["state_version"]
+    with as_login(fresh_db, "mint_worker") as worker, as_login(fresh_db, "mint_control") as control:
+        worker.autocommit = control.autocommit = True
+        operator = Operator("reviewer", "approver", "reviewer")
+        wctx, cctx = Context(worker, "i", operator), Context(control, "i", operator)
+        record_tools(wctx, "s", "server", {"read": NEW}, state_version)
+        candidate = add_tool(conn, NEW)
+        iid = evidence(conn, candidate)
+        contracts.reapprove(cctx, "s", iid, [str(candidate)])
+        guarded = (
+            "INSERT INTO mint.litellm_grants(id,instance_id,target_type,target_id,item,"
+            "server_id) VALUES (gen_random_uuid(),'i','server','s','pin','s')",
+            "UPDATE mint.contract_observations SET change_seq = change_seq + 1",
+            "INSERT INTO mint.contract_observation_receipts(instance_id,event_id)"
+            " VALUES ('i',gen_random_uuid())",
+            "UPDATE mint.contract_reapproval_plans SET status='completed',result='{}'::jsonb",
+        )
+        for statement in guarded:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege), control.transaction():
+                control.execute(statement)
+        result = finalize_reapproval(worker, "i", "s", Pin(conn, old, candidate, {"read": NEW}))
+        assert result["pin_sha256"]
+    plan = fetchone(conn, "SELECT status FROM mint.contract_reapproval_plans")
+    assert plan["status"] == "completed"
+    grant = fetchone(conn, "SELECT observed FROM mint.litellm_grants WHERE item='pin'")
+    assert grant["observed"] is True

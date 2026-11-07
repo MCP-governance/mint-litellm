@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from datetime import timedelta
 
@@ -30,7 +31,8 @@ from mint_litellm.control.worker import Worker, install_signals  # noqa: E402
 
 HEX = "ab" * 32
 KEY = "A" * 43  # base64url, 디코딩하면 32바이트
-ENV = {"MINT_EXPORT_DIR": "/tmp/mint-export", "MINT_EXPORT_HMAC_KEY": KEY}
+# 작업 실행기가 내보내기 파일을 실제로 쓰므로 시험마다 비어 있는 임시 디렉터리를 쓴다.
+ENV = {"MINT_EXPORT_DIR": tempfile.mkdtemp(prefix="mint-export-"), "MINT_EXPORT_HMAC_KEY": KEY}
 SETTINGS = Stage2Settings.from_env(ENV)
 
 
@@ -57,10 +59,12 @@ def make_worker(url, admin):
     made: list[Worker] = []
 
     def make(schedules=False, **kwargs) -> Worker:
-        worker = Worker(login_url(url), INSTANCE, SETTINGS, **kwargs)
+        worker = Worker(login_url(url), INSTANCE, kwargs.pop("settings", SETTINGS), **kwargs)
         worker.open()
         if not schedules:  # 일정이 만드는 작업이 시험의 작업과 섞이지 않게 한다
             admin.execute("DELETE FROM mint.schedules")
+        elif schedules != "all":  # 일정 시험은 만료 점검 하나만 본다
+            admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
         made.append(worker)
         return worker
 
@@ -132,17 +136,18 @@ def test_the_worker_needs_the_worker_login(url):
 
 
 def test_the_worker_login_creates_the_schedules_it_has_handlers_for(make_worker, admin):
-    make_worker(schedules=True)
-    rows = fetchall(admin, "SELECT kind, interval_seconds FROM mint.schedules ORDER BY kind")
-    assert rows == [{"kind": "approval_expiry_scan", "interval_seconds": 60},
-                    {"kind": "contract_observe", "interval_seconds": SETTINGS.observe_seconds}]
+    make_worker(schedules="all")
+    rows = fetchall(admin, "SELECT kind, interval_seconds FROM mint.schedules")
+    expected = {k: f(SETTINGS) for k, f in jobs.SCHEDULES.items() if k in jobs.HANDLERS}
+    assert {r["kind"]: r["interval_seconds"] for r in rows} == expected
+    assert {"approval_expiry_scan", "seal"} <= set(expected)
 
 
 # --- 수렴 작업 등록 규칙 ----------------------------------------------------------
 
 
 def test_job_kinds_follow_the_registration_rules(url, all_handlers):
-    assert len(jobs.KINDS) == 14
+    assert len(jobs.KINDS) == 15  # 14종 + 해제 경로의 restore_publish
     assert {k for k, v in jobs.KINDS.items() if v.convergent} == {
         "contract_observe", "sync_server", "sync_target", "activation_finalize"}
     with psycopg.connect(url) as conn:
@@ -160,7 +165,7 @@ def test_a_known_kind_can_be_registered_before_its_handler_is_connected(url):
     with psycopg.connect(url) as conn:
         ensure(conn, INSTANCE)
         ctx = make_ctx(conn)
-        for kind, key in (("sync_server", None), ("seal", "seal:x")):
+        for kind, key in (("session_verify", "s:x"), ("submission_poll", "p:x")):
             assert kind not in jobs.HANDLERS
             assert base.enqueue_job(ctx, kind, "x", key)
         assert base.enqueue_job(ctx, "approval_expiry_scan", "x", "approval_expiry_scan:t")
@@ -388,6 +393,7 @@ def test_extending_an_expired_lease_fails(make_worker, admin):
 
 def test_a_schedule_registers_one_job_per_period_even_with_two_workers(make_worker, admin):
     first, second = make_worker(schedules=True), make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     admin.execute("UPDATE mint.schedules SET next_run_at = date_trunc('second', now())"
                   " - interval '1 second'")
     start = threading.Barrier(2)
@@ -402,21 +408,19 @@ def test_a_schedule_registers_one_job_per_period_even_with_two_workers(make_work
         thread.start()
     for thread in threads:
         thread.join(15)
-    assert sum(counts) == 2
-    [row] = fetchall(admin, "SELECT * FROM mint.jobs WHERE kind='approval_expiry_scan'")
+    assert sorted(counts) == [0, 1]
+    [row] = fetchall(admin, "SELECT * FROM mint.jobs")
     assert row["kind"] == "approval_expiry_scan" and row["status"] == "pending"
     assert re.fullmatch(r"approval_expiry_scan:\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ",
                         row["idempotency_key"])
     assert jobs.register_due_schedules(first.conn, INSTANCE) == 0  # 같은 주기에는 더 없다
-    [observation] = fetchall(admin, "SELECT * FROM mint.jobs WHERE kind='contract_observe'")
-    assert observation["idempotency_key"] is None
-    nxt = fetchone(admin, "SELECT bool_and(next_run_at > now()) AS future FROM mint.schedules")
+    nxt = fetchone(admin, "SELECT next_run_at > now() AS future FROM mint.schedules")
     assert nxt["future"] is True
 
 
 def test_missed_periods_are_skipped_to_the_current_one_on_the_original_grid(make_worker, admin):
     worker = make_worker(schedules=True)
-    admin.execute("DELETE FROM mint.schedules WHERE kind='contract_observe'")
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     admin.execute("UPDATE mint.schedules SET next_run_at = now() - interval '605 seconds'")
     before = fetchone(admin, "SELECT next_run_at FROM mint.schedules")["next_run_at"]
     assert jobs.register_due_schedules(worker.conn, INSTANCE) == 1  # 열 번 밀렸어도 한 건
@@ -464,7 +468,7 @@ def test_the_worker_runs_the_approval_expiry_scan_from_its_schedule(
                 " now() + %s::interval)", (INSTANCE, tag, HEX, delta))
         conn.commit()
     worker = make_worker(schedules=True)
-    admin.execute("DELETE FROM mint.schedules WHERE kind='contract_observe'")
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     assert worker.step()  # 일정 등록 -> 임대 -> 처리
     states = {r["principal_id"]: r["status"]
               for r in fetchall(admin, "SELECT principal_id, status FROM mint.call_approvals")}
@@ -489,11 +493,11 @@ def test_a_restored_database_blocks_external_writes_but_not_the_rest(
     worker = make_worker(restore_check=restored)
     blocked = put(admin, "sync_server", "srv")
     export = put(admin, "export_checkpoint", "c", "export_checkpoint:1")
-    free = put(admin, "seal", "s", "seal:1")
+    free = put(admin, "intake_run", "s", "intake_run:1")
     ran = 0
     while worker.step() and ran < 20:
         ran += 1
-    assert [k for k, _ in all_handlers] == ["seal"]  # 외부 쓰기 작업은 실행되지 않았다
+    assert [k for k, _ in all_handlers] == ["intake_run"]  # 외부 쓰기 작업은 실행되지 않았다
     for job_id in (blocked, export):
         row = job(admin, job_id)
         assert (row["status"], row["attempts"], row["last_error_code"]) == (
@@ -501,7 +505,8 @@ def test_a_restored_database_blocks_external_writes_but_not_the_rest(
         assert row["run_after"] > fetchone(admin, "SELECT now() AS n")["n"]
     assert job(admin, free)["status"] == "done"
     assert len(calls) >= 3  # 작업 전마다 판정한다
-    assert not alerts(admin)  # 시도 횟수와 경보를 쓰지 않는다
+    # 작업은 실패가 아니라 대기이므로 job_failed 경보는 없고, 차단 자체의 경보 하나만 열린다
+    assert [a["kind"] for a in alerts(admin)] == ["enforcement_unverified"]
 
 
 def test_the_default_check_never_blocks(make_worker, admin, all_handlers):
@@ -608,3 +613,165 @@ def test_the_worker_process_exits_cleanly_on_a_termination_signal(url, tmp_path)
         if proc.poll() is None:
             proc.kill()
         proc.stderr.close()
+
+
+# --- 되돌림 판정과 외부 쓰기 경계-------------------------------------------
+
+
+def _restore_settings(tmp_path):
+    from mint_litellm.control.stage2_config import Stage2Settings as S
+
+    return S.from_env({"MINT_EXPORT_DIR": str(tmp_path / "ex"), "MINT_EXPORT_HMAC_KEY": KEY})
+
+
+def _forge_negative_ahead(settings):
+    """부정 상태 파일을 DB보다 앞선 값으로 바꿔 DB를 되돌린 것처럼 만든다(서명은 올바르다)."""
+    from mint_litellm.control import exports
+    from mint_litellm.restore import files
+
+    path = files.newest_negative(settings.export_dir, INSTANCE)
+    doc = files.read_verified(path, exports.keys(settings))
+    doc["items"][0]["state_version"] = 99
+    files.atomic_write(path, files.sign(doc, settings.export_hmac_key))
+
+
+def _closed_org_and_export(url, worker, settings):
+    from mint_litellm.control import exports
+
+    with psycopg.connect(url) as conn:
+        ensure(conn, INSTANCE)
+        conn.execute("INSERT INTO mint.orgs (instance_id, org_id, name) VALUES (%s, 'a', 'a')",
+                     (INSTANCE,))
+        conn.execute("UPDATE mint.orgs SET status = 'closed' WHERE org_id = 'a'")
+        conn.commit()
+    exports.write_export(worker.conn, INSTANCE, settings, "negative_state")
+
+
+def test_the_startup_checkpoint_writes_the_first_latest(url, make_worker, admin, tmp_path):
+    from mint_litellm.control.worker import RestoreCheck
+    from mint_litellm.restore import files
+
+    settings = _restore_settings(tmp_path)
+    worker = make_worker(settings=settings, restore_check=RestoreCheck(settings, 0))
+    worker.enqueue_startup_checkpoint()
+    assert worker.step()
+    assert files.latest_path(settings.export_dir, INSTANCE).exists()
+    assert fetchone(admin, "SELECT status FROM mint.jobs WHERE kind = 'export_checkpoint'")[
+        "status"] == "done"
+
+
+def test_the_startup_checkpoint_does_not_overwrite_a_file_that_fails_verification(
+    url, make_worker, admin, tmp_path
+):
+    """기존 파일을 먼저 검증한다: 되돌린 DB가 기존 증거를 새 정상본으로 덮지 못한다."""
+    from mint_litellm.control.worker import RestoreCheck
+    from mint_litellm.restore import files
+
+    settings = _restore_settings(tmp_path)
+    worker = make_worker(settings=settings, restore_check=RestoreCheck(settings, 0))
+    worker.enqueue_startup_checkpoint()
+    worker.step()
+    path = files.latest_path(settings.export_dir, INSTANCE)
+    broken = path.read_text().replace('"state_epoch"', '"state_epochs"')
+    path.write_text(broken)
+    worker.enqueue_startup_checkpoint()
+    assert worker.step()
+    assert path.read_text() == broken
+    job_row = fetchone(admin, "SELECT * FROM mint.jobs WHERE status = 'pending'"
+                       " AND kind = 'export_checkpoint'")
+    assert job_row["last_error_code"] == "restore_blocked" and job_row["attempts"] == 0
+
+
+def test_the_first_mismatch_holds_evidence_jobs_only_and_the_second_blocks_all_writes(
+    url, make_worker, admin, tmp_path, all_handlers
+):
+    from mint_litellm.control.worker import RestoreCheck
+
+    settings = _restore_settings(tmp_path)
+    worker = make_worker(settings=settings, restore_check=RestoreCheck(settings, 0))
+    _closed_org_and_export(url, worker, settings)
+    _forge_negative_ahead(settings)
+    admin.execute("DELETE FROM mint.jobs")  # 부정 전이가 등록한 작업은 이 시험의 대상이 아니다
+    seal_job = put(admin, "seal", "s", "seal:1")
+    export = put(admin, "export_checkpoint", "c", "export_checkpoint:1")
+    sync = put(admin, "sync_server", "x")
+    assert worker.step()  # 첫 불일치: 보류. 우선순위가 높은 sync는 돈다
+    assert worker.verdict.state == "hold" and not worker.verdict.blocked
+    assert [k for k, _ in all_handlers] == ["sync_server"]
+    assert job(admin, sync)["status"] == "done"
+    worker.restore_check.interval = 1e9  # 이후 판정은 직전 값을 쓴다
+    while worker.step():
+        pass
+    for job_id in (seal_job, export):  # 증거 작업은 보류된다(시도 횟수 그대로)
+        row = job(admin, job_id)
+        assert row["status"] == "pending" and row["last_error_code"] == "restore_blocked"
+        assert row["attempts"] == 0
+    assert [k for k, _ in all_handlers] == ["sync_server"]
+    sync2 = put(admin, "sync_server", "y")
+    assert worker.step() and job(admin, sync2)["status"] == "done"  # 보류 중에도 호출 차단은 아니다
+    assert fetchone(admin, "SELECT count(*) AS n FROM mint.events"
+                    " WHERE kind = 'restore_blocked'")["n"] == 0
+    worker.restore_check.interval = 0  # 둘째 불일치: 차단
+    sync3 = put(admin, "sync_server", "z")
+    while worker.step():
+        pass
+    assert worker.verdict.blocked and worker.verdict.cause == "restore_pending"
+    assert job(admin, sync3)["last_error_code"] == "restore_blocked"
+    assert [k for k, _ in all_handlers] == ["sync_server", "sync_server"]
+    events = fetchall(admin, "SELECT * FROM mint.events WHERE kind = 'restore_blocked'")
+    assert len(events) == 1 and events[0]["source_key"].endswith(":1:restore_blocked")
+    raised = {a["kind"]: a for a in alerts(admin)}
+    assert raised["enforcement_unverified"]["subject"]["cause"] == "restore_pending"
+    assert raised["restore_blocked"]["count"] == 1  # 같은 차단은 한 번만 연다
+    worker.step()
+    assert fetchone(admin, "SELECT count(*) AS n FROM mint.events"
+                    " WHERE kind = 'restore_blocked'")["n"] == 1  # 한 번만 남긴다
+
+
+def test_a_checkpoint_right_after_a_restore_that_overtook_the_epoch_does_not_cover_the_evidence(
+    url, make_worker, admin, tmp_path
+):
+    from mint_litellm.control import exports
+    from mint_litellm.control.worker import RestoreCheck
+    from mint_litellm.restore import files
+
+    settings = _restore_settings(tmp_path)
+    worker = make_worker(settings=settings, restore_check=RestoreCheck(settings, 0))
+    _closed_org_and_export(url, worker, settings)
+    _forge_negative_ahead(settings)
+    # 복구 뒤의 소비·확인으로 DB 세대가 파일 세대를 추월했다
+    for _ in range(3):
+        admin.execute("UPDATE mint.settings SET mode = mode WHERE instance_id = %s", (INSTANCE,))
+    latest_path = files.latest_path(settings.export_dir, INSTANCE)
+    before = latest_path.read_bytes()
+    assert fetchone(admin, "SELECT epoch FROM mint.state_epoch")["epoch"] >= 4
+    worker.enqueue_startup_checkpoint()
+    assert worker.step()
+    assert latest_path.read_bytes() == before
+    assert worker.verdict.held
+    assert files.read_verified(latest_path, exports.keys(settings))
+
+
+def test_the_external_write_boundary_blocks_at_the_write_even_mid_job(
+    url, make_worker, admin, monkeypatch
+):
+    """공통 경계: 작업이 도는 중에 되돌림이 감지되면 다음 외부 쓰기 직전에 멈춘다."""
+    from mint_litellm.restore.judge import BLOCKED, Verdict
+
+    worker = make_worker(restore_check=lambda c, i: False)
+    wrote = []
+
+    def handler(ctx):
+        ctx.external_write()
+        wrote.append("first")
+        worker.verdict = Verdict(BLOCKED, "restore_pending")  # 작업 도중 판정이 바뀐다
+        ctx.external_write()
+        wrote.append("second")
+
+    monkeypatch.setitem(jobs.HANDLERS, "sync_target", handler)
+    job_id = put(admin, "sync_target", "t")
+    assert worker.step()
+    assert wrote == ["first"]
+    row = job(admin, job_id)
+    assert row["status"] == "pending" and row["last_error_code"] == "restore_blocked"
+    assert row["attempts"] == 0

@@ -45,6 +45,11 @@ class PluginConfig:
     selfcheck_grace_seconds: float = DEFAULT_SELFCHECK_GRACE_SECONDS
     log_level: str | None = None
     observe_seconds: int = 3600
+    # 되돌림 탐지(2단계). 읽기 전용으로 마운트한 내보내기 디렉터리와 서명 키.
+    export_dir: Path | None = None
+    export_hmac_key: bytes | None = None
+    export_hmac_key_previous: bytes | None = None
+    restore_interval_seconds: float = 60.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> PluginConfig:
@@ -57,6 +62,7 @@ class PluginConfig:
         except ValueError:
             raise RuntimeError("MINT_MODE must be enforce or observe") from None
         key = _fingerprint_key(env.get("MINT_FINGERPRINT_KEY"))
+        export_dir = env.get("MINT_EXPORT_DIR", "").strip()
         return cls(
             instance_id=instance_id,
             database_url=_required(env, "MINT_DATABASE_URL"),
@@ -78,6 +84,9 @@ class PluginConfig:
             readiness_url=env.get("MINT_READINESS_URL") or None,
             log_level=_log_level(env.get("MINT_LOG_LEVEL")),
             observe_seconds=_integer(env, "MINT_OBSERVE_SECONDS", 3600, 1),
+            export_dir=Path(export_dir) if export_dir else None,
+            export_hmac_key=_hmac_key(env, "MINT_EXPORT_HMAC_KEY"),
+            export_hmac_key_previous=_hmac_key(env, "MINT_EXPORT_HMAC_KEY_PREVIOUS"),
             selfcheck_grace_seconds=float(
                 _integer(
                     env,
@@ -126,6 +135,16 @@ def _fingerprint_key(raw: str | None) -> bytes | None:
         return decode_fingerprint_key(raw)
     except ValueError as exc:
         raise RuntimeError(f"MINT_FINGERPRINT_KEY is invalid: {exc}") from None
+
+
+def _hmac_key(env: Mapping[str, str], name: str) -> bytes | None:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return decode_fingerprint_key(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} is invalid: {exc}") from None
 
 
 def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:

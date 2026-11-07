@@ -18,6 +18,7 @@ from uuid import UUID
 
 import psycopg
 
+from mint_litellm import cli_restore
 from mint_litellm.control import (
     allowlists,
     approvals,
@@ -51,6 +52,7 @@ from mint_litellm.control.services import policy as policy_service
 from mint_litellm.control.services import relations as relation_service
 from mint_litellm.control.services import servers as server_service
 from mint_litellm.control.services import settings as settings_service
+from mint_litellm.control.services import sync as sync_service
 from mint_litellm.types import fingerprint
 from mint_litellm.types.cli_commands import (
     COMMANDS,
@@ -373,6 +375,17 @@ def _ledger_list(run: Run) -> None:
         run.say(_ledger_line(row))
 
 
+def _sync_status(run: Run) -> None:
+    rows = sync_service.status(run.context(), held_only=run.args.held)
+    run.data["grants"] = [json.loads(json.dumps(row, default=str)) for row in rows]
+    for row in rows:
+        run.say(
+            f"{row['id']}	{row['target_type']}:{row['target_id']}	{row['item']}	"
+            f"{row['server_id']}	관측 {row['observed']}	외부 삭제 {row['missing_count']}	"
+            f"{'보류' if row['held'] else '-'}"
+        )
+
+
 def _policy_activate(run: Run) -> None:
     a, ctx = run.args, run.context()
     source = policy_versions.PolicySource(
@@ -577,6 +590,8 @@ HANDLERS: dict[str, Handler] = {
     ),
     "policy activate": _policy_activate,
     "ledger list": _ledger_list,
+    "sync status": _sync_status,
+    "sync resume": lambda r: sync_service.resume(r.context(), r.args.grant_id),
 }
 
 
@@ -741,6 +756,8 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--opa-url", help="정책 엔진 주소(기본: MINT_OPA_URL)"),
         _a("--timeout", type=float, default=30.0, help="엔진 적재 확인 제한 시간(초)"),
     ],
+    "sync status": [_a("--held", action="store_true", help="보류된 항목만 보인다")],
+    "sync resume": [_a("grant_id", help="동기화 항목 식별자(`sync status`의 첫 열)")],
     "ledger list": [
         _a("--kind"),
         _a("--since", type=_when),
@@ -754,7 +771,7 @@ ARGUMENTS: dict[str, list[Any]] = {
 
 
 def _add_arguments(parser: argparse.ArgumentParser, name: str) -> None:
-    for spec in ARGUMENTS.get(name, []):
+    for spec in {**ARGUMENTS, **cli_restore.ARGUMENTS}.get(name, []):
         if spec == "SUBJECT":
             group = parser.add_mutually_exclusive_group(required=True)
             group.add_argument("--team")
@@ -779,7 +796,7 @@ def build_parser() -> argparse.ArgumentParser:
     root.add_argument("--json", action="store_true", help="결과를 JSON 한 개로 출력")
     tree: dict[tuple[str, ...], argparse._SubParsersAction] = {(): root.add_subparsers(
         dest="group0", metavar="명령", required=True)}
-    for command in COMMANDS:
+    for command in [*COMMANDS, *cli_restore.COMMANDS]:
         for depth in range(1, len(command.path)):
             prefix = command.path[:depth]
             if prefix not in tree:
@@ -798,7 +815,9 @@ def build_parser() -> argparse.ArgumentParser:
     return root
 
 
-COMMAND_INDEX: dict[str, CliCommand] = {c.name: c for c in COMMANDS}
+COMMAND_INDEX: dict[str, CliCommand] = {
+    c.name: c for c in [*COMMANDS, *cli_restore.COMMANDS]
+}
 
 
 def _token(args: argparse.Namespace, environ: dict[str, str]) -> str | None:
@@ -849,7 +868,7 @@ def run_command(args: argparse.Namespace, environ: dict[str, str]) -> None:
                 raise AuthError(f"{command.name}은(는) {operator.role} 역할로 실행할 수 없습니다.")
             ctx = Context(conn, cfg.instance_id, operator)
         run = Run(args, cfg, environ, conn, ctx)
-        HANDLERS[command.name](run)
+        (HANDLERS.get(command.name) or cli_restore.HANDLERS[command.name])(run)
     if args.json:
         print(json.dumps(_result(run, command), ensure_ascii=False, default=str))
     else:

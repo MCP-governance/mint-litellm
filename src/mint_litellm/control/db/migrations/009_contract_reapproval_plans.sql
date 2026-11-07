@@ -15,3 +15,15 @@ CREATE TABLE mint.contract_reapproval_plans (
     CHECK ((status = 'completed') = (result IS NOT NULL))
 );
 GRANT SELECT, INSERT, UPDATE ON mint.contract_reapproval_plans TO mint_control;
+GRANT SELECT, UPDATE (status, result) ON mint.contract_reapproval_plans TO mint_worker;
+-- 계획 확정(completed)은 작업 실행기 로그인만 한다. 제어 역할은 계획을 새로 세우거나 대기로 되돌릴 뿐이다.
+CREATE FUNCTION mint.contract_plan_complete_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status = 'completed' AND NOT pg_has_role(current_user, 'mint_worker', 'MEMBER') THEN
+        RAISE EXCEPTION '재승인 계획 확정은 작업 실행기만 합니다' USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER contract_plan_complete_guard BEFORE UPDATE ON mint.contract_reapproval_plans
+    FOR EACH ROW EXECUTE FUNCTION mint.contract_plan_complete_guard();

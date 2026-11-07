@@ -180,9 +180,9 @@ def assert_pending(conn):
     assert not conn.locked
 
 
-def test_request_commits_frozen_plan_block_event_and_known_job_without_handler(setup):
+def test_request_commits_frozen_plan_block_event_and_the_sync_job(setup):
     conn, ctx = setup
-    assert "sync_server" in jobs.KINDS and "sync_server" not in jobs.HANDLERS
+    assert "sync_server" in jobs.KINDS
     result = request(conn, ctx)
     saved = conn.state["saved"]
     assert str(saved["id"]) == result["plan_id"]

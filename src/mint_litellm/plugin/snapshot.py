@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import math
 import socket
 import time
@@ -120,6 +121,32 @@ SELECT jsonb_build_object(
 ) AS doc
 """
 
+CONFIRMATION_SNAPSHOT_SQL = SNAPSHOT_SQL.replace(
+    "'consents', (",
+    """'self_confirmations', (
+        SELECT coalesce(jsonb_agg(to_jsonb(c) - 'display'), '[]'::jsonb)
+        FROM mint.self_confirmations c
+        WHERE c.instance_id = %(iid)s AND c.status = 'confirmed'
+          AND c.server_id = %(server_id)s AND c.tool = %(tool)s
+          AND c.principal_id = %(user_id)s
+    ),
+    'consents', (""",
+)
+
+CONSUME_CONFIRMATION_SQL = """
+UPDATE mint.self_confirmations
+SET status = 'consumed', consumed_invocation_id = %(invocation_id)s,
+    consumed_at = clock_timestamp()
+WHERE instance_id = %(iid)s AND id = %(id)s AND status = 'confirmed'
+  AND org_id = %(org_id)s AND principal_id = %(principal_id)s
+  AND confirmed_by_user_id = %(principal_id)s
+  AND server_id = %(server_id)s AND tool = %(tool)s AND args_fp = %(args_fp)s
+  AND fp_key_version = %(fp_key_version)s AND policy_version_id = %(policy_version_id)s
+  AND state_version = %(state_version)s AND expires_at > clock_timestamp()
+  AND (NOT (SELECT require_separate_confirm_key FROM mint.settings WHERE instance_id = %(iid)s)
+       OR confirmed_by_key_token <> requested_by_key_token)
+"""
+
 INSERT_EVENT_SQL = """
 INSERT INTO mint.events
     (event_id, instance_id, inserted_at, kind, source_key, invocation_id, attempt_id,
@@ -178,6 +205,7 @@ class SettingsRow:
     default_org_id: str | None = None
     settings_version: int | None = None
     control_key_token: str | None = None
+    require_separate_confirm_key: bool = True
 
 
 @dataclass(frozen=True)
@@ -252,6 +280,23 @@ class CallApprovalRow:
 
 
 @dataclass(frozen=True)
+class ConfirmationRow:
+    id: UUID
+    org_id: str
+    principal_id: str
+    server_id: str
+    tool: str
+    args_fp: str
+    fp_key_version: int
+    policy_version_id: str
+    expires_at: datetime
+    state_version: int
+    confirmed_by_user_id: str
+    confirmed_by_key_token: str
+    requested_by_key_token: str
+
+
+@dataclass(frozen=True)
 class ConsentRow:
     id: str
     org_id: str
@@ -294,6 +339,7 @@ class Snapshot:
     policy_version: PolicyVersionRow | None
     tool_contracts: tuple[ToolContractRow, ...] = ()
     negative_relation: bool = False
+    self_confirmations: tuple[ConfirmationRow, ...] = ()
     # (값, 조직 또는 None): 지금 유효한 허용 목적지 목록. 패턴 계산의 허용 호스트에 쓴다.
     egress_targets: tuple[tuple[str, str | None], ...] = ()
 
@@ -315,6 +361,7 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
             default_org_id=settings.get("default_org_id"),
             settings_version=settings["settings_version"],
             control_key_token=settings.get("control_key_token"),
+            require_separate_confirm_key=settings.get("require_separate_confirm_key", True),
         ),
         bindings={
             (SubjectType(b["subject_type"]), b["subject_id"]): b["org_id"] for b in doc["bindings"]
@@ -410,6 +457,12 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
             for c in doc.get("tool_contracts", ())
         ),
         negative_relation=bool(doc.get("negative_relation", False)),
+        self_confirmations=tuple(
+            ConfirmationRow(**{
+                **{k: c[k] for k in ConfirmationRow.__dataclass_fields__},
+                "id": UUID(c["id"]), "expires_at": _time(c["expires_at"]),
+            }) for c in doc.get("self_confirmations", ())
+        ),
         egress_targets=tuple((e["value"], e["org_id"]) for e in doc.get("egress_targets", [])),
     )
 
@@ -595,7 +648,12 @@ class PluginDatabase:
             await conn.set_isolation_level(IsolationLevel.REPEATABLE_READ)
             await conn.set_read_only(True)
             async with conn.transaction():
-                cursor = await conn.execute(SNAPSHOT_SQL, params)
+                # v001 DB도 읽는다. 상태 값 자체는 아래 단일 질의의 같은 RR 스냅숏이다.
+                probe = await conn.execute("SELECT to_regclass('mint.self_confirmations')")
+                stage2 = (await probe.fetchone())[0] is not None
+                cursor = await conn.execute(
+                    CONFIRMATION_SNAPSHOT_SQL if stage2 else SNAPSHOT_SQL, params
+                )
                 return await cursor.fetchone()
 
         row = await self._run(read)
@@ -626,7 +684,7 @@ class PluginDatabase:
                     ),
                 )
                 inserted = cursor.rowcount == 1
-                if consume is not None:
+                if consume is not None and consume.call_approval_id is not None:
                     cursor = await conn.execute(
                         CONSUME_SQL,
                         {
@@ -644,9 +702,59 @@ class PluginDatabase:
                     )
                     if cursor.rowcount != 1:
                         raise ConsumptionLost
+                if consume is not None and consume.confirmation is not None:
+                    sc = consume.confirmation
+                    cursor = await conn.execute(CONSUME_CONFIRMATION_SQL, {
+                        "iid": event.instance_id, "id": sc.id, "org_id": sc.org_id,
+                        "invocation_id": consume.invocation_id,
+                        "principal_id": consume.principal_id, "server_id": consume.server_id,
+                        "tool": consume.tool, "args_fp": consume.args_fp,
+                        "fp_key_version": sc.fp_key_version,
+                        "policy_version_id": consume.policy_version_id,
+                        "state_version": sc.state_version,
+                    })
+                    if cursor.rowcount != 1:
+                        raise ConsumptionLost("CONFIRMATION_REQUIRED")
+                if consume is not None and consume.confirmation is not None and not inserted:
+                    raise ConsumptionLost(
+                        "CALL_APPROVAL_REQUIRED" if consume.call_approval_id is not None
+                        else "CONFIRMATION_REQUIRED"
+                    )
             return inserted
 
         return await self._run(write)
+
+    async def request_confirmation(self, params: Mapping[str, Any]) -> None:
+        """주체별 상한 검사와 부분 UNIQUE 삽입을 직렬화한다. 표시 값은 이 표에만 쓴다."""
+        from psycopg import IsolationLevel
+        from psycopg.types.json import Jsonb
+
+        async def write(conn: Any) -> None:
+            await conn.set_isolation_level(IsolationLevel.READ_COMMITTED)
+            await conn.set_read_only(False)
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (json.dumps([params["iid"], params["principal_id"]]),),
+                )
+                await conn.execute("""
+                    INSERT INTO mint.self_confirmations
+                        (id, instance_id, org_id, principal_id, server_id, tool, args_fp,
+                         fp_key_version, policy_version_id, purpose, requested_by_key_token,
+                         display, expires_at)
+                    SELECT %(id)s, %(iid)s::mint.ident, %(org_id)s::mint.ident, %(principal_id)s,
+                           %(server_id)s,
+                           %(tool)s, %(args_fp)s, %(fp_key_version)s,
+                           %(policy_version_id)s::mint.ident, %(purpose)s, %(key_token)s,
+                           %(display)s,
+                           clock_timestamp() + interval '10 minutes'
+                    WHERE (SELECT count(*) FROM mint.self_confirmations
+                           WHERE instance_id = %(iid)s AND principal_id = %(principal_id)s
+                             AND status = 'pending' AND expires_at > clock_timestamp()) < 20
+                    ON CONFLICT DO NOTHING
+                """, {**params, "display": Jsonb(params["display"])})
+
+        await self._run(write)
 
     async def read_epoch(self, instance_id: str) -> int | None:
         async def read(conn: Any) -> Any:

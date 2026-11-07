@@ -26,6 +26,8 @@ CONTROL_PLANE_ALLOWED_ROUTES: tuple[str, ...] = (
     "/key/list",
     "/team/list",
     "/guardrails/list",
+    "/key/update",
+    "/team/update",
 )
 
 # 관리 API 응답에서 수신 즉시 버리고 저장·기록·표시하지 않는 자격 열.
@@ -262,6 +264,18 @@ COMMANDS: tuple[CliCommand, ...] = (
         summary="정책 번들을 검증하고 정책 엔진에 적재한 뒤 활성 판본으로 전환한다.",
         roles=ADMIN_ONLY,
         events=(EventKind.POLICY_ACTIVATED,),
+    ),
+    CliCommand(
+        path=("sync", "status"),
+        summary="LiteLLM에 반영한 키·팀·서버 권한의 확인 상태, 외부 삭제 횟수, 보류 여부를 "
+        "조회한다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("sync", "resume"),
+        summary="반복 외부 삭제로 보류된 항목을 풀고 다시 부여한다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.SYNC_APPLIED,),
     ),
     CliCommand(
         path=("alert", "list"),

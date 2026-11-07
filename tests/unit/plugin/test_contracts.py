@@ -75,7 +75,7 @@ def test_observation_deadline_boundary_and_legacy():
     assert isinstance(contract_result(snapshot(), "search", 60), SkippedStage)
 
 
-@pytest.mark.parametrize("auth", ["oauth2", "oauth_delegate", "true_passthrough"])
+@pytest.mark.parametrize("auth", ["oauth_delegate", "true_passthrough"])
 def test_scope_does_not_fall_back(auth):
     snap = managed(
         server=server_row(contract_status="managed", auth_type=auth, last_observed_at=NOW)
@@ -83,6 +83,13 @@ def test_scope_does_not_fall_back(auth):
     assert contract_result(snap, "search", 60).reason_code == "CONTRACT_DRIFT_unapproved_tool"
     snap = replace(snap, tool_contracts=(ToolContractRow("c", "per_user", "search", "none", 2),))
     assert contract_result(snap, "search", 60).reason_code is None
+
+
+def test_oauth2_uses_the_server_scope():
+    from mint_litellm.types.canonical import credential_scope
+
+    assert credential_scope("oauth2") == "server"
+    assert credential_scope("oauth_delegate") == "per_user"
 
 
 def test_contract_findings_convert_as_family(tmp_path):

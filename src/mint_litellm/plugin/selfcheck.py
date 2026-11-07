@@ -35,6 +35,7 @@ from mint_litellm.plugin.pipeline import (
     evaluate_request,
 )
 from mint_litellm.plugin.policy.opa_client import Evaluation, OPAClient
+from mint_litellm.plugin.restore_watch import RestoreWatch
 from mint_litellm.plugin.result import ResultDeps
 from mint_litellm.plugin.snapshot import PluginDatabase, RegisteredServer
 from mint_litellm.types.canonical import sha256
@@ -313,6 +314,7 @@ class PluginRuntime:
     retry_seconds: float = 1.0
     recheck_seconds: float = 30.0
     verified: bool = False
+    restore_watch: Any = None
     logger: Any = None
     guardrail: Any = None
     last_results: list[CheckResult] = field(default_factory=list)
@@ -322,6 +324,7 @@ class PluginRuntime:
     _observed_hashes: dict[str, dict[str, str]] = field(default_factory=dict, repr=False)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
     _observe_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _restore_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @property
     def deps(self) -> PipelineDeps:
@@ -331,8 +334,13 @@ class PluginRuntime:
             recorder=self.recorder,
             evaluate=self.evaluate,
             secret_markers=self.secret_markers,
-            verified=lambda: self.verified,
+            verified=lambda: self.verified and self._restore_cause() is None,
+            unverified_cause=self._restore_cause,
         )
+
+    def _restore_cause(self) -> str | None:
+        """되돌림 판정이 호출을 막는 사유. 주기 판정이 메모리에 둔 값만 읽는다."""
+        return None if self.restore_watch is None else self.restore_watch.blocked_cause
 
     @property
     def result_deps(self) -> ResultDeps:
@@ -425,6 +433,9 @@ class PluginRuntime:
         return results
 
     async def verify(self) -> bool:
+        # 기동 점검의 재시도(30초)가 판정 주기(60초)를 앞지르지 않도록 첫 판정만 여기서 한다.
+        if self.restore_watch is not None and not self.restore_watch.evaluated:
+            await self.restore_watch.refresh()
         results = await self.run_checks()
         self.verified = all(r.ok for r in results)
         return self.verified
@@ -438,6 +449,8 @@ class PluginRuntime:
         except RuntimeError:
             return
         self._task = loop.create_task(self._startup())
+        if self.restore_watch is not None:
+            self._restore_task = loop.create_task(self.restore_watch.run())
         self._observe_task = loop.create_task(self._observe_contracts())
 
     async def _observe_contracts(self) -> None:
@@ -642,6 +655,7 @@ def get_runtime(env: Mapping[str, str] | None = None) -> PluginRuntime:
             config=config,
             database=database,
             recorder=recorder,
+            restore_watch=RestoreWatch(config, database),
             evaluate=engine.evaluate,
             secret_markers=engine.secret_markers,
         )

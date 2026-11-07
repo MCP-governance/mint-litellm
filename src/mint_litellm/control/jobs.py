@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import psycopg
 from psycopg.errors import UniqueViolation
 
-from mint_litellm.control import alerts, webhook
+from mint_litellm.control import alerts, seal, webhook
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.services import expiry
 from mint_litellm.types.ids import new_uuid7
@@ -39,13 +39,16 @@ KINDS: dict[str, JobKind] = {
     "sync_target": JobKind(convergent=True, external_write=True),
     "sync_reconcile": JobKind(external_write=True),
     "activation_finalize": JobKind(convergent=True, external_write=True),
-    "seal": JobKind(),
+    # 되돌림 상태에서는 봉인도 하지 않는다(되돌린 DB 위에 새 연쇄를 잇지 않는다).
+    "seal": JobKind(external_write=True),
     "export_negative_state": JobKind(external_write=True),
     "export_checkpoint": JobKind(external_write=True),
     "alert_deliver": JobKind(external_write=True),
     "approval_expiry_scan": JobKind(),
     "evidence_expiry_scan": JobKind(),
     "session_verify": JobKind(),
+    # 해제 경로: 되돌림 차단 상태에서도 실행한다(외부 쓰기 목록에 넣지 않는다).
+    "restore_publish": JobKind(),
 }
 
 # 우선순위: export_negative_state > sync_* > 나머지(같으면 run_after 순).
@@ -59,6 +62,26 @@ class Cancelled(Exception):
     """작업 코드가 취소 신호를 보고 외부 호출을 멈추고 끝낼 때 낸다."""
 
 
+class PermanentFailure(Exception):
+    """재시도해도 소용없는 실패. 작업을 바로 ``failed``로 끝낸다(경보는 낸 쪽이 이미 열었다)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class RestoreBlocked(Exception):
+    """되돌림 상태라 외부 쓰기를 하지 않는다. 작업은 실패가 아니라 대기로 돌아간다."""
+
+    def __init__(self, cause: str | None = None) -> None:
+        super().__init__(cause or "restore_blocked")
+        self.cause = cause
+
+
+# 처음 어긋난 순간부터 보류하는 증거 작업(봉인·내보내기). 나머지 외부 쓰기는 차단 때만 멈춘다.
+EVIDENCE_KINDS = frozenset({"seal", "export_negative_state", "export_checkpoint"})
+
+
 @dataclass
 class JobContext:
     """처리기에 건네는 맥락. 처리기는 외부 호출 전에 ``checkpoint()``로 취소를 확인한다."""
@@ -69,10 +92,27 @@ class JobContext:
     settings: Any = None
     cancel: threading.Event = field(default_factory=threading.Event)
     lost: threading.Event = field(default_factory=threading.Event)
+    # 관리 API 클라이언트(쓰기 가능). 설정이 없으면 None이다.
+    litellm: Any = None
+    # 되돌림 판정의 현재 값(작업 실행기가 채운다). 외부 쓰기 경계가 읽는다.
+    verdict: Callable[[], Any] = lambda: None
 
     def checkpoint(self) -> None:
         if self.cancel.is_set():
             raise Cancelled
+
+    def external_write(self) -> None:
+        """외부 쓰기(LiteLLM 쓰기·파일 쓰기) 직전마다 부르는 공통 경계.
+
+        임대를 잃었거나 종료 신호가 왔으면 ``Cancelled``, 되돌림 상태이면 ``RestoreBlocked``이다.
+        봉인·내보내기는 처음 어긋난 순간(``hold``)부터 멈춘다.
+        """
+        self.checkpoint()
+        verdict = self.verdict()
+        if verdict is None:
+            return
+        if verdict.blocked or (verdict.held and self.job["kind"] in EVIDENCE_KINDS):
+            raise RestoreBlocked(verdict.cause)
 
 
 def _approval_expiry_scan(job: JobContext) -> None:
@@ -120,10 +160,52 @@ def _contract_observe(job: JobContext) -> None:
     handle(job)
 
 
-# 이 단계에서 처리기가 붙은 작업. 등록된 나머지 종류는 처리기를 연결한 뒤 임대한다.
+def _sync(name: str) -> Callable[[JobContext], None]:
+    """권한 동기화 처리기(``sync_jobs``)를 부를 때 불러온다(모듈 순환을 피한다)."""
+
+    def run(job: JobContext) -> None:
+        from mint_litellm.control import sync_jobs
+
+        getattr(sync_jobs, name)(job)
+
+    return run
+
+
+def _seal(job: JobContext) -> None:
+    job.external_write()
+    seal.seal_once(job.conn, job.instance_id)
+
+
+def _export_negative_state(job: JobContext) -> None:
+    from mint_litellm.control import exports
+
+    exports.export_negative_state(job)
+
+
+def _restore_publish(job: JobContext) -> None:
+    from mint_litellm.control import restore_publish
+
+    restore_publish.publish(job)
+
+
+def _export_checkpoint(job: JobContext) -> None:
+    from mint_litellm.control import exports
+
+    exports.export_checkpoint(job)
+
+
+# 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
 HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "approval_expiry_scan": _approval_expiry_scan,
     "contract_observe": _contract_observe,
+    "sync_server": _sync("sync_server"),
+    "sync_target": _sync("sync_target"),
+    "sync_reconcile": _sync("sync_reconcile"),
+    "activation_finalize": _sync("activation_finalize"),
+    "seal": _seal,
+    "export_negative_state": _export_negative_state,
+    "export_checkpoint": _export_checkpoint,
+    "restore_publish": _restore_publish,
     "alert_deliver": _alert_deliver,
 }
 
@@ -290,6 +372,19 @@ def _requeue(
 def fail(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> str | None:
     """처리기가 실패했다. ``pending``(재시도), ``failed``, 임대를 잃었으면 None을 돌려준다."""
     return _requeue(conn, job_id, "lease_owner = %s", (owner,), code, count=True)
+
+
+def fail_permanently(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> bool:
+    """재시도 없이 ``failed``로 끝낸다. 임대를 잃었으면 거짓이다."""
+    return (
+        conn.execute(
+            "UPDATE mint.jobs SET status = 'failed', last_error_code = %s, lease_owner = NULL,"
+            " lease_until = NULL, updated_at = now()"
+            " WHERE id = %s AND status = 'running' AND lease_owner = %s",
+            (code, job_id, owner),
+        ).rowcount
+        == 1
+    )
 
 
 def release(

@@ -1163,6 +1163,9 @@ def test_two_staff_decisions_at_once_leave_one_decision_and_one_event(migrated_d
             conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
 
+SA, SB = "aa" * 32, "bb" * 32
+
+
 def _concurrent_decisions(migrated_database):
     import threading
     import time
@@ -1177,10 +1180,22 @@ def _concurrent_decisions(migrated_database):
         setup.execute("INSERT INTO mint.orgs (instance_id, org_id, name) VALUES (%s, 'o', 'o')", (instance,))  # noqa: E501
         setup.execute(
             "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256, transport,"
-            " auth_type, registered_by) VALUES (gen_random_uuid(), %s, 's', 'pending', %s,"
-            " 'http', 'none', 'a')", (instance, HEX))
+            " auth_type, registered_by) VALUES (gen_random_uuid(), %s, 's',"
+            " 'awaiting_approval', %s, 'http', 'none', 'a')", (instance, HEX))
         setup.execute("INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256,"
                       " bundle_sha256) VALUES (%s, 'pv', %s, %s)", (instance, HEX, HEX))
+        setup.execute("UPDATE mint.servers SET status = 'approved' WHERE instance_id = %s",
+                      (instance,))
+        setup.execute("INSERT INTO mint.usage_relations (id, instance_id, org_id, purpose,"
+                      " server_id) VALUES (gen_random_uuid(), %s, 'o', 'p', 's')", (instance,))
+        setup.execute("INSERT INTO mint.settings (instance_id, default_org_id) VALUES (%s, 'o')"
+                      " ON CONFLICT (instance_id) DO UPDATE SET default_org_id = 'o'", (instance,))
+        setup.execute(
+            "INSERT INTO mint.console_sessions (id_hash, instance_id, subject, user_id, key_token,"
+            " role, idle_expiry, absolute_expiry) VALUES ('" + SA + "', %s, 'staff', 'u1', 'tok-a',"
+            " 'staff', now() + interval '1 hour', now() + interval '1 day'),"
+            " ('" + SB + "', %s, 'staff', 'u1', 'tok-b', 'staff', now() + interval '1 hour',"
+            " now() + interval '1 day')", (instance, instance))
         cid = new_uuid7()
         setup.execute(
             "INSERT INTO mint.self_confirmations (id, instance_id, org_id, principal_id,"
@@ -1195,6 +1210,8 @@ def _concurrent_decisions(migrated_database):
         try:
             second.execute("SELECT set_config('mint.staff_user_id', 'u1', true)")
             second.execute("SELECT set_config('mint.staff_instance_id', %s, true)", (instance,))
+            second.execute("SELECT set_config('mint.staff_session_id_hash', %s, true)", (SB,))
+            second.execute("SELECT set_config('mint.staff_team_ids', '[]', true)")
             second.execute("SELECT mint.staff_confirm(%s, 'tok-b')", (cid,))
             second.commit()
             outcome["second"] = "ok"
@@ -1205,6 +1222,8 @@ def _concurrent_decisions(migrated_database):
     try:
         first.execute("SELECT set_config('mint.staff_user_id', 'u1', true)")
         first.execute("SELECT set_config('mint.staff_instance_id', %s, true)", (instance,))
+        first.execute("SELECT set_config('mint.staff_session_id_hash', %s, true)", (SA,))
+        first.execute("SELECT set_config('mint.staff_team_ids', '[]', true)")
         first.execute("SELECT mint.staff_confirm(%s, 'tok-a')", (cid,))
         thread = threading.Thread(target=late)
         thread.start()

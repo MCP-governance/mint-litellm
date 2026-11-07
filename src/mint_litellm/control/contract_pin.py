@@ -233,6 +233,13 @@ def finalize_reapproval(conn, instance_id: str, server_id: str, pin_client) -> d
             # unpin 실패도 이미 커밋된 차단을 해제하지 않으며 원래 실패를 보존한다.
             with contextlib.suppress(Exception):
                 pin_client.unpin(server_id)
+            with contextlib.suppress(Exception), conn.transaction():
+                conn.execute(
+                    "UPDATE mint.litellm_grants SET observed=false"
+                    " WHERE instance_id=%s AND target_type='server' AND target_id=%s"
+                    " AND item='pin' AND server_id=%s",
+                    (instance_id, server_id, server_id),
+                )
             raise
     finally:
         with conn.transaction():

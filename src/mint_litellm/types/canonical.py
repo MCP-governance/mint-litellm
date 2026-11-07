@@ -76,4 +76,4 @@ def pin_set_sha256(definitions: Mapping[str, Mapping[str, Any]]) -> str:
 
 
 def credential_scope(auth_type: str) -> str:
-    return "per_user" if auth_type in {"oauth2", "oauth_delegate", "true_passthrough"} else "server"
+    return "per_user" if auth_type in {"oauth_delegate", "true_passthrough"} else "server"

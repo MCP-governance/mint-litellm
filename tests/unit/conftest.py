@@ -10,6 +10,8 @@ import mint_litellm
 MIGRATIONS = Path(mint_litellm.__file__).parent / "control" / "db" / "migrations"
 MIGRATION = MIGRATIONS / "001_initial.sql"
 STAGE2 = MIGRATIONS / "002_stage2.sql"
+STAGE3 = MIGRATIONS / "003_negative_export.sql"
+STAGE8 = MIGRATIONS / "008_restore_requests.sql"
 DATABASE_URL = os.environ.get("MINT_TEST_DATABASE_URL")
 
 
@@ -30,6 +32,8 @@ def migrated_database() -> Iterator[str]:
     try:
         with psycopg.connect(url, autocommit=True) as conn:
             for migration in sorted(MIGRATIONS.glob("*.sql")):
+                if migration.name.startswith("004_"):
+                    continue  # 직원 확인 함수는 그 시험이 직접 적용한다.
                 conn.execute(migration.read_text(encoding="utf-8"))
         yield url
     finally:
