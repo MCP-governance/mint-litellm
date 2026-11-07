@@ -32,6 +32,9 @@ EXPORT_CONFIG_MISSING = "export_config_missing"
 #   ``servers.id``)의 해제 사건(``denial_lifted``·``server_resumed``)이 있어야 한다. 사건의 판본은
 #   파일 판본보다 크고 행의 현재 판본 이하여야 한다(파일 이후의 그 전이에 결속). 봉인 여부는
 #   묻지 않는다(미봉인 사건 때문에 보류가 풀리지 않는 교착을 없앤다). 아니면 ``reapply``.
+#   해제 전이가 있는 것은 거부 해제와 서버 재개뿐이다(나머지 종류의 상태 기계는 종결 상태로만
+#   가며 해제 사건이 없다). 판본이 더 높고 아직 부정 상태인 행은 신원 열(범위·서버·도구·조직 등)이
+#   파일과 같아야 한다(다르면 ``content``).
 # 값이 안 바뀐 UPDATE도 판본을 올리므로 판본만으로는 되돌림을 가릴 수 있다. 정상 해제·변경은 새
 # 부정 상태 파일을 내므로 파일이 따라온다.
 ITEM_CHECK_CTE = """
@@ -90,6 +93,19 @@ f AS (
                      THEN split_part(e.source_key, ':', 3)::bigint END)
                BETWEEN f.state_version + 1 AND r.state_version)
       THEN 'reapply'
+    WHEN r.state_version > f.state_version AND r.neg AND f.row IS NOT NULL AND EXISTS (
+         SELECT 1 FROM unnest(CASE f.kind
+           WHEN 'denial' THEN ARRAY['org_id', 'scope_type', 'scope_id', 'server_id', 'tools']
+           WHEN 'approval' THEN ARRAY['org_id', 'scope_type', 'scope_id', 'server_id', 'tools',
+                                      'relation_id']
+           WHEN 'server' THEN ARRAY['server_id']
+           WHEN 'relation' THEN ARRAY['org_id', 'team_id', 'server_id', 'purpose']
+           WHEN 'org' THEN ARRAY['org_id']
+           WHEN 'allowlist' THEN ARRAY['org_id', 'kind', 'value']
+           WHEN 'consent' THEN ARRAY['org_id', 'server_id', 'human_user_id', 'purpose']
+         END) AS k
+         WHERE r.row -> k IS DISTINCT FROM f.row -> k)
+      THEN 'content'
   END AS problem
   FROM f LEFT JOIN rows r ON r.kind = f.kind AND r.id = f.id
 )

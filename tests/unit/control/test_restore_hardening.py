@@ -312,3 +312,62 @@ def test_attest_refuses_a_content_difference_without_a_second_admin_and_accepts_
     with psycopg.connect(world["live"], autocommit=True) as conn:
         row = fetchone(conn, "SELECT cause, second_approver FROM mint.restore_requests")
     assert row == {"cause": "content", "second_approver": "second"}
+
+
+def test_a_higher_version_with_a_changed_denial_scope_is_a_mismatch(world):
+    denial, _ = None, None
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        denial = fetchone(conn, "INSERT INTO mint.denials (id, instance_id, org_id, scope_type,"
+                          " scope_id, reason, created_by) VALUES (gen_random_uuid(), %s, 'acme',"
+                          " 'org', 'acme', '유출 의심', 'root') RETURNING id", (INSTANCE,))["id"]
+        exports.write_export(conn, INSTANCE, world["settings"], "negative_state")
+        exports.write_export(conn, INSTANCE, world["settings"], "checkpoint")
+        assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK
+        conn.execute("UPDATE mint.denials SET reason = reason WHERE id = %s", (denial,))
+        assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK  # 같은 신원
+        conn.execute("SET session_replication_role = replica")  # 범위만 바꾸고 판본을 올린다
+        conn.execute("UPDATE mint.denials SET scope_id = 'other', state_version = state_version"
+                     " + 1 WHERE id = %s", (denial,))
+    first, second = _verdicts(world["live"], world["settings"])
+    assert first.state == judge.HOLD and second.blocked
+
+
+def _allowlist(conn):
+    return fetchone(conn, "INSERT INTO mint.allowlists (id, instance_id, kind, value, valid_from,"
+                    " valid_until, created_by) VALUES (gen_random_uuid(), %s, 'provider', 'x.test',"
+                    " now() - interval '1 day', now() + interval '30 days', 'root') RETURNING id",
+                    (INSTANCE,))["id"]
+
+
+def test_terminal_state_machines_accept_forward_moves_and_refuse_a_forged_reopening(world):
+    """조직·허용 목록·이용 관계에는 해제 전이도 해제 사건도 없다: 부정 상태 안의 이동은 통과하고
+    되돌려 여는 것은 사건이 없으므로 막힌다."""
+    from control.test_restore_acceptance import add_relation_with_approval
+
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        conn.execute("INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256,"
+                     " transport, auth_type, registered_by) VALUES (gen_random_uuid(), %s, 's1',"
+                     " 'awaiting_approval', repeat('a', 64), 'http', 'none', 'x')", (INSTANCE,))
+        conn.execute("UPDATE mint.servers SET status = 'approved'")
+        relation, _ = add_relation_with_approval(conn, "ops")
+        allowlist = _allowlist(conn)
+        conn.execute("UPDATE mint.usage_relations SET status = 'terminating'")
+        conn.execute("UPDATE mint.allowlists SET status = 'lifted'")
+        conn.execute("UPDATE mint.orgs SET status = 'closed' WHERE org_id = 'acme'")
+        exports.write_export(conn, INSTANCE, world["settings"], "negative_state")
+        exports.write_export(conn, INSTANCE, world["settings"], "checkpoint")
+        assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK
+        conn.execute("UPDATE mint.usage_relations SET status = 'terminated'")  # 부정 상태 안의 이동
+        assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK
+        conn.execute("SET session_replication_role = replica")
+        for table, column, key in (("usage_relations", "id", relation),
+                                   ("allowlists", "id", allowlist),
+                                   ("orgs", "org_id", "acme")):
+            conn.execute(f"UPDATE mint.{table} SET status = 'active', state_version ="
+                         f" state_version + 5 WHERE {column}::text = %s", (str(key),))
+            first, second = _verdicts(world["live"], world["settings"])
+            assert first.state == judge.HOLD and second.blocked, table
+            conn.execute(f"UPDATE mint.{table} SET status = %s WHERE {column}::text = %s",
+                         ({"usage_relations": "terminated", "allowlists": "lifted",
+                           "orgs": "closed"}[table], str(key)))
+            assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK, table
