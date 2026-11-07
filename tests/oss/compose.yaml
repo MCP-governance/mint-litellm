@@ -33,7 +33,7 @@ services:
     volumes:
       - ./config/litellm.yaml:/app/config.yaml:ro
     ports:
-      - "127.0.0.1:4741:4000"
+      - "4741:4000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:4000/health/readiness', timeout=3).read()"]
       interval: 5s
@@ -54,7 +54,7 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
     ports:
-      - "127.0.0.1:4742:3000"
+      - "4742:3000"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
       interval: 3s
@@ -70,7 +70,7 @@ services:
       GRAFANA_URL: http://grafana:3000
       GRAFANA_SERVICE_ACCOUNT_TOKEN: ${G10_GRAFANA_TOKEN:-}
     ports:
-      - "127.0.0.1:4745:8000"
+      - "4745:8000"
     profiles: [grafana-mcp]
     networks: [mcp]
 
@@ -88,7 +88,7 @@ services:
     image: mint-g10-playwright:${G10_PLAYWRIGHT_VERSION:?}
     command: ["--browser", "chromium", "--headless", "--no-sandbox", "--host", "::", "--port", "8931", "--allowed-hosts", "*"]
     ports:
-      - "127.0.0.1:4743:8931"
+      - "4743:8931"
 
   mcp-context7:
     <<: *mcp-npm
@@ -103,7 +103,7 @@ services:
     image: mint-g10-context7:${G10_CONTEXT7_VERSION:?}
     command: ["--transport", "http", "--port", "3000"]
     ports:
-      - "127.0.0.1:4744:3000"
+      - "4744:3000"
 
 networks:
   mcp: {}
