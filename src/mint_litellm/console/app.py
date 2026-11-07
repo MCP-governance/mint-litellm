@@ -1,5 +1,7 @@
 """관리자 콘솔 앱: FastAPI + Jinja2(서버 렌더링) + HTMX. 빌드 단계와 외부 자산이 없다."""
 
+import time
+from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -35,7 +37,23 @@ HEADERS = {
     "Referrer-Policy": "same-origin",
     "X-Frame-Options": "DENY",
     "Cross-Origin-Opener-Policy": "same-origin",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 }
+
+
+LOGIN_ATTEMPTS_PER_MINUTE = 10
+
+def too_many_attempts(request: Request) -> bool:
+    """같은 주소의 분당 로그인 시도 수 제한. 프로세스별 메모리 기준이다(복제본마다 따로 센다)."""
+    now = time.monotonic()
+    address = request.client.host if request.client else ""
+    window = request.app.state.attempts.setdefault(address, deque())
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= LOGIN_ATTEMPTS_PER_MINUTE:
+        return True
+    window.append(now)
+    return False
 
 
 def create_app(
@@ -44,11 +62,19 @@ def create_app(
     config = config or ConsoleConfig.from_env({} if env is None else env)
     app = FastAPI(title="MINT 관리자 콘솔", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.config = config
+    app.state.attempts = {}
 
     @app.middleware("http")
     async def common(request: Request, call_next):
         request.state.request_id = str(new_uuid7())
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:  # 처리하지 못한 오류도 보안 헤더와 요청 식별자를 단다
+            response = JSONResponse(
+                {"code": "MINT-ADMIN-UNAVAILABLE", "message": "요청을 처리하지 못했습니다.",
+                 "reference": request.state.request_id},
+                status_code=500,
+            )
         for name, value in HEADERS.items():
             response.headers[name] = value
         response.headers["X-Request-Id"] = request.state.request_id
@@ -71,6 +97,14 @@ def create_app(
                 "message": f"요청 값이 올바르지 않습니다: {fields}",
                 "reference": request.state.request_id,
             },
+            status_code=400,
+        )
+
+    @app.exception_handler(ValueError)
+    async def bad_value(request: Request, error: ValueError):
+        return JSONResponse(
+            {"code": "MINT-ADMIN-INVALID-INPUT", "message": "입력 값이 올바르지 않습니다.",
+             "reference": request.state.request_id},
             status_code=400,
         )
 
@@ -102,6 +136,11 @@ def create_app(
         request: Request, key: str = Form(""), conn: psycopg.Connection = Depends(db)
     ) -> Response:
         cfg = config_of(request)
+        if too_many_attempts(request):
+            return render(
+                request, "login.html",
+                {"error": "로그인 시도가 너무 많습니다. 잠시 뒤 다시 시도하십시오."}, status=429,
+            )
         try:
             identity = login.verify(cfg.litellm_url, key)
             key = ""  # 평문 키는 여기서 버린다

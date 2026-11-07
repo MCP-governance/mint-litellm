@@ -6,7 +6,7 @@
 {% if approvals %}
 <table><thead><tr><th>서버</th><th>대상</th><th>도구</th><th>유효 기간</th><th>철회</th></tr></thead><tbody>
 {% for a in approvals %}<tr>
-<td><a href="/servers/{{ a.server_id }}">{{ a.server_id }}</a></td>
+<td><a href="/servers/{{ a.server_id | urlencode }}">{{ a.server_id }}</a></td>
 <td>{{ L.pick(L.SCOPE, a.scope_type) }} {{ a.scope_id }}</td><td>{{ a.tools | join }}</td>
 <td>{{ a.valid_from | when }} ~ {{ a.valid_until | when }}</td>
 <td>{% if actor.role != 'viewer' %}

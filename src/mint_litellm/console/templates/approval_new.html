@@ -3,7 +3,7 @@
 {% block body %}
 <h1>승인 검토</h1>
 <dl class="detail">
-  <dt>서버</dt><dd><a href="/servers/{{ relation.server_id }}">{{ relation.server_id }}</a></dd>
+  <dt>서버</dt><dd><a href="/servers/{{ relation.server_id | urlencode }}">{{ relation.server_id }}</a></dd>
   <dt>조직</dt><dd>{{ relation.org_name }}</dd>
   <dt>팀</dt><dd>{{ relation.team_id | blank }}</dd>
   <dt>목적</dt><dd>{{ relation.purpose }}</dd>

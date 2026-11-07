@@ -48,19 +48,22 @@ def verdict(
 
 
 def run(job: jobs.JobContext) -> None:
-    if job.litellm is None:
-        raise ControlError(
-            "session_verify에는 제어 평면 키(MINT_LITELLM_URL·MINT_LITELLM_KEY)가 필요합니다."
-        )
     conn, instance = job.conn, job.instance_id
     period = getattr(job.settings, "session_verify_seconds", 300)
-    unreachable: LiteLLMError | None = None
+    # 제어 평면 키가 없는 것도 확인하지 못함으로 같게 다룬다(키 없는 설치에 세션이 남지 않는다)
+    unreachable: Exception | None = None
+    if job.litellm is None:
+        unreachable = ControlError(
+            "session_verify에는 제어 평면 키(MINT_LITELLM_URL·MINT_LITELLM_KEY)가 필요합니다."
+        )
     for session in console_sessions.active_sessions(conn, instance):
         job.checkpoint()
         try:
+            if job.litellm is None:
+                raise unreachable
             key = job.litellm.get_key(session["key_token"])
             user = job.litellm.get_user(session["user_id"])
-        except LiteLLMError as error:
+        except (LiteLLMError, ControlError) as error:
             unreachable = unreachable or error
             if session["unverified_seconds"] > UNVERIFIED_PERIODS * period:
                 console_sessions.revoke(

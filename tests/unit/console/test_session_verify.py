@@ -133,13 +133,6 @@ def test_an_unreachable_litellm_fails_the_job_without_revoking(world):
     assert live(world) == [("human-1",)]
 
 
-def test_the_job_needs_the_control_key(world):
-    conn = as_login(world.admin_url, "mint_worker")
-    with pytest.raises(ControlError, match="제어 평면 키"):
-        session_verify.run(jobs.JobContext(conn, INSTANCE, {}, None, None))
-    conn.close()
-
-
 def test_the_job_has_a_handler_and_a_five_minute_schedule(world):
     assert "session_verify" in jobs.HANDLERS
     settings = Stage2Settings.from_env(
@@ -182,3 +175,21 @@ def test_the_console_holds_the_control_key_only_through_a_read_only_client():
     client = ReadOnlyLiteLLM(LiteLLMAdmin("http://localhost:9", CONTROL_KEY))
     assert sorted(vars(client)) == [
         "get_key", "get_server", "get_team", "get_user", "list_servers"]
+
+
+def test_without_a_control_key_unverified_sessions_are_revoked_after_two_periods(world):
+    world.session_client("admin")
+    world.session_client("viewer")
+    world.query("UPDATE mint.console_sessions SET last_verified_at = now() - interval '9 minutes'"
+                " WHERE user_id = 'human-1'")
+    world.query("UPDATE mint.console_sessions SET last_verified_at = now() - interval '11 minutes'"
+                " WHERE user_id = 'human-3'")
+    conn = as_login(world.admin_url, "mint_worker")
+    conn.autocommit = True
+    settings = Stage2Settings.from_env(
+        {"MINT_EXPORT_DIR": "/tmp/x", "MINT_EXPORT_HMAC_KEY": "A" * 43})
+    with pytest.raises(ControlError, match="제어 평면 키"):
+        session_verify.run(jobs.JobContext(conn, INSTANCE, {}, settings, None))
+    conn.close()
+    assert live(world) == [("human-1",)]
+    assert end_reasons(world) == ["unverified"]

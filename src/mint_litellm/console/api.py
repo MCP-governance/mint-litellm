@@ -92,6 +92,12 @@ def approval_conditions(body: "ApprovalBody") -> dict[str, Any]:
     return conditions
 
 
+def safe_cell(value: Any) -> str:
+    """스프레드시트가 수식으로 읽는 칸(``=``·``+``·``-``·``@`` 등으로 시작)에 ``'``를 붙인다."""
+    text = str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", chr(9), chr(13)) else text
+
+
 def done(actor: Actor, **extra: Any) -> dict[str, Any]:
     return {"ok": True, **extra, "events": [e.source_key for e in actor.ctx.emitted]}
 
@@ -327,8 +333,10 @@ def export_ledger(
     )
     for row in rows:
         writer.writerow([
-            row["event_id"], row["inserted_at"].isoformat(), row["kind"], row["actor"] or "",
-            row["server_id"] or "", row["result"] or "", row["source_key"],
+            safe_cell(c) for c in (
+                row["event_id"], row["inserted_at"].isoformat(), row["kind"], row["actor"] or "",
+                row["server_id"] or "", row["result"] or "", row["source_key"],
+            )
         ])
     return Response(
         "﻿" + out.getvalue(),

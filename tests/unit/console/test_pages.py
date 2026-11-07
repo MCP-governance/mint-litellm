@@ -295,3 +295,62 @@ def test_the_overview_shows_jobs_nobody_can_handle_and_the_longest_wait(world, a
         INSTANCE)
     html = admin.get("/").text
     assert "처리기 없는 대기 작업" in html and "최장 대기 2시간" in html
+
+
+def test_ledger_csv_neutralizes_spreadsheet_formulas(world):
+    from mint_litellm.console.api import safe_cell
+
+    assert [safe_cell(v) for v in ("=1+1", "+x", "-x", "@sum", "plain", "2026")] == [
+        "'=1+1", "'+x", "'-x", "'@sum", "plain", "2026"]
+    world.query(
+        "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload)"
+        " VALUES (%s, %s, 'org_created', 'org:x:1:org_created', '=cmd', '{}')",
+        uuid.uuid4(), INSTANCE)
+    client = world.session_client()
+    text = client.get("/api/v1/ledger/export?format=csv").text
+    assert "'=cmd" in text and ",=cmd," not in text
+
+
+@pytest.mark.parametrize("path,data", [
+    ("/policy/mode", {"mode": "zz", "state_version": 1}),
+    ("/denials", {"scope_type": "zz", "scope_id": "x", "reason": "r"}),
+])
+def test_bad_form_values_are_a_400_with_security_headers(world, admin, path, data):
+    response = form_post(world, admin, path, **data)
+    assert response.status_code == 400
+    assert "default-src 'self'" in response.headers["content-security-policy"]
+
+
+def test_a_bad_ledger_date_and_bad_paths_mode_are_400(world, admin):
+    bad = admin.get("/ledger?since=zz")
+    assert bad.status_code == 400 and "strict-transport-security" in bad.headers
+    relation = world.query("SELECT id, state_version FROM mint.usage_relations LIMIT 1")[0]
+    world.with_control_key()
+    response = form_post(
+        world, admin, "/approvals", relation_id=relation[0], state_version=relation[1],
+        scope_type="key", scope_id="k", tools="echo", requested_by="u", paths_mode="zz")
+    assert response.status_code == 400
+
+
+def test_hsts_is_sent_and_server_links_are_url_encoded(world, admin):
+    response = admin.get("/servers")
+    assert "max-age=31536000" in response.headers["strict-transport-security"]
+    world.query(
+        "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256, transport,"
+        " auth_type, registered_by) VALUES (gen_random_uuid(), %s, 'a b\"c', 'awaiting_approval',"
+        " %s, 'http', 'none', 'admin')", INSTANCE, "ab" * 32)
+    html = admin.get("/servers").text
+    assert 'href="/servers/a%20b%22c"' in html
+
+
+def test_the_login_is_rate_limited_per_address(world):
+    codes = [world.client.post("/login", data={"key": "sk-nope"}).status_code for _ in range(12)]
+    assert codes[:10] == [401] * 10 and codes[10:] == [429, 429]
+    assert world.client.post("/login", data={"key": Keys.admin}).status_code == 429
+
+
+def test_a_session_ends_when_its_operator_row_expires(world):
+    client = world.session_client("approver")
+    world.query("UPDATE mint.operators SET expires_at = now() - interval '1 minute'"
+                " WHERE name = 'approver'")
+    assert client.get("/").status_code == 303

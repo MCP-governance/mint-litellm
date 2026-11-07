@@ -92,6 +92,10 @@ def lookup(
         " idle_expiry = LEAST(now() + make_interval(secs => %s), absolute_expiry)"
         " WHERE instance_id = %s AND id_hash = %s AND subject = 'admin' AND revoked_at IS NULL"
         " AND idle_expiry > now() AND absolute_expiry > now()"
+        " AND EXISTS (SELECT 1 FROM mint.operators o"
+        "  WHERE o.instance_id = console_sessions.instance_id"
+        "  AND o.user_id = console_sessions.user_id AND o.role = console_sessions.role"
+        "  AND (o.expires_at IS NULL OR o.expires_at > now()))"
         " RETURNING id_hash, user_id, operator_name, role, key_token",
         (settings.session_idle_seconds, instance_id, hash_id(session_id)),
     )

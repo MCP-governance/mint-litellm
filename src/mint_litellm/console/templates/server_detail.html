@@ -33,14 +33,14 @@
   {% if s.status == 'approved' %}
   <h3>서버 중지</h3>
   <p class="effect">이 서버로 가는 모든 호출이 차단됩니다. 영향받는 서버 1개, 유효 승인 {{ s.approvals | selectattr('status', 'equalto', 'active') | list | length }}건.</p>
-  <form method="post" action="/servers/{{ s.server_id }}/suspend" class="form">
+  <form method="post" action="/servers/{{ s.server_id | urlencode }}/suspend" class="form">
     {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ s.state_version }}">
     <label>확인을 위해 서버 이름 입력<input name="confirm_name" data-confirm="{{ s.server_id }}" autocomplete="off"></label>
     <div class="actions"><button type="submit" class="danger" data-needs-confirm>서버 중지</button></div>
   </form>
   {% else %}
   <h3>서버 재개</h3>
-  <form method="post" action="/servers/{{ s.server_id }}/resume" class="form">
+  <form method="post" action="/servers/{{ s.server_id | urlencode }}/resume" class="form">
     {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ s.state_version }}">
     <div class="actions"><button type="submit" class="primary">서버 재개</button></div>
   </form>
