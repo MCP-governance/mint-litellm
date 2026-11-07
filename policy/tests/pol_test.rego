@@ -109,10 +109,18 @@ test_pol_e08_e15_without_allowed_keys_is_not_applied if {
 }
 
 test_pol_malformed_patterns_are_missing_inputs if {
-	bad := object.union(sample, {"arguments": {"keys": [], "sizes": {}, "patterns": {"url_external": "yes"}}})
+	bad := object.union(managed, {"arguments": {"keys": [], "sizes": {}, "patterns": {"url_external": "yes"}}})
 	"arguments.patterns" in evaluate(bad).missing_inputs
 	partial := object.union(sample, {"arguments": {"keys": [], "sizes": {}, "patterns": {"url_external": true}}})
 	"arguments.patterns" in evaluate(partial).missing_inputs
+}
+
+test_pol_patterns_are_not_checked_on_stage1_servers if {
+	bad := {"url_external": "yes"}
+	value := replace(sample, {"arguments": {"keys": [], "sizes": {}, "patterns": bad}})
+	not "arguments.patterns" in evaluate(value).missing_inputs
+	evaluate(value).missing_inputs == []
+	evaluate(managed).missing_inputs == []
 }
 
 test_pol_malformed_allowed_arg_keys_are_missing_inputs if {

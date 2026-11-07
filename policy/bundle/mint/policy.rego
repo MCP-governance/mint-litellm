@@ -95,6 +95,7 @@ pattern_names := {"url_external", "private_host", "path_traversal", "secret_like
 
 # 값이 있을 때만 쓴다(1단계 서버는 계약·패턴 값이 없어도 전면 차단되지 않는다).
 missing contains "arguments.patterns" if {
+	managed
 	"patterns" in object.keys(input.arguments)
 	not valid_patterns
 }

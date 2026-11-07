@@ -1,5 +1,6 @@
 """승인, 거부, 철회, 호출별 승인."""
 
+import ipaddress
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -73,16 +74,40 @@ def build_conditions(
         if not 1 <= len(require_consent.strip()) <= 128:
             raise ControlError("--require-consent의 목적은 1자 이상 128자 이하여야 합니다.")
         conditions["require_consent"] = require_consent.strip()
-    for name, values in (
-        ("allowed_hosts", allowed_hosts),
-        ("allowed_paths", allowed_paths),
-        ("allowed_arg_keys", allowed_arg_keys),
+    for name, values, check in (
+        ("allowed_hosts", allowed_hosts, _host_ok),
+        ("allowed_paths", allowed_paths, _path_ok),
+        ("allowed_arg_keys", allowed_arg_keys, bool),
     ):
         if values:
-            if any(not v.strip() for v in values):
-                raise ControlError(f"--{name.replace('_', '-')[:-1]} 값이 비어 있습니다.")
-            conditions[name] = sorted({v.strip() for v in values})
+            cleaned = {v.strip() for v in values}
+            for value in cleaned:
+                if not check(value):
+                    flag = name.replace("_", "-")[:-1]
+                    raise ControlError(f"--{flag} 값이 올바르지 않습니다: {value[:64]!r}")
+            conditions[name] = sorted(cleaned)
     return conditions
+
+
+def _host_ok(value: str) -> bool:
+    """점이 하나 이상인 호스트 이름(앞의 ``*.`` 허용) 또는 리터럴 주소."""
+    value = value.lower().removeprefix("*.").strip("[]")
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    labels = value.split(".")
+    return len(labels) >= 2 and all(
+        label and not label.startswith("-") and all(c.isalnum() or c in "-_" for c in label)
+        for label in labels
+    )
+
+
+def _path_ok(value: str) -> bool:
+    flat = value.replace("\\", "/")
+    absolute = flat.startswith("/") or (len(flat) > 2 and flat[1] == ":" and flat[2] == "/")
+    return absolute and ".." not in flat.split("/")
 
 
 # ---------------------------------------------------------------------------

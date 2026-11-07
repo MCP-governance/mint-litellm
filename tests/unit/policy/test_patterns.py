@@ -177,3 +177,64 @@ def test_cost_of_a_full_size_argument_is_small():
     for _ in range(20):
         patterns(arguments, allowed_hosts={"ok.test"}, secret_markers=["AKIA"] * 10)
     assert (time.perf_counter() - start) / 20 < 0.05
+
+
+BS = chr(92)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"http:{BS}{BS}127{D}0{D}0{D}1/",
+        f"http:{BS}127{D}0{D}0{D}1/",
+        f"http:/127{D}0{D}0{D}1/",
+        f"http:/{BS}127{D}0{D}0{D}1/",
+        f"http://%31%32%37{D}0{D}0{D}1/",
+        "http://127．0．0．1/",
+        "http://127。0。0。1/",
+        f"http://１２７{D}0{D}0{D}1/",
+        f"http://%25%33%31%25%33%32%25%33%37{D}0{D}0{D}1/",
+        "http://%256c%256f%2563%2561%256c%2568%256f%2573%2574/",
+        f"HTTP:{BS}{BS}localhost{BS}x",
+    ],
+)
+def test_private_host_bypass_vectors(text):
+    assert patterns({"u": text})["private_host"] is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [f"http:{BS}{BS}evil.test/", "http:/evil.test/", f"http:{BS}evil.test", "http:/%65vil.test"],
+)
+def test_url_forms_without_double_slash_are_urls(text):
+    assert patterns({"u": text}, allowed_hosts={"ok.test"})["url_external"] is True
+    assert (
+        patterns(
+            {"u": text.replace("evil", "ok").replace("%65vil", "ok")}, allowed_hosts={"ok.test"}
+        )["url_external"]
+        is False
+    )
+
+
+def test_drive_letters_are_not_urls():
+    assert patterns({"p": f"C:{BS}srv{BS}docs"}, allowed_hosts={"ok.test"})["url_external"] is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["%252e%252e/x", "%252e%252e%252fx", "..%2fx", "%2e%2e%5cx", "%25252e%25252e/x"],
+)
+def test_multiply_encoded_traversal(text):
+    assert patterns({"p": text})["path_traversal"] is True
+
+
+def test_four_levels_of_encoding_are_beyond_the_decode_limit():
+    assert patterns({"p": "%2525252e%2525252e/x"})["path_traversal"] is False
+
+
+def test_dictionary_keys_are_inspected_like_values():
+    assert patterns({"http://evil.test/": 1}, allowed_hosts={"ok.test"})["url_external"]
+    assert patterns({f"http://127{D}0{D}0{D}1/": 1})["private_host"]
+    assert patterns({"../x": 1})["path_traversal"]
+    assert patterns({"AKIAxxxx": 1}, secret_markers=["AKIA"])["secret_like"]
+    assert patterns({"k" * (MAX_STRING_BYTES + 1): 1}) == dict.fromkeys(NAMES, True)

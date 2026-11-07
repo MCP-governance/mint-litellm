@@ -6,6 +6,7 @@
 
 import ipaddress
 import posixpath
+import unicodedata
 from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -15,6 +16,8 @@ MAX_STRING_BYTES = 4 * 1024
 MAX_DEPTH = 20
 NAMES = ("url_external", "private_host", "path_traversal", "secret_like")
 
+BS = chr(92)
+_DOTS = str.maketrans({"。": ".", "｡": ".", "．": "."})
 _URL_END = " \t\r\n\"'<>"
 _SCHEME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
 
@@ -41,9 +44,7 @@ def _strings(value: Any) -> Iterable[str]:
             yield item
         elif isinstance(item, Mapping):
             for key, child in item.items():
-                total += len(str(key))
-                if total > MAX_TOTAL_BYTES:
-                    raise _Overflow
+                stack.append((str(key), depth + 1))  # 키도 값처럼 검사한다.
                 stack.append((child, depth + 1))
         elif isinstance(item, list | tuple):
             stack.extend((child, depth + 1) for child in item)
@@ -51,22 +52,44 @@ def _strings(value: Any) -> Iterable[str]:
             raise _Overflow
 
 
+def _normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKC", unquote(text))
+    return text.translate(_DOTS)
+
+
+def _forms(text: str) -> list[str]:
+    """원문과, 퍼센트 디코딩·NFKC를 바뀌지 않을 때까지(최대 3회) 거친 형태들."""
+    forms = [text]
+    for _ in range(3):
+        decoded = _normalize(forms[-1])
+        if decoded == forms[-1]:
+            break
+        forms.append(decoded)
+    return forms
+
+
 def _urls(text: str) -> Iterable[str]:
-    """문자열 안의 ``scheme://…`` 마다 호스트를 낸다(파싱 실패는 빈 문자열 = 알 수 없음)."""
+    """``scheme:`` 뒤에 슬래시나 역슬래시가 하나 이상 오는 곳마다 호스트를 낸다.
+
+    파싱 실패는 빈 문자열(알 수 없음)이다. 역슬래시는 슬래시로 읽는다. 한 글자 스킴은 드라이브
+    문자로 보고 건너뛴다.
+    """
     start = 0
-    while (at := text.find("://", start)) != -1:
-        start = at + 3
+    while (at := text.find(":", start)) != -1:
+        start = at + 1
         i = at
         while i > 0 and text[i - 1] in _SCHEME_CHARS:
             i -= 1
-        if i == at or not text[i].isalpha():
-            continue
         end = start
-        while end < len(text) and text[end] not in _URL_END:
+        while end < len(text) and text[end] in "/\\":
             end += 1
-        rest = text[start:end]
-        # 일부 클라이언트는 역슬래시를 슬래시로 읽는다: 두 해석을 모두 본다.
-        for variant in {rest, rest.replace("\\", "/")}:
+        if end == start or at - i < 2 or not text[i].isalpha():
+            continue
+        stop = end
+        while stop < len(text) and text[stop] not in _URL_END:
+            stop += 1
+        rest = text[end:stop]
+        for variant in {rest, rest.replace(BS, "/")}:
             try:
                 yield (urlsplit("//" + variant).hostname or "").lower().rstrip(".")
             except ValueError:
@@ -130,7 +153,7 @@ def _is_absolute(text: str) -> bool:
 
 
 def _traversal(text: str, allowed_paths: Collection[str]) -> bool:
-    for variant in (text, unquote(text)):
+    for variant in (text,):
         flat = variant.replace("\\", "/")
         if ".." in flat.split("/"):
             return True
@@ -155,18 +178,19 @@ def compute_patterns(
     """``allowed_hosts``는 소문자 호스트, ``allowed_paths``는 정규화된 절대 경로 접두."""
     result = dict.fromkeys(NAMES, False)
     try:
-        for text in _strings(arguments):
-            for host in _urls(text):
-                if not host_allowed(host, allowed_hosts):
-                    result["url_external"] = True
-                if _private_host(host, loose=True):
+        for raw in _strings(arguments):
+            for text in _forms(raw):
+                for host in _urls(text):
+                    if not host_allowed(host, allowed_hosts):
+                        result["url_external"] = True
+                    if _private_host(host, loose=True):
+                        result["private_host"] = True
+                if _private_host(_bare_host(text), loose=False):
                     result["private_host"] = True
-            if _private_host(_bare_host(text), loose=False):
-                result["private_host"] = True
-            if _traversal(text, allowed_paths):
-                result["path_traversal"] = True
-            if any(marker in text for marker in secret_markers):
-                result["secret_like"] = True
+                if _traversal(text, allowed_paths):
+                    result["path_traversal"] = True
+                if any(marker in text for marker in secret_markers):
+                    result["secret_like"] = True
     except _Overflow:
         return dict.fromkeys(NAMES, True)
     return result
