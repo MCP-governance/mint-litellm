@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 공개 MCP 서버 도입 시험 스택 제어. 사용: stack.sh up | swap <서버> <판본> | status | env | down
+# 공개 MCP 서버 도입 시험 스택 제어. 사용: stack.sh up | swap <서버> <판본> | authprobe up|down | status | env | down
 # 서버: playwright | context7 | grafana. 비밀은 실행 때 만들어 .runtime/env(권한 600, 저장소 제외)에만 둔다.
 set -euo pipefail
 
@@ -90,11 +90,25 @@ cmd_swap() { # 한 서버의 판본을 바꿔 그 서버만 다시 올린다.
   echo "$server -> $version"
 }
 
+cmd_authprobe() { # 자격이 필요한 서버의 대조군: 서버 인증 토큰을 켠 Grafana MCP 컨테이너를 따로 띄우거나 내린다.
+  [[ -f "$ENV_FILE" ]] || { echo "먼저 up" >&2; exit 2; }
+  local name=mint-g10-authprobe
+  case "$1" in
+    up) load
+      [[ -n "${G10_AUTHPROBE_TOKEN:-}" ]] || { set_var G10_AUTHPROBE_TOKEN "$(rand 32)"; load; }
+      docker rm -f "$name" >/dev/null 2>&1 || true
+      docker run -d --name "$name" --network mint-g10_mcp         -e MCP_GRAFANA_SERVER_TOKEN="$G10_AUTHPROBE_TOKEN" -e GRAFANA_URL=http://grafana:3000         "$G10_GRAFANA_MCP_IMAGE" --transport streamable-http --address :8000 --allowed-hosts '*' >/dev/null ;;
+    down) docker rm -f "$name" >/dev/null 2>&1 || true ;;
+    *) echo "사용: $0 authprobe up|down" >&2; exit 2 ;;
+  esac
+}
+
 case "${1:-}" in
+  authprobe) shift; cmd_authprobe "$@" ;;
   up) cmd_up ;;
   swap) shift; cmd_swap "$@" ;;
   status) load; "${COMPOSE[@]}" --profile grafana-mcp ps ;;
   env) echo "$ENV_FILE" ;;
-  down) if [[ -f "$ENV_FILE" ]]; then load; "${COMPOSE[@]}" --profile grafana-mcp down -v --remove-orphans; rm -rf "$RUNTIME"; fi ;;
-  *) echo "사용: $0 up | swap <playwright|context7|grafana> <판본> | status | env | down" >&2; exit 2 ;;
+  down) if [[ -f "$ENV_FILE" ]]; then load; docker rm -f mint-g10-authprobe >/dev/null 2>&1 || true; "${COMPOSE[@]}" --profile grafana-mcp down -v --remove-orphans; rm -rf "$RUNTIME"; fi ;;
+  *) echo "사용: $0 up | swap <playwright|context7|grafana> <판본> | authprobe up|down | status | env | down" >&2; exit 2 ;;
 esac
