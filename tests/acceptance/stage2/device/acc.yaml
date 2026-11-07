@@ -31,6 +31,8 @@ services:
     user: "1000:1000"
     environment:
       <<: *acc-env
+      # deploy/compose.yaml의 worker에는 MINT_OPA_URL이 없어 설명 검사·위험 등급이 판별 불가가 된다(제품 결함 후보).
+      MINT_OPA_URL: http://opa:8181
   console:
     environment:
       <<: *acc-env
