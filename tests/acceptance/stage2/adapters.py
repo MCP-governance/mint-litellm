@@ -39,6 +39,10 @@ class Skip(Exception):
     """제품 쪽 명령·처리기가 아직 없다."""
 
 
+class Unwritten(Exception):
+    """제품 기능은 있지만 어댑터 본문은 아직 없다."""
+
+
 def env(name, default=None):
     value = os.environ.get(name, default)
     if value is None:
@@ -392,6 +396,29 @@ def confirmation_plugin_confirm(ctx):
     write_observation(ctx, sqlstate=sqlstate, confirmed=count(where) - before)
 
 
+@adapter("auth_plugin_control_event")
+def auth_plugin_control_event(ctx):
+    """플러그인 역할로 제어 평면 사건의 삽입을 시도하고 실제 삽입 여부를 조회한다."""
+    import psycopg
+
+    from mint_litellm.types.ids import new_uuid7
+
+    event_id = new_uuid7()
+    source = f"approval:{event_id}:1:approval_granted"
+    try:
+        with psycopg.connect(env("ACC_PLUGIN_DATABASE_URL"), autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO mint.events (event_id, instance_id, kind, source_key, payload) "
+                "VALUES (%s, %s, 'approval_granted', %s, '{}'::jsonb)",
+                (event_id, instance(), source),
+            )
+        sqlstate = None
+    except psycopg.Error as error:
+        sqlstate = error.sqlstate
+    inserted = count(f"SELECT count(*) FROM mint.events WHERE event_id='{event_id}'")
+    write_observation(ctx, sqlstate=sqlstate, inserted=inserted)
+
+
 # ---------------------------------------------------------------- 시나리오 어댑터(본문 대기)
 # 아직 main에 없는 명령(intake·contract·sync·console)의 응답 모양에 의존한다. 그 명령이 병합돼
 # gate()를 통과하면 이 이름들은 장비 실행 전에 본문을 채워야 하며, 그때까지 70으로 실패한다.
@@ -405,7 +432,7 @@ SCENARIOS = sorted(
 def pending(name):
     def apply(ctx):
         gate(name)
-        raise SystemExit(f"어댑터 본문 미작성: {name} (명령이 병합된 뒤 장비 시험 전에 작성)")
+        raise Unwritten(f"어댑터 본문 미작성: {name}")
     return apply
 
 
@@ -437,7 +464,8 @@ def emit_site(ssh=None, repo="."):
     """site.json의 faults·case_setup 조각. 각 항목은 argv 배열이며 ssh를 주면 한 인자로 감싼다."""
     def wrap(*words):
         line = f"cd {shlex.quote(repo)} && .venv/bin/python -m tests.acceptance.stage2.adapters "
-        line += " ".join(shlex.quote(w) for w in words)
+        line += " ".join(w if w in {"{observation}", "{run_id}", "{case}"}
+                         else shlex.quote(w) for w in words)
         if ssh:
             return ["ssh", ssh, line]
         return ["bash", "-c", line]
@@ -483,6 +511,9 @@ def main(argv=None):
     except Skip as skip:
         print("미구현으로 건너뜀: " + str(skip))
         return SKIPPED
+    except Unwritten as error:
+        print(str(error), file=sys.stderr)
+        return UNWRITTEN
     return 0
 
 

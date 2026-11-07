@@ -78,3 +78,21 @@ def test_every_required_fault_has_a_named_adapter():
                for f in site["faults"].values())
     assert main(["no_such", "apply"]) == 2
     assert main(["sync_race_30", "apply"]) in (SKIPPED, 70)
+
+
+def test_generated_commands_replace_shell_placeholders():
+    import shlex
+
+    from .adapters import emit_site
+    from .rig import Rig
+
+    site = emit_site(ssh="test-host", repo="/test repo")
+    command = site["faults"]["auth_plugin_control_event"]["apply"]
+    replaced = Rig.replace_placeholders(command, {
+        "{observation}": "/test evidence/a'b.json", "{run_id}": "run-1",
+    })
+    assert replaced[:2] == ["ssh", "test-host"]
+    assert "{observation}" not in replaced[2] and "{run_id}" not in replaced[2]
+    assert shlex.quote("/test evidence/a'b.json") in replaced[2]
+    setup = Rig.replace_placeholders(site["case_setup"], {"{case}": "test[a b]"})
+    assert shlex.quote("test[a b]") in setup[2]

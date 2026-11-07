@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -62,8 +63,8 @@ class Rig:
         assert not dirty, "장비 시험은 커밋된 깨끗한 복제본에서 실행"
         if "test_13_" not in self.result["test"]:
             assert site.get("case_setup"), "장비 case_setup 누락: 시험마다 초기 스냅숏 복구 필요"
-            self.command([arg.replace("{case}", self.result["test"])
-                          for arg in site["case_setup"]], timeout=180)
+            self.command(self.replace_placeholders(site["case_setup"],
+                         {"{case}": self.result["test"]}), timeout=180)
         assert self.sql("SELECT mode FROM mint.settings WHERE instance_id=%s", [self.iid])[0][
             "mode"
         ] == "enforce"
@@ -339,7 +340,7 @@ class Rig:
         command = self.site["faults"][name]
         observation = self.root / (self.run_id + "-" + name + ".observation.json")
         replacements = {"{observation}": str(observation), "{run_id}": self.run_id}
-        argv = [replacements.get(arg, arg) for arg in command["apply"]]
+        argv = self.replace_placeholders(command["apply"], replacements)
         done = self.command(argv, check=False, timeout=command.get("timeout", 120))
         if done.returncode == 78:  # 어댑터 규약: 제품 명령·처리기 부재
             self.skip(done.stdout.strip() or f"미구현으로 건너뜀: 어댑터 {name}")
@@ -347,6 +348,18 @@ class Rig:
         self.result["steps"].append({"fixture": name, "exit_code": 0})
         if restore:
             self.undo.append(lambda: self.command(command["undo"], timeout=120))
+
+    @staticmethod
+    def replace_placeholders(argv, replacements):
+        result = []
+        for arg in argv:
+            if arg in replacements:
+                result.append(replacements[arg])
+            else:
+                for key, value in replacements.items():
+                    arg = arg.replace(key, shlex.quote(value))
+                result.append(arg)
+        return result
 
     def restore_fault(self, name):
         self.command(self.site["faults"][name]["undo"], timeout=120)
