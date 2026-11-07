@@ -628,7 +628,10 @@ def test_a_contract_mismatch_does_not_stop_startup_and_is_recorded_once_per_serv
 
 
 def test_same_mismatch_field_with_new_value_emits_new_observation(tmp_path):
-    runtime, store, _, state = make_runtime(tmp_path, v=view(registry=[entry(transport="sse")]))
+    runtime, store, _, state = make_runtime(
+        tmp_path, v=view(registry=[entry(transport="sse")]),
+        controlled=[registered(contract_status="managed")],
+    )
 
     async def observe():
         await runtime.run_checks()
@@ -654,6 +657,20 @@ def test_managed_issuer_changes_are_observed_without_calls(tmp_path):
     event, = store.of_kind("server_identity_mismatch_observed")
     assert event.payload["fields"] == ["issuer"]
     assert "https://changed.test" not in str(event.payload)
+
+
+def test_legacy_mismatch_keeps_its_payload_and_field_based_deduplication(tmp_path):
+    runtime, store, _, state = make_runtime(tmp_path, v=view(registry=[entry(transport="sse")]))
+
+    async def observe():
+        await runtime.run_checks()
+        await runtime._report_mismatches()
+
+    asyncio.run(observe())
+    state["view"] = view(registry=[entry(transport="streamable_http")])
+    asyncio.run(observe())
+    event, = store.of_kind("server_identity_mismatch_observed")
+    assert event.payload == {"server_id": "srv-1", "fields": ["transport"]}
 
 
 def test_a_suspended_server_missing_from_the_registry_does_not_stop_startup(tmp_path):

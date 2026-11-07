@@ -84,7 +84,7 @@ def _contract_observe(job: JobContext) -> None:
     handle(job)
 
 
-# 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
+# 이 단계에서 처리기가 붙은 작업. 등록된 나머지 종류는 처리기를 연결한 뒤 임대한다.
 HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "approval_expiry_scan": _approval_expiry_scan,
     "contract_observe": _contract_observe,

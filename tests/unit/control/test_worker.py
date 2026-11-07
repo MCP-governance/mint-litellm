@@ -156,13 +156,13 @@ def test_job_kinds_follow_the_registration_rules(url, all_handlers):
             base.enqueue_job(ctx, "seal", "x")  # 예약·키 작업은 키가 있다
 
 
-def test_a_kind_without_a_handler_cannot_be_registered(url):
+def test_a_known_kind_can_be_registered_before_its_handler_is_connected(url):
     with psycopg.connect(url) as conn:
         ensure(conn, INSTANCE)
         ctx = make_ctx(conn)
         for kind, key in (("sync_server", None), ("seal", "seal:x"), ("alert_deliver", "a:1")):
-            with pytest.raises(ControlError, match="처리기가 없습니다"):
-                base.enqueue_job(ctx, kind, "x", key)
+            assert kind not in jobs.HANDLERS
+            assert base.enqueue_job(ctx, kind, "x", key)
         assert base.enqueue_job(ctx, "approval_expiry_scan", "x", "approval_expiry_scan:t")
 
 

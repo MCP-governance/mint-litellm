@@ -9,9 +9,10 @@ from psycopg.types.json import Jsonb
 
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.contract_observe import consume_deployment_events, record_tools
+from mint_litellm.control.contract_pin import finalize_reapproval
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.errors import AdminError
-from mint_litellm.control.services.contracts import reapprove
+from mint_litellm.control.services import contracts
 from mint_litellm.plugin.pipeline import contract_result
 from mint_litellm.plugin.snapshot import ToolContractRow
 from mint_litellm.types.canonical import canonical_text, pin_sha256, sha256
@@ -20,6 +21,11 @@ from mint_litellm.types.ids import new_uuid7
 
 TOOL = {"description": "read", "input_schema": {"type": "object"}}
 NEW = {**TOOL, "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}
+
+
+def reapprove(ctx, pin, server_id, intake_id, candidate_ids, **kwargs):
+    contracts.reapprove(ctx, server_id, intake_id, candidate_ids, **kwargs)
+    return finalize_reapproval(ctx.conn, ctx.instance_id, server_id, pin)
 
 
 @pytest.fixture

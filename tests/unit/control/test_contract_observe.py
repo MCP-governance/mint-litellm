@@ -1,8 +1,8 @@
 import pytest
 
 from mint_litellm.control.contract_observe import drift_kind, normalize_tools
+from mint_litellm.control.contract_pin import verify_pin
 from mint_litellm.control.errors import AdminError
-from mint_litellm.control.services.contracts import verify_pin
 
 TOOL = {"description": "read", "input_schema": {"type": "object"}}
 

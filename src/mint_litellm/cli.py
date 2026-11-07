@@ -33,7 +33,6 @@ from mint_litellm.control import (
 )
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.context import Context, Operator
-from mint_litellm.control.contract_pin import ContractPinClient
 from mint_litellm.control.db.connection import connect, fetchall
 from mint_litellm.control.db.migrate import apply_migrations
 from mint_litellm.control.db.roles import LOGIN_PASSWORD_VARIABLES, LOGIN_ROLES, ensure_login_roles
@@ -502,14 +501,10 @@ def _allowlist_add(run: Run) -> None:
 def _contract(run: Run) -> None:
     a = run.args
     if a.command_name == "contract reapprove":
-        if not run.cfg.litellm_url or not run.cfg.litellm_key:
-            raise ControlError("LiteLLM 주소와 제어 키가 필요합니다.")
-        # 인증 조회의 트랜잭션을 마치고, 재승인의 외부 쓰기는 트랜잭션 밖에서 한다.
-        run.conn.commit()
         result = contract_service.reapprove(
-            run.context(), ContractPinClient(run.cfg.litellm_url, run.cfg.litellm_key),
-            a.server_id, a.intake, a.tool_contract, deployment_id=a.deployment_contract,
-            expected_version=a.state_version)
+            run.context(), a.server_id, a.intake, a.tool_contract,
+            deployment_id=a.deployment_contract, expected_version=a.state_version,
+        )
     else:
         fn = contract_service.diff if a.command_name == "contract diff" else contract_service.show
         result = fn(run.context(), a.server_id)

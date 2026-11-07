@@ -1,8 +1,10 @@
-"""계약 비교와 증거·직무 분리·재pin을 확인한 재승인."""
+"""계약 비교와 증거·직무 분리를 확인한 재승인 계획 등록."""
 
 import json
 from datetime import timedelta
 from uuid import UUID
+
+from psycopg.types.json import Jsonb
 
 from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchall, fetchone
@@ -12,11 +14,10 @@ from mint_litellm.control.errors import (
     separation_of_duties,
     stale_evidence,
 )
-from mint_litellm.control.services.base import require_role, service, transact
+from mint_litellm.control.services.base import enqueue_job, service
 from mint_litellm.types.canonical import (
     canonical_text,
     credential_scope,
-    pin_set_sha256,
     pin_sha256,
     sha256,
 )
@@ -299,177 +300,30 @@ def _plan(
     }
 
 
-def verify_pin(desired: dict, response: dict) -> str:
-    if not response or set(response) != set(desired):
-        raise conflict("재pin 도구 집합이 후보 계약과 다릅니다.")
-    try:
-        if any(pin_sha256(response[name]) != pin_sha256(value) for name, value in desired.items()):
-            raise conflict("재pin 해시가 후보 계약과 다릅니다.")
-        return pin_set_sha256(response)
-    except (ValueError, TypeError, KeyError):
-        raise conflict("재pin 응답의 정의 형식이 올바르지 않습니다.") from None
+def freeze_plan(plan: dict) -> dict:
+    """관측·응답 대기 중 바뀔 수 있는 계약의 id와 판본을 계획에 고정한다."""
 
-
-def _reapprove(
-    ctx: Context,
-    pin_client,
-    server_id: str,
-    intake_id: str,
-    candidate_ids: list[str],
-    *,
-    deployment_id: str | None = None,
-    expected_version: int | None = None,
-) -> dict:
-    require_role(ctx, "contract reapprove")
-    # 외부 쓰기는 열린 DB 트랜잭션을 받지 않는다.
-    from psycopg.pq import TransactionStatus
-
-    if ctx.conn.info.transaction_status != TransactionStatus.IDLE:
-        raise conflict("재승인은 유휴 연결에서 실행해야 합니다.")
-    with transact(ctx):
-        plan = _plan(ctx, server_id, intake_id, candidate_ids, deployment_id, expected_version)
-        # 외부 pin 중 다른 승인 호출이 새 정의를 실행하지 못하도록 먼저 닫는다.
-        fields = set(plan["server"]["deployment_drift_fields"] or ())
-        if plan["server"]["deployment_drift"] and not fields:
-            fields.add("unknown")
-        fields.add("pin_reapproval")
-        marker = fetchone(
-            ctx.conn,
-            "UPDATE mint.servers SET deployment_drift=true,deployment_drift_fields=%s"
-            " WHERE instance_id=%s AND server_id=%s RETURNING state_version",
-            (sorted(fields), ctx.instance_id, server_id),
-        )["state_version"]
-        requested = [(c, "tool") for c in plan["candidates"]]
-        if plan["deployment"]:
-            requested.append((plan["deployment"], "deployment"))
-        for candidate, kind in requested:
-            key = control_source_key(
-                EventKind.REAPPROVAL_REQUESTED, str(candidate["id"]), candidate["version"]
-            )
-            if (
-                fetchone(
-                    ctx.conn,
-                    "SELECT 1 FROM mint.events WHERE instance_id=%s AND source_key=%s",
-                    (ctx.instance_id, key),
-                )
-                is None
-            ):
-                ctx.emit(
-                    EventKind.REAPPROVAL_REQUESTED,
-                    candidate["id"],
-                    candidate["version"],
-                    {
-                        "server_id": server_id,
-                        "version": candidate["version"],
-                        "kind": kind,
-                        "candidate_sha256": candidate["sha256"],
-                    },
-                )
-    try:
-        response = pin_client.pin(server_id)
-        digest = verify_pin(plan["desired"], response)
-    except Exception:
-        pin_client.unpin(server_id)
-        raise
-    with transact(ctx):
-        fresh = _plan(ctx, server_id, intake_id, candidate_ids, deployment_id, marker)
-        if fresh["evidence_hash"] != plan["evidence_hash"] or fresh["desired"] != plan["desired"]:
-            raise conflict("재pin 중 후보 또는 증거가 변경되었습니다.")
-        for candidate in fresh["candidates"]:
-            old = next((c for c in fresh["approved"] if c["tool"] == candidate["tool"]), None)
-            if old:
-                row = fetchone(
-                    ctx.conn,
-                    "UPDATE mint.tool_contracts SET status='superseded'"
-                    " WHERE instance_id=%s AND id=%s RETURNING version",
-                    (ctx.instance_id, old["id"]),
-                )
-                ctx.emit(
-                    EventKind.CONTRACT_SUPERSEDED,
-                    old["id"],
-                    row["version"],
-                    {"server_id": server_id, "replacement": str(candidate["id"])},
-                )
-            row = fetchone(
-                ctx.conn,
-                "UPDATE mint.tool_contracts SET status='approved',drift='none',"
-                " observed_sha256=sha256,observed_at=now() WHERE instance_id=%s AND id=%s"
-                " RETURNING version",
-                (ctx.instance_id, candidate["id"]),
-            )
-            ctx.emit(
-                EventKind.CONTRACT_APPROVED,
-                candidate["id"],
-                row["version"],
-                {"server_id": server_id, "pin_sha256": candidate["pin_sha256"]},
-            )
-        deployment = fresh["deployment"]
-        if deployment:
-            old = fetchone(
-                ctx.conn,
-                "UPDATE mint.deployment_contracts SET status='superseded'"
-                " WHERE instance_id=%s AND server_id=%s AND status='approved' RETURNING id,version",
-                (ctx.instance_id, server_id),
-            )
-            if old:
-                ctx.emit(
-                    EventKind.DEPLOYMENT_CONTRACT_SUPERSEDED,
-                    old["id"],
-                    old["version"],
-                    {"server_id": server_id},
-                )
-            row = fetchone(
-                ctx.conn,
-                "UPDATE mint.deployment_contracts SET status='approved'"
-                " WHERE instance_id=%s AND id=%s RETURNING version",
-                (ctx.instance_id, deployment["id"]),
-            )
-            ctx.emit(
-                EventKind.DEPLOYMENT_CONTRACT_APPROVED,
-                deployment["id"],
-                row["version"],
-                {"server_id": server_id},
-            )
-            ctx.conn.execute(
-                "UPDATE mint.servers SET url_sha256=%s,transport=%s,auth_type=%s,issuer=%s"
-                " WHERE instance_id=%s AND server_id=%s",
-                (
-                    deployment["url_sha256"],
-                    deployment["transport"],
-                    deployment["auth_type"],
-                    deployment["issuer"],
-                    ctx.instance_id,
-                    server_id,
-                ),
-            )
-        # 배포 재검사 없는 도구 재승인으로 기존 배포 드리프트를 지우지 않는다.
-        clear = deployment is not None or fields == {"pin_reapproval"}
-        ctx.conn.execute(
-            "UPDATE mint.servers SET last_observed_at=now(),deployment_drift=%s,"
-            " deployment_drift_fields=CASE WHEN %s THEN NULL ELSE deployment_drift_fields END"
-            " WHERE instance_id=%s AND server_id=%s",
-            (not clear, clear, ctx.instance_id, server_id),
+    def refs(rows):
+        return sorted(
+            ({"id": str(c["id"]), "version": c["version"], "sha256": c["sha256"]} for c in rows),
+            key=lambda c: c["id"],
         )
-        ctx.conn.execute(
-            "INSERT INTO mint.litellm_grants"
-            " (id,instance_id,target_type,target_id,item,server_id,preexisting,applied_sha256,"
-            " observed,observed_at,last_applied_at)"
-            " VALUES (%s,%s,'server',%s,'pin',%s,false,%s,true,now(),now())"
-            " ON CONFLICT (instance_id,target_type,target_id,item,server_id) DO UPDATE"
-            " SET applied_sha256=EXCLUDED.applied_sha256,observed=true,observed_at=now(),"
-            " last_applied_at=now()",
-            (new_uuid7(), ctx.instance_id, server_id, server_id, digest),
-        )
-        return {
-            "server_id": server_id,
-            "pin_sha256": digest,
-            "contracts": [str(c["id"]) for c in fresh["candidates"]],
-        }
+
+    return {
+        "server_version": plan["server"]["state_version"],
+        "candidates": refs(plan["candidates"]),
+        "deployment": refs([plan["deployment"]])[0] if plan["deployment"] else None,
+        "approved": refs(plan["approved"]),
+        "desired": plan["desired"],
+        "scope": plan["scope"],
+        "evidence_hash": plan["evidence_hash"],
+        "drift_fields": sorted(plan["server"]["deployment_drift_fields"] or ()),
+    }
 
 
+@service("contract reapprove")
 def reapprove(
     ctx: Context,
-    pin_client,
     server_id: str,
     intake_id: str,
     candidate_ids: list[str],
@@ -477,29 +331,63 @@ def reapprove(
     deployment_id: str | None = None,
     expected_version: int | None = None,
 ) -> dict:
-    from psycopg.pq import TransactionStatus
-
-    require_role(ctx, "contract reapprove")
-    if ctx.conn.info.transaction_status != TransactionStatus.IDLE:
-        raise conflict("재승인은 유휴 연결에서 실행해야 합니다.")
-    key = f"contract-pin:{ctx.instance_id}:{server_id}"
-    # 세션 잠금은 외부 호출 동안에도 유지되지만 DB 트랜잭션은 열어 두지 않는다.
-    with ctx.conn.transaction():
-        locked = fetchone(
-            ctx.conn, "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS ok", (key,)
-        )["ok"]
-    if not locked:
-        raise conflict("이 서버의 재승인이 진행 중입니다.")
-    try:
-        return _reapprove(
-            ctx,
-            pin_client,
+    """계획·차단·사건과 sync_server만 커밋한다. LiteLLM에는 쓰지 않는다."""
+    plan = _plan(ctx, server_id, intake_id, candidate_ids, deployment_id, expected_version)
+    fields = set(plan["server"]["deployment_drift_fields"] or ())
+    if plan["server"]["deployment_drift"] and not fields:
+        fields.add("unknown")
+    fields.add("pin_reapproval")
+    marker = fetchone(
+        ctx.conn,
+        "UPDATE mint.servers SET deployment_drift=true,deployment_drift_fields=%s"
+        " WHERE instance_id=%s AND server_id=%s RETURNING state_version",
+        (sorted(fields), ctx.instance_id, server_id),
+    )["state_version"]
+    plan["server"].update(state_version=marker, deployment_drift_fields=sorted(fields))
+    plan_id = new_uuid7()
+    ctx.conn.execute(
+        "INSERT INTO mint.contract_reapproval_plans"
+        " (id,instance_id,server_id,intake_id,requested_by,requested_user_id,plan)"
+        " VALUES (%s,%s,%s,%s,%s,%s,%s)"
+        " ON CONFLICT (instance_id,server_id) DO UPDATE SET id=EXCLUDED.id,"
+        " intake_id=EXCLUDED.intake_id,requested_by=EXCLUDED.requested_by,"
+        " requested_user_id=EXCLUDED.requested_user_id,plan=EXCLUDED.plan,"
+        " status='pending',result=NULL",
+        (
+            plan_id,
+            ctx.instance_id,
             server_id,
             intake_id,
-            candidate_ids,
-            deployment_id=deployment_id,
-            expected_version=expected_version,
+            ctx.operator.name,
+            ctx.operator.user_id,
+            Jsonb(freeze_plan(plan)),
+        ),
+    )
+    requested = [(c, "tool") for c in plan["candidates"]]
+    if plan["deployment"]:
+        requested.append((plan["deployment"], "deployment"))
+    for candidate, kind in requested:
+        key = control_source_key(
+            EventKind.REAPPROVAL_REQUESTED, str(candidate["id"]), candidate["version"]
         )
-    finally:
-        with ctx.conn.transaction():
-            ctx.conn.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))", (key,))
+        if (
+            fetchone(
+                ctx.conn,
+                "SELECT 1 FROM mint.events WHERE instance_id=%s AND source_key=%s",
+                (ctx.instance_id, key),
+            )
+            is None
+        ):
+            ctx.emit(
+                EventKind.REAPPROVAL_REQUESTED,
+                candidate["id"],
+                candidate["version"],
+                {
+                    "server_id": server_id,
+                    "version": candidate["version"],
+                    "kind": kind,
+                    "candidate_sha256": candidate["sha256"],
+                },
+            )
+    job_id = enqueue_job(ctx, "sync_server", server_id)
+    return {"server_id": server_id, "plan_id": str(plan_id), "job_id": job_id}

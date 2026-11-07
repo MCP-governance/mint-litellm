@@ -413,7 +413,10 @@ class PluginRuntime:
             ):
                 self.last_mismatches.append((server.server_id, "issuer"))
         self._observed_hashes = {}
+        managed = {s.server_id for s in controlled or () if s.contract_status == "managed"}
         for server_id, name in self.last_mismatches:
+            if server_id not in managed:
+                continue
             entry = by_id.get(server_id)
             value = getattr(entry, name, None) if entry else None
             self._observed_hashes.setdefault(server_id, {})[name] = sha256(value)
@@ -499,24 +502,24 @@ class PluginRuntime:
             by_server.setdefault(server_id, []).append(name)
         for server_id, names in by_server.items():
             fields = tuple(names)
-            hashes = self._observed_hashes.get(server_id, {name: sha256(None) for name in fields})
-            if self._reported.get(server_id) == hashes:
+            hashes = self._observed_hashes.get(server_id)
+            identity = hashes if hashes is not None else {name: "" for name in fields}
+            if self._reported.get(server_id) == identity:
                 continue
             kind = EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED
+            payload = {"server_id": server_id, "fields": list(fields)}
+            if hashes is not None:
+                payload["observed_hashes"] = hashes
             await self.recorder.record(
                 Event(
                     instance_id=self.config.instance_id,
                     inserted_at=datetime.now(UTC),
                     kind=kind,
                     source_key=self.keys.next(kind),
-                    payload={
-                        "server_id": server_id,
-                        "fields": list(fields),
-                        "observed_hashes": hashes,
-                    },
+                    payload=payload,
                 )
             )
-            self._reported[server_id] = hashes
+            self._reported[server_id] = identity
         self._reported = {key: value for key, value in self._reported.items() if key in by_server}
 
     async def _fail(self, error: str | None = None) -> None:

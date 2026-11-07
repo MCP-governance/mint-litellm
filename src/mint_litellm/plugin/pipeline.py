@@ -320,16 +320,16 @@ def contract_result(
         (c for c in snapshot.tool_contracts if c.credential_scope == scope and c.tool == tool), None
     )
     if contract is None:
-        return StageResult.finding("CONTRACT_DRIFT_unapproved_tool")
+        return StageResult.finding(Reason.CONTRACT_DRIFT, "unapproved_tool")
     if contract.drift == "input_schema":
-        return StageResult.finding("CONTRACT_DRIFT_input_schema")
+        return StageResult.finding(Reason.CONTRACT_DRIFT, "input_schema")
     if server.deployment_drift:
-        return StageResult.finding("CONTRACT_DRIFT_deployment")
+        return StageResult.finding(Reason.CONTRACT_DRIFT, "deployment")
     if (
         server.last_observed_at is None
         or (snapshot.now - server.last_observed_at).total_seconds() > 2 * observe_seconds
     ):
-        return StageResult.finding("CONTRACT_DRIFT_unobserved")
+        return StageResult.finding(Reason.CONTRACT_DRIFT, "unobserved")
     return StageResult.passed()
 
 

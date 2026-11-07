@@ -1,6 +1,6 @@
 # CLI
 
-`mint-litellm`은 운영자용 명령줄 도구이다. `init`과 `operator bootstrap`을 제외한 모든 명령은 운영자 토큰으로 인증하며, 변경의 행위자는 토큰에 결속된 운영자 이름이다. 계약 재승인은 LiteLLM 재pin과 해시 대조를 수행한다. 그 밖의 명령은 기존 읽기 경로를 사용한다.
+`mint-litellm`은 운영자용 명령줄 도구이다. `init`과 `operator bootstrap`을 제외한 모든 명령은 운영자 토큰으로 인증하며, 변경의 행위자는 토큰에 결속된 운영자 이름이다. CLI는 LiteLLM에 쓰지 않는다. 계약 재승인은 계획과 동기화 작업을 등록한다.
 
 ## 역할
 
@@ -18,7 +18,7 @@
 | --- | --- | --- | --- | --- |
 | `mint-litellm contract show` | 모든 역할 | 서버의 승인본·후보 계약을 조회한다. | - | - |
 | `mint-litellm contract diff` | 모든 역할 | 승인 계약과 관측 원본·해시·변경 순번을 비교한다. | - | - |
-| `mint-litellm contract reapprove` | `admin`, `approver` | 직무 분리·후보에 결속된 재검사 증거·재pin을 확인한다. | - | `contract_approved`, `contract_superseded`, `deployment_contract_approved`, `deployment_contract_superseded` |
+| `mint-litellm contract reapprove` | `admin`, `approver` | 직무 분리·재검사 증거를 확인하고 후보 id·판본을 고정한 계획과 동기화 작업을 등록한다. | - | `reapproval_requested` |
 | `mint-litellm init` | 토큰 불필요 | LiteLLM 설정 조각(권장 설정 포함)을 만들고 기본 조직을 준비한다. `--no-spend-logs`를 주면 `disable_spend_logs: true`를 포함한다. | - | - |
 | `mint-litellm check` | 모든 역할 | 필수 설정 위반이 있으면 종료 코드 0이 아닌 값으로 끝나고, 권장 설정은 경고하며, 관측 항목 4가지를 출력한다. | `/v1/mcp/server`, `/key/list`, `/team/list`, `/guardrails/list` | - |
 | `mint-litellm status` | 모든 역할 | 모드, 정책 판본, 경보, 관측 항목을 표시한다. | `/v1/mcp/server`, `/key/list`, `/team/list` | - |
@@ -152,13 +152,15 @@
 | 3 | 실패는 없지만 필수 검증을 모두 수행하지 못함: `check`가 관리 API나 LiteLLM 설치본이 없어 필수 행을 확인하지 못했거나, `check`·`status`가 정책 엔진에서 활성 판본의 적재 내용을 읽지 못했다. |
 | 4 | 인증 실패: 토큰이 없거나 틀렸거나 만료됨, 역할 부족 |
 
-`check`는 필수 설정이 하나라도 어긋나면 1로 끝나고, 어긋남은 없지만 필수 행을 확인하지 못했으면 3으로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다. 상태 전이와 사건은 같은 트랜잭션에서 기록한다. 계약 재승인은 외부 pin 전에 임시 차단을 확정하므로 실패하면 기존 승인본과 차단을 유지한다. 재시도에서 pin 해시가 맞으면 새 승인본과 함께 임시 차단을 해제한다.
+`check`는 필수 설정이 하나라도 어긋나면 1로 끝나고, 어긋남은 없지만 필수 행을 확인하지 못했으면 3으로 끝난다. 권장 설정 위반은 경고로 출력하고 종료 코드에 영향을 주지 않는다. 재승인 계획·`pin_reapproval` 차단 표지·사건·`sync_server` 작업은 같은 트랜잭션에서 기록한다. 명령 성공은 계획 등록을 뜻한다.
 
 ## 계약 재승인
 
 `contract show <server_id>`와 `contract diff <server_id>`는 승인본·후보·관측본을 표시한다. `diff`의 관측값은 업스트림 시험 목록에서 얻은 원본이며 호출자에게 제공한 목록을 사용하지 않는다.
 
-`contract reapprove <server_id> --intake <id> --tool-contract <candidate_id>`는 후보 도구 계약을 재승인한다. 도구가 여러 개면 `--tool-contract`를 반복하고, 배포 값 변경에는 `--deployment-contract <candidate_id>`를 함께 지정한다. `--state-version`은 서버의 낙관적 잠금 버전이다. 신청자와 승인자는 서로 다른 사람이어야 하며, 후보 집합의 해시에 결속된 24시간 이내 통과 증거가 있어야 한다. 재검사는 수용검증 경로로 실행한다. 도구 집합 또는 pin 해시가 다르면 승인본을 유지하고 unpin한다.
+`contract reapprove <server_id> --intake <id> --tool-contract <candidate_id>`는 후보 도구 계약의 재승인 계획을 등록하고 `plan_id`·`job_id`를 돌려준다. 도구가 여러 개면 `--tool-contract`를 반복하고, 배포 값 변경에는 `--deployment-contract <candidate_id>`를 함께 지정한다. `--state-version`은 서버의 낙관적 잠금 버전이다. 신청자와 승인자는 서로 다른 사람이어야 하며, 후보 집합의 해시에 결속된 24시간 이내 통과 증거가 있어야 한다. 재검사는 수용검증 경로로 실행한다.
+
+확정 접점은 `control.contract_pin.finalize_reapproval(conn, instance_id, server_id, pin_client)`이다. 외부 pin 응답 뒤 계획과 후보 id·판본·도구 집합을 다시 확인하고 승인본·사건·pin 원장·계획 완료를 한 DB 트랜잭션에서 확정한다. 불일치나 DB 실패이면 unpin을 시도하고 기존 승인본과 먼저 커밋한 차단을 유지한다. 외부 pin과 DB 사이에는 분산 원자성을 보장하지 않으며, unpin도 실패할 수 있으므로 실패 시 차단이 안전 경계이다. 이 변경에서는 `sync_server` 처리기에 연결하지 않는다. G4b 연결 전까지 계획은 대기하고 차단은 유지된다.
 
 배포 후보를 등록한 경로는 `control.services.contracts.request_deployment`를 같은 트랜잭션에서 호출한다. 이 함수는 승인 전 서버 차단과 재승인 요청을 기록한다. 재검사 증거의 `inputs.contract_sha256`은 `SHA-256(JCS({tools: {도구명: 후보 sha256}, deployment: 배포 후보 sha256 또는 null}))`이다. 관측 작업은 수용검증 클라이언트의 `test_tools_list({server_id})`를 사용한다. 이 연결이 없거나 관측이 실패하면 관측 시각을 갱신하지 않는다.
 
