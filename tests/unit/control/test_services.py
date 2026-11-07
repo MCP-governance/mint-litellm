@@ -13,7 +13,7 @@ from litellm_stub import GOOD_KEY
 psycopg = pytest.importorskip("psycopg")
 
 import mint_litellm  # noqa: E402
-from mint_litellm.control import ledger  # noqa: E402
+from mint_litellm.control import jobs, ledger  # noqa: E402
 from mint_litellm.control.db.connection import fetchall, fetchone  # noqa: E402
 from mint_litellm.control.errors import AdminCode, AdminError, ControlError  # noqa: E402
 from mint_litellm.control.services import (  # noqa: E402
@@ -34,6 +34,13 @@ from mint_litellm.types.identity import SubjectType  # noqa: E402
 URL = "http://upstream.test/mcp"
 NOW = datetime.now(UTC)
 LATER = NOW + timedelta(days=30)
+
+
+@pytest.fixture(autouse=True)
+def handlers_for_the_job_kinds_used_here(monkeypatch):
+    """작업 등록의 원자성·수렴만 보는 파일이라 처리기 없는 종류에는 빈 처리기를 둔다."""
+    for kind in ("sync_server", "export_negative_state"):
+        monkeypatch.setitem(jobs.HANDLERS, kind, lambda job: None)
 
 
 def count(conn, table):
