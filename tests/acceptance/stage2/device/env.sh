@@ -18,6 +18,7 @@ export ACC_LITELLM_ADMIN_KEY="$(getenv LITELLM_MASTER_KEY)"
 export ACC_ADMIN_TOKEN="$(getjson ACC_ADMIN_TOKEN)" ACC_APPROVER_TOKEN="$(getjson ACC_APPROVER_TOKEN)" ACC_ADMIN2_TOKEN="$(getjson ACC_ADMIN2_TOKEN)"
 export ACC_PG_SERVICE=postgres ACC_PG_SUPERUSER=postgres ACC_FIXTURE_URL=http://127.0.0.1:4340 ACC_SERVER_ID=synthetic
 export ACC_EXPORT_HOST_DIR="$STATE/export" ACC_EXPORT_CONTAINER_DIR=/var/lib/mint/export ACC_STATE_DIR="$STATE/state"
+export ACC_READY_URLS=http://127.0.0.1:4300,http://127.0.0.1:4301 ACC_RESTORE_SERVICES="litellm litellm2 worker console"
 export ACC_PLUGIN_SERVICES="litellm litellm2 worker" ACC_BUFFER_SERVICE=litellm ACC_BUFFER_CONTAINER_DIR=/var/lib/mint/buffer
 export MINT_POLICY_ROOT="$REPO" ACC_SITE="$REPO/tests/acceptance/stage2/.runtime/site.json"
 mkdir -p "$ACC_STATE_DIR"
