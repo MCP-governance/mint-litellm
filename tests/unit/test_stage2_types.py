@@ -149,15 +149,15 @@ def test_contract_drift_codes_stay_in_the_observation_family(kind):
     assert is_observation_candidate(code)
 
 
-def test_the_fourth_obligation_is_declared_but_not_yet_accepted_by_the_pipeline():
+def test_the_fourth_obligation_is_accepted_by_the_pipeline():
     assert ObligationType.REQUIRE_USER_CONFIRMATION.value == "require_user_confirmation"
-    assert ObligationType.REQUIRE_USER_CONFIRMATION not in SUPPORTED_OBLIGATIONS
+    assert ObligationType.REQUIRE_USER_CONFIRMATION in SUPPORTED_OBLIGATIONS
     item = RequireUserConfirmation(purpose="transfer", display_fields=("amount", "to"))
     assert item.display_fields == ("amount", "to")
     with pytest.raises(ValidationError):
         RequireUserConfirmation(purpose=" ")
     out = compose_obligations([{"type": "require_user_confirmation", "purpose": "p"}])
-    assert out.failure is not None and out.failure.reason_code == "UNSUPPORTED"
+    assert out.failure is None and out.obligations == (RequireUserConfirmation(purpose="p"),)
 
 
 @pytest.mark.parametrize(

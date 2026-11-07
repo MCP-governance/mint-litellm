@@ -83,6 +83,29 @@ def _original_items(settings, iid: str, request_id: str, archived: bool) -> list
     return files.read_verified(path, keys).get("items") or []
 
 
+def _anchor_ok(conn, iid: str, settings, request_id: str, archived: bool) -> bool:
+    """원본 ``latest.json``의 봉인 끝이 DB의 ``seal_batches``와 같은가. 읽지 못하면 거짓이다."""
+    path = (
+        _dest(settings, iid, request_id) / "latest.json"
+        if archived
+        else files.latest_path(settings.export_dir, iid)
+    )
+    try:
+        latest = files.read_verified(path, exports.keys(settings))
+    except (FileNotFoundError, files.ExportUnverified):
+        return False
+    seq = latest.get("to_seal_seq")
+    if seq is None:
+        return True
+    row = fetchone(
+        conn,
+        "SELECT encode(tail_hash, 'hex') AS tail FROM mint.seal_batches"
+        " WHERE instance_id = %s AND to_seal_seq = %s",
+        (iid, seq),
+    )
+    return row is not None and row["tail"] == latest.get("tail_hash")
+
+
 def validate(job: JobContext, request: dict[str, Any]) -> None:
     """게시 직전에 요청이 정당한지 다시 확인한다. 아니면 ``ControlError``."""
     conn, iid, settings = job.conn, job.instance_id, job.settings
@@ -104,7 +127,8 @@ def validate(job: JobContext, request: dict[str, Any]) -> None:
         if ok:
             items = _original_items(settings, iid, request_id, archived)
             ok = not restore_service.compare(conn, iid, items)
-        if ok and request["cause"] == "anchor":
+        if ok and not _anchor_ok(conn, iid, settings, request_id, archived):
+            # 요청의 cause 값을 믿지 않고 원본 latest.json 기준으로 다시 계산한 결과다
             ok = _two_admins(conn, iid, request["requested_by"], request["second_approver"])
     else:
         event = _event(conn, iid, EventKind.RESTORE_STALE_ACCEPTED, request_id)

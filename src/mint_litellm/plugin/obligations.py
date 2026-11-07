@@ -1,6 +1,6 @@
 """정책 출력의 정규화와 의무 합성.
 
-지원하는 의무는 ``alert``, ``require_call_approval``, ``require_consent`` 세 가지뿐이다.
+지원하는 의무는 알림·호출별 승인·동의·본인 확인 네 가지다.
 그 밖의 의무(인자 변환 등)나 서로 모순되는 의무는 호출을 차단하는 ``stop``이 된다.
 원장에는 의무의 종류와 정책 식별자만 남기고 의무 값(심각도·목적)은 남기지 않는다.
 """
@@ -18,10 +18,10 @@ from mint_litellm.types.decision import (
 )
 from mint_litellm.types.reason_codes import Reason
 
-# ``require_user_confirmation``은 형식만 정의되어 있고 판정 경로가 받아들이지 않는다(UNSUPPORTED).
-SUPPORTED_OBLIGATIONS: frozenset[ObligationType] = frozenset(
-    {ObligationType.ALERT, ObligationType.REQUIRE_CALL_APPROVAL, ObligationType.REQUIRE_CONSENT}
-)
+SUPPORTED_OBLIGATIONS: frozenset[ObligationType] = frozenset({
+    ObligationType.ALERT, ObligationType.REQUIRE_CALL_APPROVAL,
+    ObligationType.REQUIRE_CONSENT, ObligationType.REQUIRE_USER_CONFIRMATION,
+})
 
 _SEVERITY_RANK = {Severity.LOW: 0, Severity.MEDIUM: 1, Severity.HIGH: 2, Severity.CRITICAL: 3}
 
@@ -59,8 +59,10 @@ class RequireUserConfirmation(BaseModel):
 
 
 Obligation = Annotated[
-    AlertObligation | RequireCallApproval | RequireConsent, Field(discriminator="type")
+    AlertObligation | RequireCallApproval | RequireConsent | RequireUserConfirmation,
+    Field(discriminator="type"),
 ]
+ParsedObligation = AlertObligation | RequireCallApproval | RequireConsent | RequireUserConfirmation
 _OBLIGATION = TypeAdapter(Obligation)
 
 
@@ -74,7 +76,7 @@ class PolicyNormalization(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     decision: PolicyDecision | None = None
-    obligations: tuple[AlertObligation | RequireCallApproval | RequireConsent, ...] = ()
+    obligations: tuple[ParsedObligation, ...] = ()
     findings: tuple[StageResult, ...] = ()
     failure: StageResult | None = None
 
@@ -87,7 +89,7 @@ def _failed(reason: Reason, detail: str) -> PolicyNormalization:
     return PolicyNormalization(failure=StageResult.stop(reason, detail=detail))
 
 
-def _parse(item: Mapping[str, Any]) -> AlertObligation | RequireCallApproval | RequireConsent:
+def _parse(item: Mapping[str, Any]) -> ParsedObligation:
     return _OBLIGATION.validate_python(dict(item))
 
 
@@ -99,7 +101,7 @@ def compose_obligations(
     같은 종류는 하나로 합친다: ``alert``는 가장 높은 심각도, ``require_call_approval``은 하나,
     ``require_consent``는 같은 목적일 때만 하나로 합치고 목적이 다르면 충돌로 차단한다.
     """
-    parsed: list[AlertObligation | RequireCallApproval | RequireConsent] = []
+    parsed: list[ParsedObligation] = []
     for item in raw:
         kind = item.get("type") if isinstance(item, Mapping) else None
         if not isinstance(kind, str):
@@ -118,13 +120,22 @@ def compose_obligations(
     if len(purposes) > 1:
         return _failed(Reason.UNSUPPORTED, "conflicting consent purposes")
 
-    composed: list[AlertObligation | RequireCallApproval | RequireConsent] = []
+    confirmations = [o for o in parsed if isinstance(o, RequireUserConfirmation)]
+    if len({o.purpose for o in confirmations}) > 1:
+        return _failed(Reason.UNSUPPORTED, "conflicting confirmation purposes")
+
+    composed: list[ParsedObligation] = []
     if alerts:
         composed.append(max(alerts, key=lambda a: _SEVERITY_RANK[a.severity]))
     if any(isinstance(o, RequireCallApproval) for o in parsed):
         composed.append(RequireCallApproval())
     if purposes:
         composed.append(RequireConsent(purpose=next(iter(purposes))))
+    if confirmations:
+        composed.append(RequireUserConfirmation(
+            purpose=confirmations[0].purpose,
+            display_fields=tuple(sorted({f for o in confirmations for f in o.display_fields})),
+        ))
     return PolicyNormalization(obligations=tuple(composed))
 
 

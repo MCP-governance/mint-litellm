@@ -925,7 +925,9 @@ def test_evidence_expiry_scan_alerts_and_reruns_the_checks_without_changing_stat
         base.enqueue_job(make_ctx(conn), "evidence_expiry_scan", "scan", "evidence_expiry_scan:t0")
         conn.commit()
     world.drain()
-    assert fetchall(world.conn, "SELECT * FROM mint.alerts") == []  # 아직 만료가 멀다
+    assert (
+        fetchall(world.conn, "SELECT * FROM mint.alerts WHERE kind = 'evidence_expiring'") == []
+    )  # 아직 만료가 멀다
     world.conn.execute("ALTER TABLE mint.intake_checks DISABLE TRIGGER intake_checks_1_append_only")
     world.conn.execute(
         "UPDATE mint.intake_checks SET evidence_valid_until = now() + interval '3 days'"
@@ -936,7 +938,9 @@ def test_evidence_expiry_scan_alerts_and_reruns_the_checks_without_changing_stat
         base.enqueue_job(make_ctx(conn), "evidence_expiry_scan", "scan", "evidence_expiry_scan:t1")
         conn.commit()
     world.drain()  # 증거 경보를 만들고 재검사 작업까지 돌린다
-    alerts = fetchall(world.conn, "SELECT * FROM mint.alerts ORDER BY dedup_key")
+    alerts = fetchall(
+        world.conn, "SELECT * FROM mint.alerts WHERE kind = 'evidence_expiring' ORDER BY dedup_key"
+    )
     assert [(a["kind"], a["subject"]["check"]) for a in alerts] == [
         ("evidence_expiring", "connection"),
         ("evidence_expiring", "definitions"),
@@ -952,7 +956,9 @@ def test_evidence_expiry_scan_alerts_and_reruns_the_checks_without_changing_stat
         base.enqueue_job(make_ctx(conn), "evidence_expiry_scan", "scan", "evidence_expiry_scan:t2")
         conn.commit()
     world.drain()
-    assert len(fetchall(world.conn, "SELECT * FROM mint.alerts")) == 2
+    assert (
+        len(fetchall(world.conn, "SELECT * FROM mint.alerts WHERE kind = 'evidence_expiring'")) == 2
+    )
 
 
 def test_the_evidence_scan_ignores_rejected_and_unmanaged_servers(world):
@@ -963,7 +969,7 @@ def test_the_evidence_scan_ignores_rejected_and_unmanaged_servers(world):
         base.enqueue_job(make_ctx(conn), "evidence_expiry_scan", "scan", "evidence_expiry_scan:t")
         conn.commit()
     world.drain()
-    assert fetchall(world.conn, "SELECT * FROM mint.alerts") == []
+    assert fetchall(world.conn, "SELECT * FROM mint.alerts WHERE kind = 'evidence_expiring'") == []
 
 
 # --- 되돌림 보호 경계 -----------------------------------------------------------------------
@@ -1026,11 +1032,13 @@ def test_without_a_litellm_client_the_intake_jobs_fail_with_a_code(world):
     world.worker.close()
     worker = world.worker.__class__(world.worker.database_url, INSTANCE, SETTINGS)
     worker.open()
+    world.conn.execute("DELETE FROM mint.schedules")
     try:
         with psycopg.connect(world.url) as conn:
             base.enqueue_job(make_ctx(conn), "submission_poll", "poll", "submission_poll:x")
             conn.commit()
-        worker.step()
+        while worker.step():
+            pass
         row = world.jobs("submission_poll")[0]
         assert (row["status"], row["last_error_code"]) == ("pending", "litellm_not_configured")
     finally:

@@ -87,34 +87,6 @@ def test_write_whitelist_refuses_other_methods_and_paths(stub, method, path):
     assert stub.requests == []
 
 
-def test_key_and_team_updates_send_only_the_permission_fields(stub):
-    c = client(stub)
-    for bad in ({"blocked": True}, {"mcp_servers": [], "models": ["x"]}):
-        with pytest.raises(ControlError, match="mcp_servers"):
-            c.update_object_permission("key", "k", bad)
-    with pytest.raises(ControlError):
-        c.update_object_permission("user", "u", {"mcp_servers": []})
-    assert stub.requests == []
-
-
-def test_key_and_team_update_bodies_are_exactly_the_documented_ones(stub):
-    permission = {"mcp_servers": ["s1"], "mcp_tool_permissions": {"s1": ["echo"]}}
-    with pytest.raises(Exception):  # noqa: B017 - 시험 서버는 이 경로를 모른다(본문만 본다)
-        client(stub).update_object_permission("key", "k1", permission)
-    with pytest.raises(Exception):  # noqa: B017
-        client(stub).update_object_permission("team", "t1", permission)
-    assert stub.requests[0] == (
-        "POST",
-        "/key/update",
-        {"key": "k1", "object_permission": permission},
-    )
-    assert stub.requests[1] == (
-        "POST",
-        "/team/update",
-        {"team_id": "t1", "object_permission": permission},
-    )
-
-
 def test_probe_bodies_are_limited_to_the_contract_fields(stub):
     c = client(stub)
     with pytest.raises(ControlError, match="허용되지 않은 필드"):
@@ -134,13 +106,11 @@ def test_tools_list_over_the_size_limit_is_refused(stub):
     assert client(stub).test_tools_list({"url": "http://x"})["tools"]
 
 
-def test_stage2_routes_extend_the_stage1_list_without_changing_it():
+def test_the_probe_routes_extend_the_control_plane_route_list():
     from mint_litellm.types.cli_commands import CONTROL_PLANE_ALLOWED_ROUTES
 
     assert not set(STAGE2_ALLOWED_ROUTES) & set(CONTROL_PLANE_ALLOWED_ROUTES)
     assert set(STAGE2_ALLOWED_ROUTES) == {
-        "/key/update",
-        "/team/update",
         "/mcp-rest/test/connection",
         "/mcp-rest/test/tools/list",
     }
@@ -155,7 +125,7 @@ def test_server_update_is_limited_to_closing_allow_all_keys(stub):
         {"allow_all_keys": False},
         None,
     ):
-        with pytest.raises(ControlError, match="allow_all_keys를 끄는"):
+        with pytest.raises(ControlError, match="allow_all_keys: false"):
             c._write("PUT", "/v1/mcp/server", bad)
     assert stub.requests == []
 
@@ -183,8 +153,7 @@ def test_a_client_without_a_guard_cannot_write(stub):
         lambda: bare.approve_submission("a"),
         lambda: bare.reject_submission("a", "x"),
         lambda: bare.close_all_keys("a"),
-        lambda: bare.update_object_permission("key", "k", {"mcp_servers": []}),
-        lambda: bare.pin("a"),
+        lambda: bare.update_key_permission("k", [], {}),
     ):
         with pytest.raises(ControlError, match="경계"):
             write()

@@ -30,6 +30,7 @@ _VERSIONED = {
     "denials": ("id", "state_version"),
     "call_approvals": ("id", "state_version"),
     "consents": ("id", "state_version"),
+    "litellm_grants": ("id", "state_version"),
     "allowlists": ("id", "state_version"),
     "orgs": ("org_id", "state_version"),
     "settings": ("instance_id", "settings_version"),

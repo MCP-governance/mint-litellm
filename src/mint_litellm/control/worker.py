@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import psycopg
 from psycopg.errors import UniqueViolation
@@ -77,8 +78,8 @@ class Worker:
         restore_check: Callable[[psycopg.Connection, str], restore_judge.Verdict | bool]
         | None = None,
         owner: str | None = None,
-        litellm: object | None = None,
-        policy_data: object | None = None,
+        litellm: Any = None,
+        policy_data: Any = None,
     ) -> None:
         self.litellm = litellm
         self.policy_data = policy_data
@@ -90,6 +91,7 @@ class Worker:
         self.verdict = restore_judge.Verdict(restore_judge.SKIP)
         self._reported_blocks: set[int] = set()
         self._alerted: set[tuple] = set()
+        self.litellm = litellm
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.stop = threading.Event()
         self.current: jobs.JobContext | None = None
@@ -239,6 +241,8 @@ class Worker:
         outcome: str | tuple[str, str] = "ok"
         try:
             jobs.HANDLERS[job["kind"]](ctx)
+        except jobs.PermanentFailure as error:
+            outcome = ("permanent", error.code)
         except jobs.Cancelled:
             outcome = "cancelled"
         except jobs.RestoreBlocked:
@@ -261,6 +265,8 @@ class Worker:
             jobs.release(conn, job_id, self.owner, "shutdown")
         elif outcome == "restore_blocked":
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
+        elif outcome[0] == "permanent":
+            jobs.fail_permanently(conn, job_id, self.owner, outcome[1])
         else:
             jobs.fail(conn, job_id, self.owner, outcome[1])
 
@@ -284,10 +290,9 @@ def main(environ: Mapping[str, str] | None = None) -> int:
     environ = dict(os.environ) if environ is None else dict(environ)
     config = ControlConfig.from_env(environ)
     settings = Stage2Settings.from_env(environ)
-    litellm = (
-        LiteLLMControl(config.litellm_url, config.litellm_key)
-        if config.litellm_url and config.litellm_key else None
-    )
+    litellm = None
+    if config.litellm_url and config.litellm_key:
+        litellm = LiteLLMControl(config.litellm_url, config.litellm_key)
     worker = Worker(
         config.require_database(), config.instance_id, settings, litellm=litellm,
         policy_data=PolicyDataSource(environ.get("MINT_OPA_URL")),

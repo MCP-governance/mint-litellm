@@ -409,6 +409,7 @@ def test_extending_an_expired_lease_fails(make_worker, admin):
 
 def test_a_schedule_registers_one_job_per_period_even_with_two_workers(make_worker, admin):
     first, second = make_worker(schedules=True), make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     admin.execute("UPDATE mint.schedules SET next_run_at = date_trunc('second', now())"
                   " - interval '1 second'")
     start = threading.Barrier(2)
@@ -435,6 +436,7 @@ def test_a_schedule_registers_one_job_per_period_even_with_two_workers(make_work
 
 def test_missed_periods_are_skipped_to_the_current_one_on_the_original_grid(make_worker, admin):
     worker = make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     admin.execute("UPDATE mint.schedules SET next_run_at = now() - interval '605 seconds'")
     before = fetchone(admin, "SELECT next_run_at FROM mint.schedules")["next_run_at"]
     assert jobs.register_due_schedules(worker.conn, INSTANCE) == 1  # 열 번 밀렸어도 한 건
@@ -482,6 +484,7 @@ def test_the_worker_runs_the_approval_expiry_scan_from_its_schedule(
                 " now() + %s::interval)", (INSTANCE, tag, HEX, delta))
         conn.commit()
     worker = make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
     assert worker.step()  # 일정 등록 -> 임대 -> 처리
     states = {r["principal_id"]: r["status"]
               for r in fetchall(admin, "SELECT principal_id, status FROM mint.call_approvals")}

@@ -13,8 +13,8 @@ def test_applies_once_and_is_a_no_op_the_second_time(fresh_db):
         assert migrate.apply_migrations(conn) == []
         names = [r[0] for r in conn.execute("SELECT name FROM mint.schema_migrations")]
         assert names == [
-            "001_initial", "002_stage2", "003_negative_export", "006_alert_delivery_count",
-            "008_restore_requests",
+            "001_initial", "002_stage2", "003_negative_export", "004_staff_confirmation",
+            "006_alert_delivery_count", "008_restore_requests",
         ]
 
 
@@ -29,8 +29,8 @@ def test_first_run_on_an_empty_database_applies_everything(fresh_db):
     try:
         with psycopg.connect(make_conninfo(**dict(params, dbname=name))) as conn:
             assert migrate.apply_migrations(conn) == [
-                "001_initial", "002_stage2", "003_negative_export", "006_alert_delivery_count",
-                "008_restore_requests",
+                "001_initial", "002_stage2", "003_negative_export", "004_staff_confirmation",
+                "006_alert_delivery_count", "008_restore_requests",
             ]
             assert conn.execute("SELECT count(*) FROM mint.orgs").fetchone()[0] == 0
     finally:
@@ -78,8 +78,8 @@ def test_a_database_with_only_the_first_migration_is_upgraded(fresh_db):
             before = conn.execute("SELECT epoch FROM mint.state_epoch").fetchone()[0]
             conn.commit()
             assert migrate.apply_migrations(conn) == [
-                "002_stage2", "003_negative_export", "006_alert_delivery_count",
-                "008_restore_requests",
+                "002_stage2", "003_negative_export", "004_staff_confirmation",
+                "006_alert_delivery_count", "008_restore_requests",
             ]
             assert conn.execute("SELECT count(*) FROM mint.intakes").fetchone()[0] == 0
             row = conn.execute(

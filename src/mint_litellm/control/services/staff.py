@@ -2,11 +2,13 @@
 
 직원 화면의 쓰기는 직원 로그인 역할이 함수로만 한다. 함수는 대상 사용자와 배치를 트랜잭션마다 거는
 ``mint.staff_user_id``·``mint.staff_instance_id`` 설정에서만 읽고 본인 행만 바꾸므로(한계: 그 값은
-콘솔의 세션 인증이 보증한다), 소속·상태·상한·키 분리·세션 만료 같은 규칙은 이 계층이 먼저 확인한다.
+콘솔의 세션 인증이 보증한다). 이 계층의 선확인 뒤 DB 함수가 같은 쓰기 트랜잭션에서
+소속·서버·세션·키 분리·유효 기간을 다시 확인한다.
 직원 로그인 역할은 표를 읽지 못하므로 확인용 읽기는 제어 연결로 하고, 쓰기는 직원 연결의 한
 트랜잭션에서 한다.
 """
 
+import json
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -37,10 +39,14 @@ class StaffContext:
     user_id: str
     # 본인 동의의 유효 기간 상한(일). Stage2Settings.staff_consent_max_days 값을 넘긴다.
     consent_max_days: int = 90
+    # 인증된 LiteLLM 세션 키 정보에서만 채운다. 화면 입력을 받지 않는다.
+    team_ids: tuple[str, ...] = ()
 
 
 @contextmanager
-def _staff_transaction(sctx: StaffContext) -> Iterator[psycopg.Connection]:
+def _staff_transaction(
+    sctx: StaffContext, session_id_hash: str = "", team_ids: Sequence[str] | None = None,
+) -> Iterator[psycopg.Connection]:
     """직원 함수가 읽는 설정을 이 트랜잭션에만 걸고 연결을 내준다."""
     # 바깥 트랜잭션 안이면 세이브포인트가 되어 설정이 바깥 끝까지 남는다. 유휴 연결만 받는다.
     if sctx.staff.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
@@ -48,8 +54,13 @@ def _staff_transaction(sctx: StaffContext) -> Iterator[psycopg.Connection]:
     with sctx.staff.transaction():
         sctx.staff.execute(
             "SELECT set_config('mint.staff_user_id', %s, true),"
-            " set_config('mint.staff_instance_id', %s, true)",
-            (sctx.user_id, sctx.instance_id),
+            " set_config('mint.staff_instance_id', %s, true),"
+            " set_config('mint.staff_session_id_hash', %s, true),"
+            " set_config('mint.staff_team_ids', %s, true),"
+            " set_config('mint.staff_consent_max_days', %s, true)",
+            (sctx.user_id, sctx.instance_id, session_id_hash,
+             json.dumps(list(sctx.team_ids if team_ids is None else team_ids)),
+             str(sctx.consent_max_days)),
         )
         yield sctx.staff
 
@@ -93,12 +104,12 @@ def start_session(
 
 def touch_session(sctx: StaffContext, session_id_hash: str, idle_expiry: datetime) -> None:
     _active_session(sctx, session_id_hash)
-    with _staff_transaction(sctx) as conn:
+    with _staff_transaction(sctx, session_id_hash) as conn:
         conn.execute("SELECT mint.staff_touch_session(%s, %s)", (session_id_hash, idle_expiry))
 
 
 def end_session(sctx: StaffContext, session_id_hash: str) -> None:
-    with _staff_transaction(sctx) as conn:
+    with _staff_transaction(sctx, session_id_hash) as conn:
         conn.execute("SELECT mint.staff_end_session(%s)", (session_id_hash,))
 
 
@@ -142,7 +153,7 @@ def _decide(
         raise separation_of_duties(
             "호출한 키와 같은 키로 로그인한 세션은 확인할 수 없습니다. 다른 키로 로그인하십시오."
         )
-    with _staff_transaction(sctx) as conn:
+    with _staff_transaction(sctx, session_id_hash) as conn:
         if target == "cancel":
             conn.execute("SELECT mint.staff_cancel(%s)", (confirmation_id,))
         else:
@@ -255,7 +266,7 @@ def grant_consent(
     _active_session(sctx, session_id_hash)
     _check_consent_target(sctx, org_id, server_id, team_ids)
     consent_id = new_uuid7()
-    with _staff_transaction(sctx) as conn:
+    with _staff_transaction(sctx, session_id_hash, team_ids) as conn:
         conn.execute(
             "SELECT mint.staff_grant_consent(%s, %s, %s, %s, %s, %s, %s)",
             (consent_id, org_id, server_id, purpose.strip(), data_scope, text_version, valid_until),
@@ -265,7 +276,7 @@ def grant_consent(
 
 def revoke_consent(sctx: StaffContext, session_id_hash: str, consent_id: str) -> None:
     _active_session(sctx, session_id_hash)
-    with _staff_transaction(sctx) as conn:
+    with _staff_transaction(sctx, session_id_hash) as conn:
         conn.execute("SELECT mint.staff_revoke_consent(%s)", (consent_id,))
 
 
