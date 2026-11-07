@@ -10,6 +10,7 @@ export ACC_DATABASE_URL="postgresql://postgres:$(getenv POSTGRES_PASSWORD)@127.0
 export MINT_DATABASE_URL="postgresql://mint_control_app:$(getenv MINT_CONTROL_DB_PASSWORD)@127.0.0.1:4332/mint"
 export ACC_PLUGIN_DATABASE_URL="postgresql://mint_plugin_app:$(getenv MINT_PLUGIN_DB_PASSWORD)@127.0.0.1:4332/mint"
 export ACC_STAFF_DATABASE_URL="postgresql://mint_staff_app:$(getenv MINT_STAFF_DB_PASSWORD)@127.0.0.1:4332/mint"
+export MINT_EXPORT_DIR="$STATE/export"
 export MINT_EXPORT_HMAC_KEY="$(getenv MINT_EXPORT_HMAC_KEY)" MINT_INSTANCE_ID=acceptance
 export MINT_LITELLM_URL=http://127.0.0.1:4300 ACC_LITELLM_ADMIN_URL=http://127.0.0.1:4300
 export MINT_LITELLM_KEY="$(getjson ACC_CONTROL_KEY)" ACC_CONTROL_KEY="$(getjson ACC_CONTROL_KEY)"
