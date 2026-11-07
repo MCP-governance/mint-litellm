@@ -138,6 +138,18 @@ def _ip_in_entry(entry_value: str, ip: ipaddress.IPv4Address | ipaddress.IPv6Add
         return False
 
 
+def _embedded_ipv4_forbidden(ip: Any) -> bool:
+    """NAT64(``64:ff9b::/96``)·6to4(``2002::/16``) 안에 든 IPv4가 전역이 아니면 거부한다."""
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return False
+    embedded = None
+    if ip in ipaddress.ip_network("64:ff9b::/96"):
+        embedded = ipaddress.IPv4Address(ip.packed[12:])
+    elif ip in ipaddress.ip_network("2002::/16"):
+        embedded = ipaddress.IPv4Address(ip.packed[2:6])
+    return embedded is not None and not embedded.is_global
+
+
 def url_guard(
     url: str | None,
     transport: str | None,
@@ -157,6 +169,9 @@ def url_guard(
     inputs: dict = {"url_sha256": sha256_hex(url), "scheme": parts.scheme, "port": port}
     if parts.scheme not in ("http", "https") or not host:
         return _done("url_guard", Outcome("fail", "URL_INVALID", method, inputs))
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        # 주소 앞의 자격(user:pass@)은 로그·계약에 비밀이 남고 호스트 판정을 속인다
+        return _done("url_guard", Outcome("fail", "URL_USERINFO", method, inputs))
     egress = [e for e in allowlists if e["kind"] == "egress_target"]
     used: list[str] = []
     ip = None
@@ -172,8 +187,10 @@ def url_guard(
         or (ip is not None and _ip_in_entry(e["value"], ip))
     ]
     if ip is not None and (
-        ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_multicast
+        not ip.is_global  # 공유 주소 대역(CGNAT)·문서용·벤치마크 등 전역이 아닌 모든 주소
+        or ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_multicast
         or ip.is_unspecified or ip.is_reserved
+        or _embedded_ipv4_forbidden(ip)
     ):
         if not exempt:
             return _done("url_guard", Outcome("fail", "IP_FORBIDDEN", method, inputs))
@@ -247,12 +264,20 @@ def connection(client: Any, spec: dict) -> Outcome:
 # --- 4. definitions -------------------------------------------------------------------
 
 
-def depth(value: Any, level: int = 1) -> int:
-    if isinstance(value, dict):
-        return max([level] + [depth(v, level + 1) for v in value.values()])
-    if isinstance(value, list):
-        return max([level] + [depth(v, level + 1) for v in value])
-    return level
+def depth(value: Any, limit: int = MAX_DEPTH + 1) -> int:
+    """중첩 깊이. ``limit``에 닿으면 더 세지 않고 돌려준다(재귀 한도에 닿지 않는다)."""
+    deepest = 1
+    stack = [(value, 1)]
+    while stack:
+        node, level = stack.pop()
+        deepest = max(deepest, level)
+        if deepest >= limit:
+            return deepest
+        if isinstance(node, dict):
+            stack.extend((v, level + 1) for v in node.values())
+        elif isinstance(node, list):
+            stack.extend((v, level + 1) for v in node)
+    return deepest
 
 
 def tool_definition(tool: dict) -> dict:
@@ -309,17 +334,24 @@ def definitions(client: Any, spec: dict) -> Outcome:
 
 
 def _strings(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        return [s for v in value.values() for s in _strings(v)]
-    if isinstance(value, list):
-        return [s for v in value for s in _strings(v)]
-    return []
+    """문자열 값과 사전의 키를 모두 모은다(반복으로 훑어 재귀 한도에 닿지 않는다)."""
+    found: list[str] = []
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            found.append(node)
+        elif isinstance(node, dict):
+            for key, child in node.items():
+                found.append(str(key))
+                stack.append(child)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return found
 
 
 def description_scan(defs: list[dict] | None, data: PolicyData | None) -> Outcome:
-    """도구 설명과 입력 스키마의 모든 문자열에서 번들의 고정 표지를 찾는다. 적중 0이면 통과."""
+    """도구 정의 전체(이름·설명·스키마·annotations)의 문자열에서 번들의 고정 표지를 찾는다."""
     method = "scan:description_markers"
     if data is None:
         return _done("description_scan",
@@ -329,7 +361,8 @@ def description_scan(defs: list[dict] | None, data: PolicyData | None) -> Outcom
     hits = 0
     scanned = 0
     for d in defs:
-        text = "\n".join(_strings([d["description"], d["input_schema"]])).casefold()
+        # 이름·설명·입력/출력 스키마·annotations의 모든 문자열(도구 정의 전체)
+        text = "\n".join(_strings(d)).casefold()
         scanned += len(text)
         hits += sum(1 for m in data.markers if m.casefold() in text)
     inputs = {"tools": len(defs), "chars": scanned, "hits": hits, "markers_sha256": data.sha256}

@@ -18,7 +18,7 @@ def stub():
     server.close()
 
 
-def client(stub, guard=None):
+def client(stub, guard=lambda: None):
     return LiteLLMControl(stub.url, CONTROL_KEY, guard=guard)
 
 
@@ -167,8 +167,35 @@ def test_close_all_keys_updates_then_reads_back_and_reports_the_result(stub):
     assert c.close_all_keys("a") is True
     assert calls == [1]  # 쓰기 직전 경계
     assert [(m, p) for m, p, _ in stub.requests] == [
-        ("PUT", "/v1/mcp/server"), ("GET", "/v1/mcp/server/a")]
+        ("PUT", "/v1/mcp/server"),
+        ("GET", "/v1/mcp/server/a"),
+    ]
     assert stub.requests[0][2] == {"server_id": "a", "allow_all_keys": False}
     stub.submissions[0]["allow_all_keys"] = True
     stub.close_works = False  # 수정이 반영되지 않으면 읽어 확인한 결과가 거짓이다
     assert c.close_all_keys("a") is False
+
+
+def test_a_client_without_a_guard_cannot_write(stub):
+    stub.submissions = [submission("a")]
+    bare = LiteLLMControl(stub.url, CONTROL_KEY)
+    for write in (
+        lambda: bare.approve_submission("a"),
+        lambda: bare.reject_submission("a", "x"),
+        lambda: bare.close_all_keys("a"),
+        lambda: bare.update_object_permission("key", "k", {"mcp_servers": []}),
+        lambda: bare.pin("a"),
+    ):
+        with pytest.raises(ControlError, match="경계"):
+            write()
+    assert stub.requests == []
+    assert bare.list_submissions()  # 읽기는 경계 없이 된다
+
+
+def test_a_refused_reject_is_reported_and_a_too_deep_response_is_a_limit(stub):
+    stub.submissions = [submission("a")]
+    stub.reject_refused = True
+    assert client(stub).reject_submission("a", "x") == "refused"
+    stub.tools_raw = b"[" * 5000 + b"]" * 5000
+    with pytest.raises(ResponseTooLarge):
+        client(stub).test_tools_list({"url": "http://x"})

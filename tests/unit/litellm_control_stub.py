@@ -54,6 +54,7 @@ class ControlStub:
         }
         self.servers: dict[str, dict] = {}
         self.tools_raw: bytes | None = None
+        self.reject_refused = False  # True면 거절이 400(다른 사유)으로 거부된다
         self.close_works = True  # False면 allow_all_keys 수정이 반영되지 않는다
         self.context = None  # 정책 엔진 문맥 응답(GET /v1/data/mint/context)
         stub = self
@@ -126,6 +127,8 @@ class ControlStub:
                     item = next((i for i in stub.submissions if i["server_id"] == parts[4]), None)
                     if item is None:
                         return self._send(404, {"detail": {"error": "not found"}})
+                    if parts[5] == "reject" and stub.reject_refused:
+                        return self._send(400, {"detail": {"error": "cannot reject"}})
                     state = "active" if parts[5] == "approve" else "rejected"
                     if item["approval_status"] == state:
                         return self._send(

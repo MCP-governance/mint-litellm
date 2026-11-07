@@ -95,6 +95,8 @@ class LiteLLMControl(LiteLLMAdmin):
             raise ResponseTooLarge(f"LiteLLM {path} 응답이 {max_bytes}바이트를 넘었습니다.")
         try:
             parsed = scrub(json.loads(raw)) if raw else None
+        except RecursionError:
+            raise ResponseTooLarge(f"LiteLLM {path} 응답의 중첩이 한도를 넘었습니다.") from None
         except ValueError:
             parsed = None
         return status, parsed
@@ -109,8 +111,12 @@ class LiteLLMControl(LiteLLMAdmin):
             or body["allow_all_keys"] is not False
         ):
             raise ControlError("서버 수정은 allow_all_keys를 끄는 본문만 보낼 수 있습니다.")
-        if self._guard is not None:
-            self._guard()
+        if self._guard is None:
+            # 경계 없는 쓰기는 하지 않는다(되돌림 상태·임대 유효성 확인을 건너뛰지 않게)
+            raise ControlError(
+                "쓰기 직전 경계(guard)가 없는 클라이언트로는 LiteLLM에 쓸 수 없습니다."
+            )
+        self._guard()
         return self._send(method, path, body)
 
     # --- 읽기 -------------------------------------------------------------------
@@ -155,6 +161,8 @@ class LiteLLMControl(LiteLLMAdmin):
         text = json.dumps(out, ensure_ascii=False) if out is not None else ""
         if status == 400 and f"already {done_word}" in text:
             return "already"
+        if status == 400:
+            return "refused"  # 이미 다른 상태로 결정된 제출: 재시도해도 같다(호출자가 정리한다)
         raise LiteLLMError(f"LiteLLM 제출 {action} 응답이 올바르지 않습니다(HTTP {status}).")
 
     def approve_submission(self, server_id: str) -> str:

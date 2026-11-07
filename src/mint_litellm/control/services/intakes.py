@@ -651,6 +651,11 @@ def decide(
         checks = latest_checks(ctx.conn, ctx.instance_id, row["id"])
         if decision == "reject":
             return _reject(ctx, row)
+        if decision != "reject" and any(c["reason_code"] == "ALL_KEYS_NOT_CLOSED" for c in checks):
+            raise conflict(
+                "승인한 제출 서버의 allow_all_keys를 끄지 못해 진행할 수 없습니다. "
+                "LiteLLM에서 서버를 정리하거나 재검사하십시오."
+            )
         if any(c["result"] == "fail" for c in checks) or (
             decision == "approve" and any(c["result"] != "pass" for c in checks)
         ):

@@ -77,32 +77,50 @@ class AllKeysNotClosed(Exception):
     """승인한 제출 서버의 ``allow_all_keys``를 끄지 못했다. 신청은 더 진행하지 않는다."""
 
 
-def _registry_first(job: JobContext, client: Any, server_id: str) -> str | None:
-    """제출을 LiteLLM 레지스트리에 올린다. 사유 코드가 돌아오면 올리지 못한 것이다.
+def _alert_divergence(job: JobContext, server_id: str, item: str, **subject: Any) -> None:
+    with job.conn.transaction():
+        alerts.raise_alert(
+            job.conn, job.instance_id, kind="sync_divergence", severity="high",
+            dedup_key=f"sync_divergence:{item}:{server_id}",
+            subject={"server_id": server_id, "item": item, **subject},
+        )
 
-    승인은 제출의 ``allow_all_keys``를 그대로 두므로 승인 직후 같은 작업에서 끄고 다시 읽어
-    확인한다. 끄지 못하면 경보 ``sync_divergence``를 내고 ``AllKeysNotClosed``를 낸다.
-    """
-    item = next((i for i in client.list_submissions() if i.get("server_id") == server_id), None)
-    if item is None:
-        return "SUBMISSION_GONE"
-    if item.get("approval_status") == "pending_review":
-        client.approve_submission(server_id)
-    if item.get("allow_all_keys"):
+
+def _close_all_keys(job: JobContext, client: Any, server_id: str) -> None:
+    """``allow_all_keys``를 끄고 다시 읽어 확인한다. 못 끄면 경보를 내고 ``AllKeysNotClosed``."""
+    try:
+        closed = client.close_all_keys(server_id)
+    except LiteLLMError:
         closed = False
-        try:
-            closed = client.close_all_keys(server_id)
-        except LiteLLMError:
-            closed = False
-        if not closed:
-            with job.conn.transaction():
-                alerts.raise_alert(
-                    job.conn, job.instance_id, kind="sync_divergence", severity="high",
-                    dedup_key=f"sync_divergence:allow_all_keys:{server_id}",
-                    subject={"server_id": server_id, "item": "allow_all_keys",
-                             "expected": False},
-                )
-            raise AllKeysNotClosed
+    if not closed:
+        _alert_divergence(job, server_id, "allow_all_keys", expected=False)
+        raise AllKeysNotClosed
+
+
+def _gate(job: JobContext, client: Any, server_id: str, mode: str) -> str | None:
+    """연결 검사 직전에 LiteLLM 서버 상태를 맞춘다. 사유 코드가 돌아오면 검사를 하지 않는다.
+
+    ``registry``: 제출을 레지스트리에 올리고(승인) **값과 상관없이** 승인 직후 같은 작업에서
+    ``allow_all_keys``를 끄고 다시 읽어 확인한다. 그 밖의 방식: 이미 레지스트리에 있는 서버가
+    열려 있으면(``allow_all_keys=true``) 다시 끈다. 끄지 못하면 ``AllKeysNotClosed``이다.
+    """
+    if mode == "registry":
+        submissions = client.list_submissions()
+        item = next((i for i in submissions if i.get("server_id") == server_id), None)
+        if item is None:
+            return "SUBMISSION_GONE"
+        if item.get("approval_status") == "pending_review":
+            if client.approve_submission(server_id) == "refused":
+                return "APPROVE_REFUSED"
+        _close_all_keys(job, client, server_id)
+        return None
+    entry = client.get_server(server_id)
+    if (
+        entry is not None
+        and entry.get("approval_status") in (None, "active")  # 대기·거절 제출은 건드리지 않는다
+        and entry.get("allow_all_keys") is True
+    ):
+        _close_all_keys(job, client, server_id)
     return None
 
 
@@ -145,12 +163,12 @@ def _run_checks(
         elif name in ("connection", "definitions"):
             probe = dict(spec or {})
             blocked = None
+            if name == "connection":
+                try:
+                    blocked = _gate(job, client, server_id, mode)
+                except AllKeysNotClosed:
+                    blocked, halt = "ALL_KEYS_NOT_CLOSED", True
             if mode == "registry":
-                if name == "connection":
-                    try:
-                        blocked = _registry_first(job, client, server_id)
-                    except AllKeysNotClosed:
-                        blocked, halt = "ALL_KEYS_NOT_CLOSED", True
                 probe["server_id"] = server_id
             if blocked:
                 out = checks.Outcome("indeterminate", blocked, "litellm:registry_first")
@@ -186,7 +204,12 @@ def _reject_at_litellm(job: JobContext, row: dict) -> None:
     if row["source"] != "submission" or row["decision"] != "rejected":
         return
     reason = (row["decision_reason"] or "rejected")[:200]
-    _client(job).reject_submission(row["server_id"], reason)
+    result = _client(job).reject_submission(row["server_id"], reason)
+    if result == "refused":
+        # LiteLLM이 거절을 받지 않는다(이미 다른 상태로 결정된 제출). 재시도해도 같으므로 반복하지
+        # 않고 경보로 남긴다. 운영자가 LiteLLM에서 그 서버를 정리한다.
+        _alert_divergence(job, row["server_id"], "submission_reject_refused",
+                          intake_id=str(row["id"]))
 
 
 def intake_run(job: JobContext) -> None:

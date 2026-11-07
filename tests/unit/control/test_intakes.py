@@ -472,7 +472,11 @@ def test_credentials_required_then_registry_first_checks_again_with_the_stored_c
     world.drain()
     row = world.intake(intake_id)
     assert (row["status"], row["needs_registry_credentials"]) == ("passed", False)
-    assert world.stub.writes() == [("PUT", "/v1/mcp/server/sub-1/approve")]  # 승인 1회
+    # 승인 1회, 값이 이미 꺼져 있어도 승인 직후 항상 끄기를 부르고 읽어 확인한다
+    assert world.stub.writes() == [
+        ("PUT", "/v1/mcp/server/sub-1/approve"),
+        ("PUT", "/v1/mcp/server"),
+    ]
     probes = [b for m, p, b in world.stub.requests if p.startswith("/mcp-rest/test")]
     assert probes[-1]["server_id"] == "sub-1" and "credentials" not in probes[-1]
     assert {c["attempt"] for c in world.checks(intake_id, 2)} >= {2}
@@ -505,7 +509,8 @@ def test_registry_first_closes_allow_all_keys_right_after_the_approval_and_reads
         for m, p, _ in world.stub.requests
         if p.startswith("/v1/mcp/server/sub-1") or p == "/v1/mcp/server"
     ]
-    assert order.index(("PUT", "/v1/mcp/server")) < order.index(("GET", "/v1/mcp/server/sub-1"))
+    put = order.index(("PUT", "/v1/mcp/server"))
+    assert ("GET", "/v1/mcp/server/sub-1") in order[put + 1 :]  # 끈 뒤 다시 읽어 확인
     update = [b for m, p, b in world.stub.requests if (m, p) == ("PUT", "/v1/mcp/server")][0]
     assert update == {"server_id": "sub-1", "allow_all_keys": False}
     assert world.stub.submissions[0]["allow_all_keys"] is False
@@ -530,6 +535,87 @@ def test_when_allow_all_keys_cannot_be_closed_the_intake_stops_and_an_alert_open
         "sub-1",
     )
     assert [e["payload"]["kind"] for e in world.events("alert_opened")] == ["sync_divergence"]
+
+
+def test_a_failed_close_blocks_approve_and_except_but_not_reject(world):
+    from mint_litellm.control.context import Operator
+
+    world.stub.close_works = False
+    intake_id = registry_first_with_all_keys(world)
+    with pytest.raises(AdminError) as raised:
+        world.decide(intake_id, "approve", valid_until=FUTURE)
+    assert raised.value.code == AdminCode.CONFLICT
+    with pytest.raises(AdminError, match="allow_all_keys") as raised:
+        world.call(
+            lambda ctx: svc.decide(
+                ctx,
+                intake_id,
+                "except",
+                reason="r",
+                valid_until=FUTURE,
+                second=Operator("boss2", "approver", "boss-2"),
+            ),
+            name="boss",
+            user="boss-1",
+            role="approver",
+        )
+    assert raised.value.code == AdminCode.CONFLICT
+    assert world.intake(intake_id)["decision"] is None
+    assert fetchall(world.conn, "SELECT * FROM mint.approvals") == []
+    world.decide(intake_id, "reject", reason="정리")  # 거절은 막지 않는다
+    assert world.intake(intake_id)["decision"] == "rejected"
+
+
+def test_a_plain_recheck_closes_a_server_that_is_open_in_the_registry(world):
+    world.stub.submissions = [submission("sub-1", approval_status="active", allow_all_keys=True)]
+    world.stub.servers["sub-1"] = world.stub.submissions[0]
+    world.conn.execute(
+        "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256,"
+        " transport, auth_type, registered_by) VALUES (gen_random_uuid(), %s,"
+        " 'sub-1', 'pending', %s, 'http', 'none', 'root')",
+        (INSTANCE, "ab" * 32),
+    )
+    world.create("sub-1")
+    world.drain()
+    assert world.stub.submissions[0]["allow_all_keys"] is False
+    assert ("PUT", "/v1/mcp/server") in world.stub.writes()
+    # 열려 있지 않으면 쓰지 않는다
+    before = len(world.stub.writes())
+    intake_id = str(fetchone(world.conn, "SELECT id FROM mint.intakes")["id"])
+    world.call(lambda ctx: svc.recheck(ctx, intake_id))
+    world.drain()
+    assert len(world.stub.writes()) == before
+
+
+def test_a_refused_litellm_reject_is_not_retried_and_raises_an_alert(world):
+    world.stub.submissions = [submission("sub-1", url="https://other.test/mcp")]
+    world.stub.reject_refused = True
+    poll(world)
+    world.call(lambda ctx: svc.create(ctx, world.admin_client, "sub-1", **INPUTS))
+    world.drain()
+    run = world.jobs("intake_run")[0]
+    assert (run["status"], run["attempts"], run["last_error_code"]) == ("done", 0, None)
+    assert [(r[0], r[1]) for r in world.stub.requests if r[0] == "PUT"] == [
+        ("PUT", "/v1/mcp/server/sub-1/reject")
+    ]  # 한 번만
+    [alert] = fetchall(world.conn, "SELECT * FROM mint.alerts")
+    assert (alert["kind"], alert["subject"]["item"]) == (
+        "sync_divergence",
+        "submission_reject_refused",
+    )
+
+
+def test_the_url_query_is_stored_only_in_the_contract(world):
+    secret = "token=s3cr3t"
+    world.conn.execute("UPDATE mint.allowlists SET status = 'lifted' WHERE kind = 'provider'")
+    world.allow("provider", "up.test")
+    world.call(
+        lambda ctx: svc.create(ctx, world.admin_client, "srv-a", url=f"{URL}?{secret}", **INPUTS)
+    )
+    world.drain()
+    for table in ("intake_checks", "events", "jobs", "alerts"):
+        rows = fetchall(world.conn, f"SELECT t::text AS t FROM mint.{table} t")
+        assert not [r for r in rows if "s3cr3t" in r["t"]], table
 
 
 def test_recheck_is_refused_for_non_submissions_and_the_wrong_state(world):
