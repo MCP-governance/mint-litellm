@@ -16,10 +16,11 @@ from collections.abc import Callable, Mapping
 
 import psycopg
 
-from mint_litellm.control import intake_jobs, jobs
+from mint_litellm.control import alerts, intake_jobs, jobs
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.db.connection import connect, fetchone
 from mint_litellm.control.errors import ControlError
+from mint_litellm.control.intake_checks import PolicyDataSource
 from mint_litellm.control.litellm_control import LiteLLMControl
 from mint_litellm.control.stage2_config import Stage2Settings
 
@@ -52,10 +53,10 @@ class Worker:
         restore_check: Callable[[psycopg.Connection, str], bool] = no_restore_detected,
         owner: str | None = None,
         litellm: object | None = None,
-        policy_root: object | None = None,
+        policy_data: object | None = None,
     ) -> None:
         self.litellm = litellm
-        self.policy_root = policy_root
+        self.policy_data = policy_data
         self.database_url = database_url
         self.instance_id = instance_id
         self.settings = settings
@@ -104,6 +105,8 @@ class Worker:
         assert self.conn is not None
         jobs.register_due_schedules(self.conn, self.instance_id)
         jobs.reclaim_expired(self.conn, self.instance_id)
+        if self.settings.webhook_urls:
+            alerts.enqueue_deliveries(self.conn, self.instance_id, self.settings.webhook_urls)
         job = jobs.lease(
             self.conn, self.instance_id, self.owner, self.lease_seconds, sorted(jobs.HANDLERS)
         )
@@ -141,7 +144,7 @@ class Worker:
             return
         ctx = jobs.JobContext(
             conn, self.instance_id, job, self.settings, litellm=self.litellm,
-            restore_check=self.restore_check, policy_root=self.policy_root,
+            restore_check=self.restore_check, policy_data=self.policy_data,
         )
         self.current = ctx
         if self.stop.is_set():
@@ -203,7 +206,7 @@ def main(environ: Mapping[str, str] | None = None) -> int:
     )
     worker = Worker(
         config.require_database(), config.instance_id, settings, litellm=litellm,
-        policy_root=environ.get("MINT_POLICY_ROOT", "/opt/mint"),
+        policy_data=PolicyDataSource(environ.get("MINT_OPA_URL")),
     )
     worker.open()
     restore = install_signals(worker)

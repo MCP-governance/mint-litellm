@@ -6,6 +6,7 @@
     MINT_G2_LITELLM_URL        LiteLLM 주소(시험이 닿는 주소)
     MINT_G2_MASTER_KEY         LiteLLM 마스터 키(제어 평면 키·팀 키를 만드는 데만 쓴다)
     MINT_G2_UPSTREAM_URL       LiteLLM이 닿을 수 있는 시험 서버의 MCP 주소
+    MINT_G2_OPA_URL            활성 번들(`description_markers`·`risk`)을 가진 정책 엔진 주소
     MINT_TEST_DATABASE_URL     MINT 시험용 슈퍼유저 접속 주소
 
 통합 스택(``compose.yaml``)을 쓰면 LiteLLM은 ``http://localhost:4101``, 마스터 키는 스택의
@@ -29,10 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unit"))
 LITELLM = os.environ.get("MINT_G2_LITELLM_URL")
 MASTER = os.environ.get("MINT_G2_MASTER_KEY")
 UPSTREAM = os.environ.get("MINT_G2_UPSTREAM_URL")
+OPA = os.environ.get("MINT_G2_OPA_URL")
 pytestmark = pytest.mark.skipif(
-    not (LITELLM and MASTER and UPSTREAM and os.environ.get("MINT_TEST_DATABASE_URL")),
+    not (LITELLM and MASTER and UPSTREAM and OPA and os.environ.get("MINT_TEST_DATABASE_URL")),
     reason="MINT_G2_LITELLM_URL, MINT_G2_MASTER_KEY, MINT_G2_UPSTREAM_URL, "
-    "MINT_TEST_DATABASE_URL이 필요합니다",
+    "MINT_G2_OPA_URL, MINT_TEST_DATABASE_URL이 필요합니다",
 )
 
 from ctl_fixtures import INSTANCE, LOGIN_PASSWORDS, make_ctx  # noqa: E402
@@ -45,6 +47,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo  # noqa: E402
 
 from mint_litellm.control.db.connection import fetchall, fetchone  # noqa: E402
 from mint_litellm.control.db.roles import LOGIN_ROLES  # noqa: E402
+from mint_litellm.control.intake_checks import PolicyDataSource  # noqa: E402
 from mint_litellm.control.litellm_admin import LiteLLMAdmin  # noqa: E402
 from mint_litellm.control.litellm_control import STAGE2_ALLOWED_ROUTES, LiteLLMControl  # noqa: E402
 from mint_litellm.control.services import base, settings  # noqa: E402
@@ -53,7 +56,6 @@ from mint_litellm.control.stage2_config import Stage2Settings  # noqa: E402
 from mint_litellm.control.worker import Worker  # noqa: E402
 from mint_litellm.types.cli_commands import CONTROL_PLANE_ALLOWED_ROUTES  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[2]
 READINESS = {"credential_notice": "mail", "revocation_record": "log", "audit_access_days": 90}
 INPUTS = dict(
     purpose="통합 시험",
@@ -109,13 +111,33 @@ def world(fresh_db, login_roles, lite):
     params = conninfo_to_dict(fresh_db)
     params.update(user=LOGIN_ROLES["mint_worker"], password=LOGIN_PASSWORDS["mint_worker"])
     client = LiteLLMControl(LITELLM, lite["ctl_key"])
-    worker = Worker(make_conninfo(**params), INSTANCE, settings_, litellm=client, policy_root=ROOT)
+    worker = Worker(
+        make_conninfo(**params),
+        INSTANCE,
+        settings_,
+        litellm=client,
+        policy_data=PolicyDataSource(OPA),
+    )
     worker.open()
     admin = psycopg.connect(fresh_db, autocommit=True)
     admin.execute("DELETE FROM mint.schedules")
     with psycopg.connect(fresh_db) as conn:
         settings.initialize(make_ctx(conn), "acme", "ACME")
         conn.commit()
+    meta = json.loads(urllib.request.urlopen(f"{OPA}/v1/data/mint/meta", timeout=10).read())[
+        "result"
+    ]
+    admin.execute(
+        "INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256, bundle_sha256)"
+        " VALUES (%s, %s, %s, %s)",
+        (INSTANCE, meta["policy_version_id"], "cd" * 32, meta["bundle_sha256"]),
+    )
+    for status in ("staged", "active"):
+        admin.execute(
+            "UPDATE mint.policy_versions SET status = %s, activated_at = now(),"
+            " activated_by = 'root' WHERE id = %s",
+            (status, meta["policy_version_id"]),
+        )
     for kind in ("provider", "egress_target"):
         admin.execute(
             "INSERT INTO mint.allowlists (id, instance_id, kind, value, valid_from, valid_until,"
@@ -250,3 +272,43 @@ def test_a_failed_check_rejects_the_litellm_submission_automatically(world):
         admin, "SELECT count(*) AS n FROM mint.intakes WHERE server_id = %s", (server_id,)
     )["n"]
     assert count == 1
+
+
+def test_registry_first_closes_allow_all_keys_on_the_real_litellm(world):
+    """제출을 레지스트리에 올리면(승인) allow_all_keys가 같은 작업에서 꺼지고 다시 읽어 확인된다.
+
+    자격 필요 상태는 시험 장치로 표시한다(업스트림이 인증을 요구하지 않는 시험 서버이므로).
+    """
+    status, body = call(
+        "POST",
+        "/v1/mcp/server/register",
+        {
+            "server_name": f"g2_all_{uuid.uuid4().hex[:6]}",
+            "url": UPSTREAM,
+            "transport": "http",
+            "auth_type": "bearer_token",
+            "allow_all_keys": True,
+        },
+        key=world["lite"]["team_key"],
+    )
+    assert status == 201 and body["allow_all_keys"] is True
+    server_id = body["server_id"]
+    poll(world)
+    reader = LiteLLMAdmin(LITELLM, world["lite"]["ctl_key"])
+    with psycopg.connect(world["url"]) as conn:
+        svc.create(make_ctx(conn), reader, server_id, **INPUTS)
+        conn.commit()
+    admin = world["admin"]
+    intake = fetchone(admin, "SELECT * FROM mint.intakes WHERE server_id = %s", (server_id,))
+    run_jobs(world)
+    admin.execute(
+        "UPDATE mint.intakes SET needs_registry_credentials = true WHERE id = %s", (intake["id"],)
+    )
+    with psycopg.connect(world["url"]) as conn:
+        svc.recheck(make_ctx(conn), str(intake["id"]), registry_first=True)
+        conn.commit()
+    run_jobs(world)
+    status, listing = call("GET", "/v1/mcp/server/submissions")
+    item = next(i for i in listing["items"] if i["server_id"] == server_id)
+    assert (item["approval_status"], item["allow_all_keys"]) == ("active", False)
+    assert fetchall(admin, "SELECT * FROM mint.alerts") == []

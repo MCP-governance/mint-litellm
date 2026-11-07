@@ -15,12 +15,12 @@ from mint_litellm.control import jobs
 from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchone
 from mint_litellm.control.errors import conflict, forbidden, not_found
-from mint_litellm.types.cli_commands import ALL_COMMANDS, OperatorRole
+from mint_litellm.types.cli_commands import COMMANDS, OperatorRole
 from mint_litellm.types.ids import new_uuid7
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-_COMMANDS = {command.name: command for command in ALL_COMMANDS}
+_COMMANDS = {command.name: command for command in COMMANDS}
 
 # 낙관적 잠금이 가능한 표: 표 -> (대상 열, 버전 열)
 _VERSIONED = {

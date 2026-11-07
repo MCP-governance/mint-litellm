@@ -54,6 +54,8 @@ class ControlStub:
         }
         self.servers: dict[str, dict] = {}
         self.tools_raw: bytes | None = None
+        self.close_works = True  # False면 allow_all_keys 수정이 반영되지 않는다
+        self.context = None  # 정책 엔진 문맥 응답(GET /v1/data/mint/context)
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -71,6 +73,12 @@ class ControlStub:
                 raw = self.rfile.read(length) if length else b""
                 body = json.loads(raw) if raw else None
                 stub.requests.append((self.command, path, body))
+                if self.command == "GET" and path == "/v1/data/mint/context":
+                    return (
+                        self._send(200, {"result": stub.context})
+                        if stub.context
+                        else self._send(404, {})
+                    )
                 if self.headers.get("Authorization") != f"Bearer {CONTROL_KEY}":
                     return self._send(401, {"detail": "bad key"})
                 if self.command == "GET" and path == "/v1/mcp/server/submissions":
@@ -78,8 +86,25 @@ class ControlStub:
                         200, {"total": len(stub.submissions), "items": stub.submissions}
                     )
                 if self.command == "GET" and path.startswith("/v1/mcp/server/"):
-                    entry = stub.servers.get(path.rsplit("/", 1)[1])
+                    sid = path.rsplit("/", 1)[1]
+                    entry = stub.servers.get(sid) or next(
+                        (i for i in stub.submissions if i["server_id"] == sid), None
+                    )
                     return self._send(200, entry) if entry else self._send(404, {"detail": "no"})
+                if self.command == "PUT" and path == "/v1/mcp/server":
+                    item = next(
+                        (
+                            i
+                            for i in stub.submissions
+                            if i["server_id"] == (body or {}).get("server_id")
+                        ),
+                        None,
+                    )
+                    if item is None:
+                        return self._send(404, {"detail": {"error": "not found"}})
+                    if stub.close_works:
+                        item["allow_all_keys"] = body["allow_all_keys"]
+                    return self._send(202, item)
                 if self.command == "GET" and path == "/user/info":
                     uid = dict(p.split("=") for p in urlsplit(self.path).query.split("&")).get(
                         "user_id"

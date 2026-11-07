@@ -256,15 +256,28 @@ COMMANDS: tuple[CliCommand, ...] = (
         events=(EventKind.POLICY_ACTIVATED,),
     ),
     CliCommand(
+        path=("alert", "list"),
+        summary="경보를 상태별로 조회한다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("alert", "ack"),
+        summary="열린 경보를 확인 처리한다. 확인한 운영자와 함께 사건을 남긴다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.ALERT_ACKNOWLEDGED,),
+    ),
+    CliCommand(
+        path=("alert", "resolve"),
+        summary="경보를 해결됨으로 닫는다. 같은 원인이 다시 생기면 새 경보가 열린다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.ALERT_RESOLVED,),
+    ),
+    CliCommand(
         path=("ledger", "list"),
         summary="원장 사건을 종류·기간·호출 식별자로 조회한다.",
         roles=ALL_ROLES,
     ),
-)
-
-
-# 2단계 신청(수용검증) 명령. 1단계 표(``COMMANDS``)와 그 시험 기대값을 바꾸지 않도록 별도 표로 둔다.
-INTAKE_COMMANDS: tuple[CliCommand, ...] = (
+    # 신청(수용검증) 명령
     CliCommand(
         path=("intake", "list"),
         summary="수용검증 신청을 상태별로 조회한다.",
@@ -319,5 +332,3 @@ INTAKE_COMMANDS: tuple[CliCommand, ...] = (
         events=(EventKind.INTAKE_DECIDED, EventKind.CONTRACT_APPROVED),
     ),
 )
-
-ALL_COMMANDS: tuple[CliCommand, ...] = COMMANDS + INTAKE_COMMANDS

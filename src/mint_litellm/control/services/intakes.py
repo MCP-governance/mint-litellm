@@ -34,6 +34,8 @@ DATA_GRADES = ("public", "internal", "confidential", "restricted")
 READINESS_KEYS = ("credential_notice", "revocation_record", "audit_access_days")
 EVIDENCE_MAX_AGE = timedelta(hours=24)
 EXCEPTION_MAX_DAYS = 90
+DEFAULT_DAYS = 90
+DEFAULT_SHORT_DAYS = 30
 SYSTEM_ACTOR = "intake_run"
 _REQUIRED = (
     "purpose", "data_grade", "allowed_resources", "provider", "owner_user_id", "readiness",
@@ -654,15 +656,14 @@ def decide(
         ):
             raise conflict("모든 검사가 통과해야 승인할 수 있습니다.")
         _require_fresh_evidence(ctx, row)
-        if valid_until is None:
-            raise ControlError("승인 유효 기간(--valid-until)이 필요합니다.")
         now = datetime.now(UTC)
-        if valid_until <= now:
-            raise ControlError("valid-until이 이미 지났습니다.")
-        if decision == "except" and valid_until > now + timedelta(days=EXCEPTION_MAX_DAYS):
-            raise ControlError(
-                f"예외 승인의 유효 기간은 {EXCEPTION_MAX_DAYS}일을 넘을 수 없습니다."
-            )
+        if valid_until is not None:
+            if valid_until <= now:
+                raise ControlError("valid-until이 이미 지났습니다.")
+            if decision == "except" and valid_until > now + timedelta(days=EXCEPTION_MAX_DAYS):
+                raise ControlError(
+                    f"예외 승인의 유효 기간은 {EXCEPTION_MAX_DAYS}일을 넘을 수 없습니다."
+                )
         return _approve(ctx, row, decision, reason, valid_until, scope_type, scope_id, team_id,
                         second_info, checks)
 
@@ -697,6 +698,10 @@ def _approve(
         raise ControlError("승인할 도구 계약 후보가 없습니다. 정의 수집이 끝나야 합니다.")
     if any(t["risk_grade"] is None or t["action_type"] is None for t in tools):
         raise ControlError("위험 등급이 산정되지 않은 도구가 있어 승인할 수 없습니다.")
+    if valid_until is None:  # 기본: 일반 90일, high·critical 도구가 있으면 30일, 예외 30일
+        short = decision == "except" or any(t["risk_grade"] in ("high", "critical") for t in tools)
+        valid_until = datetime.now(UTC) + timedelta(days=DEFAULT_SHORT_DAYS if short else
+                                                    DEFAULT_DAYS)
     deployment = deployment_candidate(ctx.conn, ctx.instance_id, server_id)
     if deployment is None:
         raise ControlError("승인할 배포 계약 후보가 없습니다.")

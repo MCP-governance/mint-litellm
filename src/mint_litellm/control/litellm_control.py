@@ -34,6 +34,7 @@ WRITE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("PUT", rf"{_SERVER}/reject"),
         ("POST", rf"{_SERVER}/pin"),
         ("DELETE", rf"{_SERVER}/pin"),
+        ("PUT", r"/v1/mcp/server"),  # allow_all_keys 끄기 전용(본문 제한)
         ("POST", r"/key/update"),
         ("POST", r"/team/update"),
     )
@@ -41,6 +42,7 @@ WRITE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 # 업스트림 서버에 접속해 보는 시험 경로(LiteLLM 상태를 바꾸지 않는다)
 PROBE_ROUTES = frozenset({"/mcp-rest/test/connection", "/mcp-rest/test/tools/list"})
 PROBE_FIELDS = frozenset({"url", "transport", "auth_type", "server_id"})
+CLOSE_FIELDS = frozenset({"server_id", "allow_all_keys"})
 PERMISSION_FIELDS = frozenset({"mcp_servers", "mcp_tool_permissions"})
 MAX_TOOLS_BYTES = 2 * 1024 * 1024
 
@@ -101,6 +103,12 @@ class LiteLLMControl(LiteLLMAdmin):
         """LiteLLM 쓰기의 단 하나의 통로. 허용된 (메서드, 경로)만 보내고 그 직전에 경계를 부른다."""
         if not any(m == method and p.fullmatch(path) for m, p in WRITE_ROUTES):
             raise ControlError(f"허용되지 않은 LiteLLM 쓰기입니다: {method} {path}")
+        if method == "PUT" and path == "/v1/mcp/server" and (
+            not isinstance(body, dict)
+            or set(body) != CLOSE_FIELDS
+            or body["allow_all_keys"] is not False
+        ):
+            raise ControlError("서버 수정은 allow_all_keys를 끄는 본문만 보낼 수 있습니다.")
         if self._guard is not None:
             self._guard()
         return self._send(method, path, body)
@@ -155,6 +163,20 @@ class LiteLLMControl(LiteLLMAdmin):
 
     def reject_submission(self, server_id: str, notes: str) -> str:
         return self._review(server_id, "reject", {"review_notes": notes[:500]}, "rejected")
+
+    def close_all_keys(self, server_id: str) -> bool:
+        """서버의 ``allow_all_keys``를 끄고 다시 읽어 확인한다. 꺼졌으면 참.
+
+        ``PUT /v1/mcp/server``는 본문의 ``server_id``와 ``allow_all_keys``만 바꾸고 나머지
+        (주소·인증·저장 자격)는 그대로 둔다(실측). 확인은 서버 상세 읽기로 한다.
+        """
+        status, _ = self._write(
+            "PUT", "/v1/mcp/server", {"server_id": server_id, "allow_all_keys": False}
+        )
+        if status not in (200, 202):
+            return False
+        entry = self.get_server(server_id)
+        return entry is not None and entry.get("allow_all_keys") is False
 
     def update_object_permission(
         self, target: str, target_id: str, object_permission: dict

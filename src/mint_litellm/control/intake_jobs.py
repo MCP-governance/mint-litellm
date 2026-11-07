@@ -8,16 +8,15 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from psycopg.types.json import Jsonb
-
+from mint_litellm.control import alerts
 from mint_litellm.control import intake_checks as checks
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.db.connection import fetchall
 from mint_litellm.control.errors import ControlError
 from mint_litellm.control.jobs import JobContext, guard_external_write
+from mint_litellm.control.litellm_admin import LiteLLMError
 from mint_litellm.control.services import intakes
 from mint_litellm.control.services.base import enqueue_job
-from mint_litellm.types.ids import new_uuid7
 from mint_litellm.types.jobs import intake_run_job_key
 
 POLL_LIMIT = 500
@@ -74,16 +73,36 @@ def _stored_definitions(job: JobContext, server_id: str) -> list[dict] | None:
     return [json.loads(r["canonical_text"]) for r in rows] or None
 
 
-def _registry_first(client: Any, server_id: str) -> str | None:
-    """제출을 LiteLLM 레지스트리에 올린다(``allow_all_keys=false``인 제출만). 막히면 사유 코드."""
+class AllKeysNotClosed(Exception):
+    """승인한 제출 서버의 ``allow_all_keys``를 끄지 못했다. 신청은 더 진행하지 않는다."""
+
+
+def _registry_first(job: JobContext, client: Any, server_id: str) -> str | None:
+    """제출을 LiteLLM 레지스트리에 올린다. 사유 코드가 돌아오면 올리지 못한 것이다.
+
+    승인은 제출의 ``allow_all_keys``를 그대로 두므로 승인 직후 같은 작업에서 끄고 다시 읽어
+    확인한다. 끄지 못하면 경보 ``sync_divergence``를 내고 ``AllKeysNotClosed``를 낸다.
+    """
     item = next((i for i in client.list_submissions() if i.get("server_id") == server_id), None)
     if item is None:
         return "SUBMISSION_GONE"
-    if item.get("allow_all_keys"):
-        # approve는 제출의 allow_all_keys를 그대로 둔다. 모든 키에 열린 서버는 올리지 않는다.
-        return "ALL_KEYS_OPEN"
     if item.get("approval_status") == "pending_review":
         client.approve_submission(server_id)
+    if item.get("allow_all_keys"):
+        closed = False
+        try:
+            closed = client.close_all_keys(server_id)
+        except LiteLLMError:
+            closed = False
+        if not closed:
+            with job.conn.transaction():
+                alerts.raise_alert(
+                    job.conn, job.instance_id, kind="sync_divergence", severity="high",
+                    dedup_key=f"sync_divergence:allow_all_keys:{server_id}",
+                    subject={"server_id": server_id, "item": "allow_all_keys",
+                             "expected": False},
+                )
+            raise AllKeysNotClosed
     return None
 
 
@@ -95,10 +114,11 @@ def _run_checks(
     server_id = row["server_id"]
     contract = intakes.deployment_candidate(job.conn, job.instance_id, server_id)
     allowlists = _allowlists(job, row["org_id"])
-    data = checks.load_policy_data(job.policy_root)
+    data = job.policy_data.get(job.conn, job.instance_id) if job.policy_data else None
     ports = tuple(getattr(job.settings, "intake_allowed_ports", checks.DEFAULT_PORTS))
     defs: list[dict] | None = None
     needs_credentials = False
+    halt = False
     spec = None
     if contract is not None:
         spec = {"url": contract["url"], "transport": contract["transport"],
@@ -109,6 +129,8 @@ def _run_checks(
         if done is not None:  # 재시도: 이 시도에서 이미 기록한 검사는 건너뛴다
             if name == "connection":
                 needs_credentials = done["reason_code"] == "CREDENTIALS_REQUIRED"
+                if done["reason_code"] == "ALL_KEYS_NOT_CLOSED":
+                    return needs_credentials  # 끄지 못한 신청은 더 진행하지 않는다
             if name == "definitions" and done["result"] == "pass":
                 defs = _stored_definitions(job, server_id)
             if done["result"] == "fail":
@@ -124,7 +146,11 @@ def _run_checks(
             probe = dict(spec or {})
             blocked = None
             if mode == "registry":
-                blocked = _registry_first(client, server_id) if name == "connection" else None
+                if name == "connection":
+                    try:
+                        blocked = _registry_first(job, client, server_id)
+                    except AllKeysNotClosed:
+                        blocked, halt = "ALL_KEYS_NOT_CLOSED", True
                 probe["server_id"] = server_id
             if blocked:
                 out = checks.Outcome("indeterminate", blocked, "litellm:registry_first")
@@ -150,7 +176,7 @@ def _run_checks(
             out = checks.supply_chain(contract and contract["image_digest"],
                                       contract and contract["source_commit"])
         intakes.record_check(ctx, row, attempt, name, out)
-        if out.result == "fail":
+        if out.result == "fail" or halt:
             break
     return needs_credentials
 
@@ -189,16 +215,6 @@ def intake_run(job: JobContext) -> None:
 # --- evidence_expiry_scan -------------------------------------------------------------------
 
 
-def _open_alert(job: JobContext, kind: str, dedup: str, subject: dict) -> None:
-    job.conn.execute(
-        "INSERT INTO mint.alerts (id, instance_id, kind, severity, dedup_key, subject)"
-        " VALUES (%s, %s, %s, 'medium', %s, %s)"
-        " ON CONFLICT (instance_id, dedup_key) WHERE status <> 'resolved'"
-        " DO UPDATE SET count = mint.alerts.count + 1, last_at = now()",
-        (new_uuid7(), job.instance_id, kind, dedup[:512], Jsonb(subject)),
-    )
-
-
 def evidence_expiry_scan(job: JobContext) -> None:
     """승인된 신청의 증거가 7일 안에 만료되면 경보 ``evidence_expiring``과 재검사를 등록한다."""
     ctx = _context(job)
@@ -222,10 +238,13 @@ def evidence_expiry_scan(job: JobContext) -> None:
         if not expiring:
             continue
         for c in expiring:
-            _open_alert(job, "evidence_expiring", f"evidence_expiring:{row['id']}:{c['check']}",
-                        {"intake_id": str(row["id"]), "server_id": row["server_id"],
-                         "check": c["check"],
-                         "valid_until": c["evidence_valid_until"].isoformat()})
+            with job.conn.transaction():
+                alerts.raise_alert(
+                    job.conn, job.instance_id, kind="evidence_expiring", severity="medium",
+                    dedup_key=f"evidence_expiring:{row['id']}:{c['check']}"[:512],
+                    subject={"intake_id": str(row["id"]), "server_id": row["server_id"],
+                             "check": c["check"],
+                             "valid_until": c["evidence_valid_until"].isoformat()})
         attempt = intakes.next_attempt(job.conn, job.instance_id, row["id"])
         enqueue_job(ctx, "intake_run", f"{row['id']}/evidence",
                     intake_run_job_key(row["id"], attempt))

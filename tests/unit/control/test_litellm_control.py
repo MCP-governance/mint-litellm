@@ -71,7 +71,6 @@ def test_with_guard_returns_a_copy_with_the_same_connection(stub):
     ("method", "path"),
     [
         ("POST", "/v1/mcp/server"),  # 서버 등록
-        ("PUT", "/v1/mcp/server"),  # 서버 수정
         ("DELETE", "/v1/mcp/server/x"),  # 서버 삭제
         ("POST", "/v1/mcp/server/import"),
         ("POST", "/v1/mcp/server/register"),
@@ -145,3 +144,31 @@ def test_stage2_routes_extend_the_stage1_list_without_changing_it():
         "/mcp-rest/test/connection",
         "/mcp-rest/test/tools/list",
     }
+
+
+def test_server_update_is_limited_to_closing_allow_all_keys(stub):
+    c = client(stub)
+    for bad in (
+        {"server_id": "a", "allow_all_keys": True},
+        {"server_id": "a", "allow_all_keys": False, "url": "http://other"},
+        {"server_id": "a"},
+        {"allow_all_keys": False},
+        None,
+    ):
+        with pytest.raises(ControlError, match="allow_all_keys를 끄는"):
+            c._write("PUT", "/v1/mcp/server", bad)
+    assert stub.requests == []
+
+
+def test_close_all_keys_updates_then_reads_back_and_reports_the_result(stub):
+    stub.submissions = [submission("a", allow_all_keys=True, approval_status="active")]
+    calls = []
+    c = client(stub, guard=lambda: calls.append(1))
+    assert c.close_all_keys("a") is True
+    assert calls == [1]  # 쓰기 직전 경계
+    assert [(m, p) for m, p, _ in stub.requests] == [
+        ("PUT", "/v1/mcp/server"), ("GET", "/v1/mcp/server/a")]
+    assert stub.requests[0][2] == {"server_id": "a", "allow_all_keys": False}
+    stub.submissions[0]["allow_all_keys"] = True
+    stub.close_works = False  # 수정이 반영되지 않으면 읽어 확인한 결과가 거짓이다
+    assert c.close_all_keys("a") is False

@@ -8,10 +8,12 @@ import hashlib
 import ipaddress
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
+from mint_litellm.control.db.connection import fetchone
 from mint_litellm.control.litellm_admin import LiteLLMError
 from mint_litellm.control.litellm_control import ResponseTooLarge
 
@@ -34,7 +36,6 @@ MAX_TOOLS = 500
 MAX_DEPTH = 20
 DEFAULT_PORTS = (443, 8443)
 OAUTH_AUTH_TYPES = frozenset({"oauth2", "oauth2_token_exchange", "oauth2_id_jag", "oauth_delegate"})
-DATA_FILE = Path("policy") / "bundle" / "mint" / "data" / "data.json"
 
 
 def sha256_hex(data: bytes | str) -> str:
@@ -72,25 +73,55 @@ class PolicyData:
     sha256: str
 
 
-def load_policy_data(root: Any) -> PolicyData | None:
-    """``<root>/policy/bundle/mint/data/data.json``의 ``description_markers``와 ``risk``.
-
-    없거나 형식이 맞지 않으면 None이다(검사는 판별 불가가 된다).
-    """
-    if root is None:
-        return None
+def _policy_data(result: Any, sha256: str) -> PolicyData | None:
     try:
-        raw = (Path(root) / DATA_FILE).read_bytes()
-        data = json.loads(raw)
-        markers, risk = data["description_markers"], data["risk"]
+        markers, risk = result["description_markers"], result["risk"]
         if not (isinstance(markers, list) and markers and all(isinstance(m, str) and m
                                                               for m in markers)):
             return None
         if not all(k in risk for k in ("data", "action", "irreversible", "grades")):
             return None
-    except (OSError, ValueError, KeyError, TypeError):
+    except (KeyError, TypeError):
         return None
-    return PolicyData(tuple(markers), risk, sha256_hex(raw))
+    return PolicyData(tuple(markers), risk, sha256)
+
+
+class PolicyDataSource:
+    """활성 번들의 ``description_markers``·``risk``를 정책 엔진에서 읽는다(판본별 캐시).
+
+    활성 판본(DB)과 엔진이 돌려준 번들 메타(판본·해시)가 같을 때만 쓰고, 다르거나 읽지 못하면
+    None이다(해당 검사는 판별 불가). 같은 판본은 한 번만 읽는다.
+    """
+
+    def __init__(self, opa_url: str | None, timeout: float = 5.0) -> None:
+        self._url = None if not opa_url else opa_url.rstrip("/") + "/v1/data/mint/context"
+        self._timeout = timeout
+        self._cached: tuple[tuple[str, str], PolicyData] | None = None
+
+    def get(self, conn: Any, instance_id: str) -> PolicyData | None:
+        row = fetchone(
+            conn,
+            "SELECT id, bundle_sha256 FROM mint.policy_versions"
+            " WHERE instance_id = %s AND status = 'active'",
+            (instance_id,),
+        )
+        if row is None or self._url is None:
+            return None
+        version = (row["id"], row["bundle_sha256"])
+        if self._cached is not None and self._cached[0] == version:
+            return self._cached[1]
+        try:
+            response = httpx.get(self._url, timeout=self._timeout, follow_redirects=False,
+                                 trust_env=False)
+            response.raise_for_status()
+            result = response.json()["result"]
+            meta = (result["bundle"]["policy_version_id"], result["bundle"]["bundle_sha256"])
+        except (KeyError, TypeError, ValueError, httpx.HTTPError):
+            return None
+        data = _policy_data(result, version[1]) if meta == version else None
+        if data is not None:
+            self._cached = (version, data)
+        return data
 
 
 # --- 1. url_guard ---------------------------------------------------------------------

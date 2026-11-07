@@ -4,6 +4,7 @@
 LiteLLM 응답 고정 서버로 돌린다(MINT_TEST_DATABASE_URL이 없으면 건너뜀).
 """
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from mint_litellm.control import jobs  # noqa: E402
 from mint_litellm.control.db.connection import fetchall, fetchone  # noqa: E402
 from mint_litellm.control.db.roles import LOGIN_ROLES  # noqa: E402
 from mint_litellm.control.errors import AdminCode, AdminError, ControlError  # noqa: E402
+from mint_litellm.control.intake_checks import PolicyDataSource  # noqa: E402
 from mint_litellm.control.litellm_admin import LiteLLMAdmin  # noqa: E402
 from mint_litellm.control.litellm_control import LiteLLMControl  # noqa: E402
 from mint_litellm.control.services import base, settings  # noqa: E402
@@ -56,11 +58,14 @@ class World:
         self.conn = psycopg.connect(url, autocommit=True)
         self.client = LiteLLMControl(stub.url, CONTROL_KEY)
         self.admin_client = LiteLLMAdmin(stub.url, CONTROL_KEY)
-        self.worker: Worker = make_worker(litellm=self.client, policy_root=ROOT)
+        self.worker: Worker = make_worker(
+            litellm=self.client, policy_data=PolicyDataSource(stub.url)
+        )
         with psycopg.connect(url) as conn:
             ctx = make_ctx(conn)
             settings.initialize(ctx, "acme", "ACME")
             conn.commit()
+        self.activate_policy("v1", "ab" * 32)
         for name, user in (
             ("root", "root-user"),
             ("boss", "boss-1"),
@@ -86,6 +91,30 @@ class World:
             "auth_type": None,
             "url": None,
         }
+
+    def activate_policy(self, version: str, sha: str) -> None:
+        """활성 판본 행을 두고 정책 엔진 stub이 같은 판본의 번들 데이터를 돌려주게 한다."""
+        raw = json.loads((ROOT / "policy/bundle/mint/data/data.json").read_text(encoding="utf-8"))
+        self.stub.context = {
+            "bundle": {"policy_version_id": version, "bundle_sha256": sha},
+            "description_markers": raw["description_markers"],
+            "risk": raw["risk"],
+            "secret_markers": raw["secret_markers"],
+        }
+        self.conn.execute(
+            "UPDATE mint.policy_versions SET status = 'superseded' WHERE status = 'active'"
+        )
+        self.conn.execute(
+            "INSERT INTO mint.policy_versions (instance_id, id, catalog_sha256, bundle_sha256)"
+            " VALUES (%s, %s, %s, %s)",
+            (INSTANCE, version, "cd" * 32, sha),
+        )
+        for status in ("staged", "active"):
+            self.conn.execute(
+                "UPDATE mint.policy_versions SET status = %s, activated_at = now(),"
+                " activated_by = 'root' WHERE id = %s",
+                (status, version),
+            )
 
     def allow(self, kind: str, value: str) -> str:
         row = fetchone(
@@ -450,18 +479,57 @@ def test_credentials_required_then_registry_first_checks_again_with_the_stored_c
     assert world.stub.submissions[0]["allow_all_keys"] is False
 
 
-def test_registry_first_never_approves_a_submission_that_opens_all_keys(world):
+def registry_first_with_all_keys(world):
     world.stub.submissions = [submission("sub-1", auth_type="bearer_token", allow_all_keys=True)]
     poll(world)
     world.call(lambda ctx: svc.create(ctx, world.admin_client, "sub-1", **INPUTS))
     world.stub.connection = CRED
+    world.stub.tools = (200, {"status": "error", "message": "it returned HTTP 401."})
     world.drain()
     intake_id = str(fetchone(world.conn, "SELECT id FROM mint.intakes")["id"])
+    world.stub.connection = (200, {"status": "ok"})
+    world.stub.tools = (200, {"tools": [TOOL], "message": "ok"})
     world.call(lambda ctx: svc.recheck(ctx, intake_id, registry_first=True))
     world.drain()
-    assert world.stub.writes() == []
-    last = [c for c in world.checks(intake_id, 2) if c["check"] == "connection"][0]
-    assert (last["result"], last["reason_code"]) == ("indeterminate", "ALL_KEYS_OPEN")
+    return intake_id
+
+
+def test_registry_first_closes_allow_all_keys_right_after_the_approval_and_reads_it_back(world):
+    intake_id = registry_first_with_all_keys(world)
+    assert world.stub.writes() == [
+        ("PUT", "/v1/mcp/server/sub-1/approve"),
+        ("PUT", "/v1/mcp/server"),
+    ]
+    order = [
+        (m, p)
+        for m, p, _ in world.stub.requests
+        if p.startswith("/v1/mcp/server/sub-1") or p == "/v1/mcp/server"
+    ]
+    assert order.index(("PUT", "/v1/mcp/server")) < order.index(("GET", "/v1/mcp/server/sub-1"))
+    update = [b for m, p, b in world.stub.requests if (m, p) == ("PUT", "/v1/mcp/server")][0]
+    assert update == {"server_id": "sub-1", "allow_all_keys": False}
+    assert world.stub.submissions[0]["allow_all_keys"] is False
+    assert world.intake(intake_id)["status"] == "passed"
+    assert fetchall(world.conn, "SELECT * FROM mint.alerts") == []
+
+
+def test_when_allow_all_keys_cannot_be_closed_the_intake_stops_and_an_alert_opens(world):
+    world.stub.close_works = False
+    intake_id = registry_first_with_all_keys(world)
+    rows = world.checks(intake_id, 2)
+    assert [(c["check"], c["result"], c["reason_code"]) for c in rows] == [
+        ("url_guard", "pass", None),
+        ("oauth_issuer_allowlist", "pass", None),
+        ("connection", "indeterminate", "ALL_KEYS_NOT_CLOSED"),
+    ]  # 뒤 검사는 진행하지 않는다
+    assert world.intake(intake_id)["status"] == "indeterminate"
+    [alert] = fetchall(world.conn, "SELECT * FROM mint.alerts")
+    assert (alert["kind"], alert["severity"], alert["subject"]["server_id"]) == (
+        "sync_divergence",
+        "high",
+        "sub-1",
+    )
+    assert [e["payload"]["kind"] for e in world.events("alert_opened")] == ["sync_divergence"]
 
 
 def test_recheck_is_refused_for_non_submissions_and_the_wrong_state(world):
@@ -811,7 +879,7 @@ def test_the_litellm_write_waits_while_the_database_looks_restored_and_runs_afte
         INSTANCE,
         SETTINGS,
         litellm=world.client,
-        policy_root=ROOT,
+        policy_data=PolicyDataSource(world.stub.url),
         restore_check=lambda conn, inst: state["restored"],
     )
     worker.open()
@@ -903,3 +971,81 @@ def test_list_and_show(world):
     with pytest.raises(AdminError) as raised:
         world.call(lambda ctx: svc.show(ctx, "00000000-0000-0000-0000-000000000000"))
     assert raised.value.code == AdminCode.NOT_FOUND
+
+
+# --- 승인 유효 기간 기본값 -----------------------------------------------------------------------
+
+
+def approval_days(world) -> float:
+    row = fetchone(
+        world.conn, "SELECT extract(epoch FROM valid_until - valid_from) AS s FROM mint.approvals"
+    )
+    return row["s"] / 86400
+
+
+def test_the_default_validity_is_90_days_and_30_with_a_high_risk_tool(world):
+    intake_id = passed(world)
+    world.decide(intake_id, "approve")  # --valid-until 없이
+    assert round(approval_days(world)) == 90
+
+
+def test_a_high_risk_tool_shortens_the_default_to_30_days(world):
+    drop = {**TOOL, "name": "drop", "annotations": {"destructiveHint": True}}
+    world.stub.tools = (200, {"tools": [TOOL, drop], "message": "ok"})
+    intake_id = passed(world)
+    world.decide(intake_id, "approve")
+    assert round(approval_days(world)) == 30
+
+
+def test_an_exception_defaults_to_30_days_and_an_explicit_value_still_caps_at_90(world):
+    from mint_litellm.control.context import Operator
+
+    intake_id = passed(world, readiness={**READINESS, "audit_access_days": 0})
+    second = Operator("boss2", "approver", "boss-2")
+    world.decide(intake_id, "except", reason="일시 허용", second=second)
+    assert round(approval_days(world)) == 30
+
+
+def test_an_explicit_valid_until_overrides_the_default(world):
+    intake_id = passed(world)
+    world.decide(intake_id, "approve", valid_until=datetime.now(UTC) + timedelta(days=7))
+    assert round(approval_days(world)) == 7
+
+
+# --- 정책 엔진에서 읽는 번들 데이터 ---------------------------------------------------------------
+
+
+def test_bundle_data_is_read_from_the_policy_engine_once_per_active_version(world):
+    source = PolicyDataSource(world.stub.url)
+    first = source.get(world.conn, INSTANCE)
+    assert first is not None and "ignore previous instructions" in first.markers
+    assert first.sha256 == "ab" * 32
+    reads = lambda: [r for r in world.stub.requests if r[1] == "/v1/data/mint/context"]  # noqa: E731
+    assert len(reads()) == 1
+    assert source.get(world.conn, INSTANCE) is first and len(reads()) == 1  # 같은 판본은 캐시
+    world.activate_policy("v2", "ef" * 32)
+    second = source.get(world.conn, INSTANCE)
+    assert second is not None and second.sha256 == "ef" * 32 and len(reads()) == 2
+
+
+def test_bundle_data_is_unavailable_when_the_engine_disagrees_or_is_down(world):
+    assert PolicyDataSource(None).get(world.conn, INSTANCE) is None
+    assert PolicyDataSource("http://localhost:9").get(world.conn, INSTANCE) is None
+    world.stub.context["bundle"]["bundle_sha256"] = "00" * 32  # 활성 판본과 다른 번들
+    assert PolicyDataSource(world.stub.url).get(world.conn, INSTANCE) is None
+    world.stub.context = None
+    assert PolicyDataSource(world.stub.url).get(world.conn, INSTANCE) is None
+    world.conn.execute("DELETE FROM mint.policy_versions")  # 활성 판본이 없다
+    assert PolicyDataSource(world.stub.url).get(world.conn, INSTANCE) is None
+
+
+def test_without_bundle_data_the_scan_and_the_grade_are_indeterminate(world):
+    world.stub.context = None
+    intake_id = passed(world)
+    row = world.intake(intake_id)
+    assert row["status"] == "indeterminate"
+    reasons = {c["check"]: c["reason_code"] for c in world.checks(intake_id) if c["reason_code"]}
+    assert reasons == {
+        "description_scan": "POLICY_DATA_UNAVAILABLE",
+        "risk_grade": "POLICY_DATA_UNAVAILABLE",
+    }

@@ -4,6 +4,7 @@
 ``Stage2Settings.from_env``를 부르고 실패하면 기동을 멈춘다.
 """
 
+import ipaddress
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +66,24 @@ def _ports(raw: str | None) -> tuple[int, ...]:
             f"MINT_INTAKE_ALLOWED_PORTS는 쉼표로 구분한 포트 목록이어야 합니다: {raw!r}"
         )
     return ports
+def _refuse_internal_host(url: str, host: str) -> None:
+    """리터럴 사설·루프백·링크로컬 주소와 localhost를 거부한다(이름 해석 결과는 보지 않는다)."""
+    lowered = host.lower()
+    if lowered == "localhost" or lowered.endswith(".localhost"):
+        raise ControlError(f"MINT_WEBHOOK_URLS에 localhost를 쓸 수 없습니다: {url}")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return
+    if (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_unspecified
+        or address.is_reserved
+    ):
+        raise ControlError(f"MINT_WEBHOOK_URLS에 내부 주소를 쓸 수 없습니다: {url}")
 
 
 def _webhook_urls(raw: str | None) -> tuple[str, ...]:
@@ -75,6 +94,7 @@ def _webhook_urls(raw: str | None) -> tuple[str, ...]:
         parts = urlsplit(url)
         if parts.scheme != "https" or not parts.hostname:
             raise ControlError(f"MINT_WEBHOOK_URLS는 https 주소만 받습니다: {url}")
+        _refuse_internal_host(url, parts.hostname)
     return urls
 
 
@@ -96,6 +116,7 @@ class Stage2Settings:
     session_verify_seconds: int = 300
     staff_consent_max_days: int = 90
     intake_allowed_ports: tuple[int, ...] = (443, 8443)
+    console_url: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Stage2Settings":
@@ -121,6 +142,7 @@ class Stage2Settings:
             session_verify_seconds=_seconds(env, "MINT_SESSION_VERIFY_SECONDS", 300),
             staff_consent_max_days=_days(env, "MINT_STAFF_CONSENT_MAX_DAYS", 90),
             intake_allowed_ports=_ports(env.get("MINT_INTAKE_ALLOWED_PORTS")),
+            console_url=(env.get("MINT_CONSOLE_URL") or "").strip() or None,
         )
         if settings.session_idle_seconds > settings.session_absolute_seconds:
             raise ControlError(

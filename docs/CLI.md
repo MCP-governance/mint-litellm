@@ -47,6 +47,17 @@
 | `mint-litellm settings observable` | `admin` | 관측 모드로 전환할 수 있는 사유 계열과 정책을 정한다. | - | `settings_changed` |
 | `mint-litellm policy activate` | `admin` | 정책 번들을 검증하고 정책 엔진에 적재한 뒤 활성 판본으로 전환한다. | - | `policy_activated` |
 | `mint-litellm ledger list` | 모든 역할 | 원장 사건을 종류·기간·호출 식별자로 조회한다. | - | - |
+| `mint-litellm alert list` | 모든 역할 | 경보를 상태(`--status`)별로 조회한다. | - | - |
+| `mint-litellm alert ack` | `admin` | 열린 경보(`alert_id`)를 확인 처리한다. 확인한 운영자 이름이 남는다. | - | `alert_acknowledged` |
+| `mint-litellm alert resolve` | `admin` | 경보(`alert_id`)를 해결됨으로 닫는다. 같은 원인이 다시 생기면 새 경보가 열린다. | - | `alert_resolved` |
+| `mint-litellm intake list` | 모든 역할 | 수용검증 신청을 상태(`--status`)별로 조회한다. | - | - |
+| `mint-litellm intake show` | 모든 역할 | 신청 한 건과 검사 결과, 도구 계약 후보를 보인다. | - | - |
+| `mint-litellm intake create` | `admin` | 서버의 수용검증 신청을 만든다(아래 「수용검증 신청」). | `/v1/mcp/server/{server_id}` | `intake_received` |
+| `mint-litellm intake recheck` | `admin` | 검사를 다시 한다. | - | - |
+| `mint-litellm intake assign` | `admin` | 신청자가 비어 있는 제출 신청에 사람 사용자를 신청자로 지정한다. | `/user/info` | `intake_requester_assigned` |
+| `mint-litellm intake approve` | `admin`, `approver` | 모든 검사를 통과한 신청을 승인한다. | - | `intake_decided`, `contract_approved` |
+| `mint-litellm intake reject` | `admin`, `approver` | 신청을 거절한다. | - | `intake_decided` |
+| `mint-litellm intake except` | `admin`, `approver` | 판별 불가가 있는 신청을 예외 승인한다. | - | `intake_decided`, `contract_approved` |
 
 ## 정책 활성화 실패와 복원
 
@@ -78,12 +89,12 @@
 - `mint-litellm intake list [--status <상태>]`, `mint-litellm intake show <신청>`: 신청, 검사 결과(검사마다 최근 시도), 도구 계약 후보를 본다.
 - `mint-litellm intake create <server_id> --purpose … --data-grade … --allowed-resources <JSON> --provider … --owner … --credential-notice … --revocation-record … --audit-access-days … --data-return-terms …`: 신청을 만든다. 같은 서버에 LiteLLM 제출에서 온 `received` 신청이 있으면 그 신청의 필수 입력을 채운다. 필수 입력이 모두 있고 신청자가 있어야 검사가 시작된다.
 - `mint-litellm intake assign <신청> --requester <사용자>`: 제출의 `submitted_by`가 비어 있을 때(서비스 계정 제출) 사람 사용자를 신청자로 지정한다. 지정한 운영자는 그 신청을 결정할 수 없다.
-- `mint-litellm intake recheck <신청> [--registry-first]`: 검사를 다시 한다. `--registry-first`는 연결 검사가 `CREDENTIALS_REQUIRED`로 판별 불가였던 제출 서버를 LiteLLM 레지스트리에 올리고(`allow_all_keys`가 켜진 제출은 올리지 않는다) 저장된 자격으로 연결·정의 검사를 다시 한다. 키·팀 권한은 주지 않는다.
-- `mint-litellm intake approve <신청> --valid-until <시각> [--scope key|user|team --scope-id <식별자> --team <팀>]`: 모든 검사가 통과한 신청을 승인한다. 신청자와 같은 사용자는 승인할 수 없고, 연결·정의 증거는 24시간 안이어야 한다(아니면 `MINT-ADMIN-STALE-EVIDENCE`, 재검사). 승인은 도구 계약 후보와 배포 계약 후보를 승인하고 서버 행에 계약 값을 복사하고(`contract_status=managed`) 이용 관계와 `pending` 승인을 만들며 동기화 작업을 등록한다. 승인 범위의 기본은 책임자 사용자이다.
-- `mint-litellm intake except <신청> --reason … --valid-until … --second-approver …`: 판별 불가가 있는 신청의 예외 승인. 사유와 두 번째 승인자가 필요하고 유효 기간은 90일을 넘을 수 없다.
+- `mint-litellm intake recheck <신청> [--registry-first]`: 검사를 다시 한다. `--registry-first`는 연결 검사가 `CREDENTIALS_REQUIRED`로 판별 불가였던 제출 서버를 LiteLLM 레지스트리에 올리고(승인은 제출의 `allow_all_keys`를 그대로 두므로, 켜진 제출은 승인 직후 같은 작업에서 `allow_all_keys=false`로 고치고 다시 읽어 확인한다. 끄지 못하면 신청은 더 진행하지 않고 경보 `sync_divergence`가 열린다) 저장된 자격으로 연결·정의 검사를 다시 한다. 키·팀 권한은 주지 않는다.
+- `mint-litellm intake approve <신청> [--valid-until <시각>] [--scope key|user|team --scope-id <식별자> --team <팀>]`: 모든 검사가 통과한 신청을 승인한다. 신청자와 같은 사용자는 승인할 수 없고, 연결·정의 증거는 24시간 안이어야 한다(아니면 `MINT-ADMIN-STALE-EVIDENCE`, 재검사). 승인은 도구 계약 후보와 배포 계약 후보를 승인하고 서버 행에 계약 값을 복사하고(`contract_status=managed`) 이용 관계와 `pending` 승인을 만들며 동기화 작업을 등록한다. 승인 범위의 기본은 책임자 사용자이고, 유효 기간의 기본은 90일(high·critical 도구가 있으면 30일)이다.
+- `mint-litellm intake except <신청> --reason … --second-approver … [--valid-until …]`: 판별 불가가 있는 신청의 예외 승인. 사유와 두 번째 승인자가 필요하고 유효 기간의 기본은 30일, 상한은 90일이다.
 - `mint-litellm intake reject <신청> --reason …`: 거절한다. 제출에서 온 신청은 LiteLLM 제출도 거절된다.
 
-검사가 하나라도 실패하면 신청은 자동으로 거절된다. `MINT_INTAKE_ALLOWED_PORTS`(기본 `443,8443`)는 URL 검사가 허용하는 포트이다. 정책 번들 데이터(`description_markers`, `risk`)는 `MINT_POLICY_ROOT`(기본 `/opt/mint`) 아래 `policy/bundle/mint/data/data.json`에서 읽으며, 읽을 수 없으면 해당 검사는 판별 불가이다.
+검사가 하나라도 실패하면 신청은 자동으로 거절된다. `MINT_INTAKE_ALLOWED_PORTS`(기본 `443,8443`)는 URL 검사가 허용하는 포트이다. 정책 번들 데이터(`description_markers`, `risk`)는 작업 실행기가 `MINT_OPA_URL`의 정책 엔진에서 활성 번들로 읽고(판본별 캐시, 엔진이 돌려준 판본·해시가 활성 판본과 다르거나 읽을 수 없으면) 해당 검사는 판별 불가이다. 제어 평면 키의 `allowed_routes`에는 서버 수정 경로가 `/v1/mcp/server` 접두로 이미 들어 있다.
 
 ## 서버를 LiteLLM에서 삭제하는 순서
 
@@ -98,6 +109,7 @@
 | `MINT_OPERATOR_TOKEN` | 운영자 토큰. `--token-file <파일>`로 대신할 수 있다. | 인증이 필요한 명령에서 필수 |
 | `MINT_LITELLM_URL` | LiteLLM 관리 API 주소 | `server register`·`operator add`·`approve`·`consent add`·`check`·`status`에서 필요 |
 | `MINT_LITELLM_KEY` | 제어 평면 LiteLLM 키(`proxy_admin`, `allowed_routes` 7개로 제한) | 위와 같음 |
+| `MINT_CONSOLE_URL` | 경보 본문의 `console_url`에 넣을 콘솔 주소(선택). 없으면 `null`이다. | 없음 |
 | `MINT_LITELLM_CONFIG` | `check`·`status`가 읽는 LiteLLM `config.yaml` 경로. `--config`로 대신할 수 있다. | 없음 |
 | `MINT_MODE` | 모드 상한. `enforce`이면 `settings mode observe`가 거부된다. | `enforce` |
 | `MINT_REPLICAS` | `check`가 공유 캐시 설정을 판단할 때 쓰는 복제본 수 | `1` |
@@ -121,6 +133,9 @@
 | `--business-hours-only` | `business_hours_only` | 업무 시간 밖의 호출을 차단한다. 업무 시간은 정책 번들의 값이다. |
 | `--business-hours 시간대,요일,시작,끝` | `business_hours` | 이 승인의 업무 시간을 재정의한다(예: `Asia/Seoul,1-5,09:00,18:00`, 요일은 1=월 ~ 7=일). `--business-hours-only`와 함께 쓴다. |
 | `--require-consent 목적` | `require_consent` | 그 목적의 동의가 있어야 호출을 허용한다. |
+| `--allowed-host 호스트` (반복) | `allowed_hosts` | 인자의 URL이 향할 수 있는 호스트(하위 도메인 포함). 계약 관리 서버에만 적용한다. |
+| `--allowed-path 경로` (반복) | `allowed_paths` | 인자의 절대 경로가 있어야 하는 폴더. 계약 관리 서버에만 적용한다. |
+| `--allowed-arg-key 이름` (반복) | `allowed_arg_keys` | 호출이 쓸 수 있는 인자 이름. 이 밖의 이름이 있으면 차단한다. 계약 관리 서버에만 적용한다. |
 
 승인 범위(`--scope key|user|team`)의 대상은 LiteLLM에서 읽어 확인한다. 대상이 없거나, `object_permission.mcp_servers`에 서버 식별자가 아닌 항목(별칭·이름)이 있거나, 대상에 해당 서버의 권한(직접 부여 또는 서버가 속한 접근 그룹)이 없으면 승인은 만들어지지 않는다. 이용 관계에 팀이 있으면 `team` 범위는 그 팀, `key` 범위는 팀이 같은 키, `user` 범위는 그 팀에 속한 사용자여야 한다. 팀이 없는 관계에서는 `team` 범위가 그 조직에 묶인 팀이어야 하고, `key`·`user` 범위는 조직 유도 결과(팀 바인딩, 사용자 바인딩, 기본 조직 순)가 관계의 조직과 같아야 한다. `--scope org` 승인은 지원하지 않으므로 조직에 묶인 팀을 `team` 범위로 승인한다.
 
@@ -177,6 +192,23 @@
 - `--args-fp <지문>`: 차단 사건에 기록된 지문(소문자 16진 64자)을 그대로 넣는다.
 
 키가 없으면 인자 원문으로는 요청할 수 없고, 지문 키가 설정되어 있지 않으면 플러그인에서 호출별 승인은 항상 요구 상태로 남는다.
+
+## 경보와 웹훅
+
+경보는 종류와 대상으로 묶인다. 같은 묶음의 미해결 경보가 있으면 새로 만들지 않고 `count`와 `last_at`만 올린다. `job_failed`는 작업이 최대 시도 횟수를 넘겨 실패할 때, 같은 종류·대상의 작업이 이후 성공하면 해결된다. `approval_expiring`은 7일 안에 만료될 대기·확정 건마다 한 번 열리며, 운영자가 닫은 뒤에는 다시 열리지 않는다.
+
+경보가 열리면 `alert_opened`(순번 0), 확인되면 `alert_acknowledged`(순번 1), 해결되면 `alert_resolved`(순번 2) 사건을 같은 트랜잭션에 남긴다.
+
+`MINT_WEBHOOK_URLS`를 설정하면 새로 열린 경보마다 주소별로 전송 작업이 하나 생긴다. 주소는 `https`만 받고, 호스트는 이 목록의 호스트로 한정한다. 전송은 총 3회 시도하며 요청마다 5초 제한을 둔다. 3번 모두 실패하면 전송 행을 `failed`로 두고 작업은 완료로 끝난다. 응답 본문은 저장하지 않는다.
+
+서명 형식(수신 쪽이 검증하는 방법):
+
+- 요청 헤더 `X-MINT-Signature`는 `t=<유닉스 초>,v1=<서명>`이다.
+- 서명은 `HMAC-SHA256(키, "<t>.<본문>")`의 16진수 소문자 64자이며, `<본문>`은 요청 본문의 바이트 그대로다. 키는 `MINT_WEBHOOK_HMAC_KEY`다.
+- 헤더 `X-MINT-Delivery`는 전송 식별자이며 수신 쪽이 중복을 거를 때 쓴다. 재시도는 같은 식별자로 새 서명을 붙여 보낸다.
+- 수신 쪽은 `t`와 현재 시각의 차이가 5분을 넘으면 거부하고, 서명을 상수 시간 비교로 확인한다. 구현 예시는 `mint_litellm.control.webhook.verify`다.
+
+본문 `console_url`은 `MINT_CONSOLE_URL`(선택)을 그대로 쓰며, 설정이 없으면 `null`이다.
 
 ## 원장 조회
 

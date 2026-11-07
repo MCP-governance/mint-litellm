@@ -239,7 +239,9 @@ def test_definitions_failures_and_credentials():
 
 
 def data():
-    loaded = c.load_policy_data(ROOT)
+    """저장소의 번들 데이터 파일로 만든 시험용 번들 데이터(엔진이 돌려줄 값과 같은 모양)."""
+    raw = json.loads((ROOT / "policy/bundle/mint/data/data.json").read_text(encoding="utf-8"))
+    loaded = c._policy_data(raw, "0" * 64)
     assert loaded is not None
     return loaded
 
@@ -344,15 +346,17 @@ def test_supply_chain_applies_only_to_self_deployed_servers():
     assert c.supply_chain(None, "abc123").result == "indeterminate"
 
 
-def test_policy_data_unavailable_or_malformed_returns_none(tmp_path):
-    assert c.load_policy_data(None) is None
-    assert c.load_policy_data(tmp_path) is None
-    target = tmp_path / c.DATA_FILE
-    target.parent.mkdir(parents=True)
-    target.write_text(json.dumps({"description_markers": [], "risk": {}}), encoding="utf-8")
-    assert c.load_policy_data(tmp_path) is None
-    target.write_text("not json", encoding="utf-8")
-    assert c.load_policy_data(tmp_path) is None
+def test_malformed_policy_data_is_refused():
+    good = json.loads((ROOT / "policy/bundle/mint/data/data.json").read_text(encoding="utf-8"))
+    assert c._policy_data(good, "0" * 64) is not None
+    for bad in (
+        {},
+        {**good, "description_markers": []},
+        {**good, "description_markers": [1]},
+        {**good, "risk": {}},
+        {**good, "risk": None},
+    ):
+        assert c._policy_data(bad, "0" * 64) is None
 
 
 def test_evidence_validity_days():
