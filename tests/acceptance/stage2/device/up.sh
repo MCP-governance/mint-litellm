@@ -28,9 +28,11 @@ mkdir -p config
 cp "$HERE/litellm.config.yaml" config/litellm.config.yaml
 cp "$HERE/litellm.plain.yaml" config/litellm.plain.yaml
 # 내보내기 볼륨은 호스트 디렉터리에 바인드한다(어댑터가 파일을 직접 읽고 쓴다). 컨테이너 사용자가 쓰도록 777.
-mkdir -p "$STATE/export" && chmod 777 "$STATE/export"
+mkdir -p "$STATE/export" "$STATE/dumps" && chmod 777 "$STATE/export" "$STATE/dumps"
+export ACC_DUMP_DIR="$STATE/dumps"
 docker volume inspect "${COMPOSE_PROJECT_NAME}_export" >/dev/null 2>&1 ||   docker volume create --driver local --opt type=none --opt o=bind --opt "device=$STATE/export" "${COMPOSE_PROJECT_NAME}_export" >/dev/null
 ./mint.sh up
+"${C[@]}" up -d --wait postgres
 "${C[@]}" up -d cnt fixture
 set -a; . ./.env; set +a
 "${C[@]}" exec -T postgres psql -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='litellm_plain'" | grep -q 1 \

@@ -8,9 +8,12 @@ x-acc-env: &acc-env
   MINT_SESSION_VERIFY_SECONDS: "300"
 
 services:
+  # 어댑터가 /tmp에 두는 기준 덤프가 컨테이너 재생성에 사라지지 않도록 호스트 디렉터리에 둔다.
   postgres:
     ports:
       - "127.0.0.1:4332:5432"
+    volumes:
+      - ${ACC_DUMP_DIR:-/tmp/acc-dumps}:/tmp
   litellm:
     environment:
       <<: *acc-env
