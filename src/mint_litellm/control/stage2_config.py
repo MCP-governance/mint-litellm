@@ -114,6 +114,12 @@ class Stage2Settings:
     session_idle_seconds: int = 1800
     session_absolute_seconds: int = 28800
     session_verify_seconds: int = 300
+
+    @property
+    def session_verify_window_seconds(self) -> int:
+        """마지막 성공 확인 뒤 요청을 받아 주는 시간(확인 주기 두 번). 넘으면 요청마다 거부한다."""
+        return 2 * self.session_verify_seconds
+
     staff_consent_max_days: int = 90
     intake_allowed_ports: tuple[int, ...] = (443, 8443)
     console_url: str | None = None

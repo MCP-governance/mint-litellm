@@ -26,3 +26,33 @@ LANGUAGE sql STABLE SET TimeZone = 'UTC' AS $$ SELECT to_jsonb(r) $$;
 -- 판정(플러그인 포함)이 복원 진행 중 여부를 읽는다: 복원이 진행 중일 때 파일이 없는 것은 첫 설치가
 -- 아니다.
 GRANT SELECT ON mint.restore_requests TO mint_plugin;
+
+-- 직원 쓰기는 세션의 마지막 성공 확인이 확인 기한(콘솔이 설정, 기본 10분) 안일 때만 한다.
+-- 작업 실행기가 멈춰도 만료가 집행된다.
+CREATE OR REPLACE FUNCTION mint.staff_active_session() RETURNS mint.console_sessions
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, mint, pg_temp AS $$
+DECLARE
+    s mint.console_sessions;
+    sid text := nullif(current_setting('mint.staff_session_id_hash', true), '');
+    window_seconds integer := coalesce(
+        nullif(current_setting('mint.staff_verify_window_seconds', true), '')::integer, 600);
+BEGIN
+    IF sid IS NULL THEN
+        RAISE EXCEPTION 'staff session is not set' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    SELECT * INTO s FROM mint.console_sessions
+    WHERE id_hash = sid AND instance_id = mint.staff_instance() AND user_id = mint.staff_user()
+      AND subject = 'staff' AND role = 'staff' AND revoked_at IS NULL
+      AND idle_expiry > clock_timestamp() AND absolute_expiry > clock_timestamp()
+      AND last_verified_at > clock_timestamp() - make_interval(secs => window_seconds)
+    FOR SHARE;
+    IF NOT FOUND OR s.idle_expiry <= clock_timestamp()
+       OR s.absolute_expiry <= clock_timestamp() THEN
+        RAISE EXCEPTION 'no active staff session' USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN s;
+END $$;
+
+-- 행 내용 대조 함수는 판정을 하는 역할만 실행한다(직원 로그인은 공개 직원 함수만 실행한다).
+REVOKE ALL ON FUNCTION mint.row_json(anyelement) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION mint.row_json(anyelement) TO mint_plugin, mint_control, mint_worker;

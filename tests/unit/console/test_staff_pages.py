@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
-from console_fixtures import CONTROL_KEY, token_of
+from console_fixtures import CONTROL_KEY, key_info, token_of
 from ctl_fixtures import INSTANCE, as_login
 
 from mint_litellm.console.core import COOKIE, STAFF_COOKIE
@@ -197,6 +197,22 @@ def test_session_verification_refreshes_the_teams_of_a_staff_session(sworld):
     sworld.stub.control(CONSOLE, STAFFER, team_id="team-new")
     run_verify(sworld)
     assert sworld.query("SELECT team_ids FROM mint.console_sessions") == [(["team-new"],)]
+
+
+def test_every_verification_replaces_the_team_list_including_removal_and_a_new_owner_ends_it(
+    sworld
+):
+    client = logged_in(sworld)
+    for team, expected in (("team-a", ["team-a"]), ("team-b", ["team-b"]), (None, [])):
+        sworld.stub.control(CONSOLE, STAFFER, **({"team_id": team} if team else {}))
+        run_verify(sworld)
+        assert sworld.query("SELECT team_ids FROM mint.console_sessions") == [(expected,)]
+    body = key_info("someone-else")
+    body["key"] = token_of(CONSOLE)
+    sworld.stub.routes[("/key/info", CONTROL_KEY, token_of(CONSOLE))] = (200, body)
+    run_verify(sworld)  # 키 소유자가 바뀌면 세션을 폐기한다
+    assert sworld.query("SELECT revoked_at IS NOT NULL FROM mint.console_sessions") == [(True,)]
+    assert client.get("/staff").status_code == 303
 
 
 def test_session_verification_revokes_a_staff_session_of_a_blocked_key(sworld):

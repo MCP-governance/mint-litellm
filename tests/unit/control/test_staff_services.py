@@ -559,3 +559,22 @@ def test_a_staff_write_that_waits_on_a_state_change_is_refused_after_it_commits(
         admin.commit()
     worker.join(10)
     assert isinstance(result["error"], psycopg.errors.InsufficientPrivilege)
+
+
+def test_a_staff_session_not_verified_within_the_window_cannot_write_or_be_found(world):
+    url = world[0]
+    cid = add_confirmation(url)
+    login(world)
+    with psycopg.connect(url) as admin:
+        admin.execute("UPDATE mint.console_sessions SET last_verified_at ="
+                      " now() - interval '11 minutes'")
+    assert staff.find_session(world[2], INSTANCE, SESSION) is None
+    with pytest.raises(AdminError) as raised:
+        staff.confirm(sctx(world), SESSION, cid)
+    assert raised.value.code == AdminCode.FORBIDDEN
+    assert row(url, "SELECT status FROM mint.self_confirmations")["status"] == "pending"
+    # 확인 기한을 넉넉히 준 맥락에서는 같은 세션이 통과하고, DB 함수도 같은 기한을 쓴다
+    wide = staff.StaffContext(world[1], world[2], INSTANCE, USER, consent_max_days=90,
+                              verify_window_seconds=3600)
+    staff.confirm(wide, SESSION, cid)
+    assert row(url, "SELECT status FROM mint.self_confirmations")["status"] == "confirmed"
