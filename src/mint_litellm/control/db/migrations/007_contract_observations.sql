@@ -21,7 +21,4 @@ CREATE TABLE mint.contract_observation_receipts (
 GRANT SELECT, INSERT, UPDATE ON mint.contract_observations TO mint_control;
 GRANT SELECT, INSERT ON mint.contract_observation_receipts TO mint_control;
 GRANT SELECT (version) ON mint.tool_contracts TO mint_plugin;
-GRANT UPDATE (observed_sha256, observed_at) ON mint.tool_contracts TO mint_control;
 GRANT INSERT ON mint.alerts, mint.litellm_grants TO mint_control;
-GRANT UPDATE (applied_sha256, observed, observed_at, last_applied_at)
-    ON mint.litellm_grants TO mint_control;
