@@ -48,9 +48,10 @@ class LiteLLMUnreachable(LiteLLMError):
 class LiteLLMHttpError(LiteLLMError):
     """LiteLLM이 2xx가 아닌 상태로 응답했다."""
 
-    def __init__(self, message: str, status: int) -> None:
+    def __init__(self, message: str, status: int, body: Any = None) -> None:
         super().__init__(message)
         self.status = status
+        self.body = body  # 응답 본문(사유 판별용, 자격 열은 이미 지워진 값)
         self.code = f"litellm_http_{status}"
 
 
@@ -79,6 +80,14 @@ def check_write(method: str, path: str, body: Any) -> None:
             raise WriteRefused(
                 "PUT /v1/mcp/server 본문은 {server_id, allow_all_keys: false}만 보낼 수 있습니다."
             )
+        return
+    if path.endswith("/reject"):
+        if body is not None and (
+            not isinstance(body, dict)
+            or set(body) != {"review_notes"}
+            or not isinstance(body["review_notes"], str)
+        ):
+            raise WriteRefused("거절 본문은 {review_notes: 문자열}만 보낼 수 있습니다.")
         return
     id_field = _ID_FIELD.get(path)
     if id_field is None:
@@ -167,7 +176,7 @@ class LiteLLMSync(LiteLLMAdmin):
         if status in (401, 403):
             raise LiteLLMForbidden(f"LiteLLM이 {path} 쓰기를 거부했습니다(HTTP {status}).", status)
         raise LiteLLMHttpError(
-            f"LiteLLM {path} 쓰기 응답이 올바르지 않습니다(HTTP {status}).", status
+            f"LiteLLM {path} 쓰기 응답이 올바르지 않습니다(HTTP {status}).", status, parsed
         )
 
     # --- 키·팀 권한 ------------------------------------------------------------
@@ -215,3 +224,10 @@ class LiteLLMSync(LiteLLMAdmin):
     def approve_server(self, server_id: str) -> dict | None:
         quoted = urllib.parse.quote(server_id, safe="")
         return self._write("PUT", f"/v1/mcp/server/{quoted}/approve")
+
+    def reject_server(self, server_id: str, notes: str) -> dict | None:
+        """제출을 거절한다. 본문은 검토 메모(500자까지)뿐이다."""
+        quoted = urllib.parse.quote(server_id, safe="")
+        return self._write(
+            "PUT", f"/v1/mcp/server/{quoted}/reject", {"review_notes": notes[:500]}
+        )

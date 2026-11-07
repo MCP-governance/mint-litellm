@@ -94,6 +94,8 @@ class JobContext:
     lost: threading.Event = field(default_factory=threading.Event)
     # 관리 API 클라이언트(쓰기 가능). 설정이 없으면 None이다.
     litellm: Any = None
+    # 활성 번들 데이터 조회(``PolicyDataSource``). 없으면 번들 데이터가 필요한 검사는 판별 불가
+    policy_data: Any = None
     # 되돌림 판정의 현재 값(작업 실행기가 채운다). 외부 쓰기 경계가 읽는다.
     verdict: Callable[[], Any] = lambda: None
 
@@ -113,6 +115,19 @@ class JobContext:
             return
         if verdict.blocked or (verdict.held and self.job["kind"] in EVIDENCE_KINDS):
             raise RestoreBlocked(verdict.cause)
+
+
+def guard_external_write(ctx: "JobContext") -> None:
+    """LiteLLM 쓰기 직전에 부르는 경계. 임대를 잃었거나 종료 중이거나 되돌림 상태면 쓰지 않는다.
+
+    임시 구현이다. 공용 경계(임대 유효성과 되돌림 상태 확인)는 되돌림 보호 단계가 만들고
+    그때 이 함수를 대신한다. LiteLLM 쓰기는 클라이언트의 쓰기 메서드 한 곳만 이 함수를 부른다.
+    """
+    ctx.checkpoint()
+    if ctx.lost.is_set():
+        raise Cancelled
+    if ctx.restore_check is not None and ctx.restore_check(ctx.conn, ctx.instance_id):
+        raise RestoreBlocked
 
 
 def _approval_expiry_scan(job: JobContext) -> None:
@@ -210,6 +225,7 @@ SCHEDULES: dict[str, Callable[[Any], int]] = {
     "sync_reconcile": lambda s: s.reconcile_seconds,
     "export_checkpoint": lambda s: s.checkpoint_seconds,
     "session_verify": lambda s: s.session_verify_seconds,
+    "evidence_expiry_scan": lambda s: 3600,  # 1시간(고정)
 }
 
 

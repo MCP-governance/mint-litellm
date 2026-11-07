@@ -54,6 +54,18 @@ def _days(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _ports(raw: str | None) -> tuple[int, ...]:
+    if raw is None or not raw.strip():
+        return (443, 8443)
+    try:
+        ports = tuple(int(part) for part in raw.split(",") if part.strip())
+    except ValueError:
+        ports = ()
+    if not ports or any(not 1 <= port <= 65535 for port in ports):
+        raise ControlError(
+            f"MINT_INTAKE_ALLOWED_PORTS는 쉼표로 구분한 포트 목록이어야 합니다: {raw!r}"
+        )
+    return ports
 def _refuse_internal_host(url: str, host: str) -> None:
     """리터럴 사설·루프백·링크로컬 주소와 localhost를 거부한다(이름 해석 결과는 보지 않는다)."""
     lowered = host.lower()
@@ -103,6 +115,7 @@ class Stage2Settings:
     session_absolute_seconds: int = 28800
     session_verify_seconds: int = 300
     staff_consent_max_days: int = 90
+    intake_allowed_ports: tuple[int, ...] = (443, 8443)
     console_url: str | None = None
 
     @classmethod
@@ -128,6 +141,7 @@ class Stage2Settings:
             session_absolute_seconds=_seconds(env, "MINT_SESSION_ABSOLUTE_SECONDS", 28800),
             session_verify_seconds=_seconds(env, "MINT_SESSION_VERIFY_SECONDS", 300),
             staff_consent_max_days=_days(env, "MINT_STAFF_CONSENT_MAX_DAYS", 90),
+            intake_allowed_ports=_ports(env.get("MINT_INTAKE_ALLOWED_PORTS")),
             console_url=(env.get("MINT_CONSOLE_URL") or "").strip() or None,
         )
         if settings.session_idle_seconds > settings.session_absolute_seconds:
