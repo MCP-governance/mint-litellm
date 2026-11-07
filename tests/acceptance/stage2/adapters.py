@@ -161,11 +161,17 @@ def db_restore(ctx):
     services = [s for s in ("litellm", "worker", "console") if running(s)]
     if services:
         compose("stop", *services)
+    pg = env("ACC_PG_SERVICE", "postgres")
+    user = env("ACC_PG_SUPERUSER", "postgres")
     try:
         for database in ("mint", "litellm"):
-            compose("exec", "-T", env("ACC_PG_SERVICE", "postgres"), "pg_restore", "-U",
-                    env("ACC_PG_SUPERUSER", "postgres"), "--clean", "--if-exists",
-                    "--single-transaction", "-d", database, f"/tmp/{source}-{database}.dump")
+            # 새로 만든 표까지 지우려고 DB째 다시 만든다(역할은 클러스터 전역이라 남는다).
+            for statement in (f"DROP DATABASE IF EXISTS {database} WITH (FORCE)",
+                              f"CREATE DATABASE {database}"):
+                compose("exec", "-T", pg, "psql", "-U", user, "-d", "postgres", "-X", "-q",
+                        "-v", "ON_ERROR_STOP=1", "-c", statement)
+            compose("exec", "-T", pg, "pg_restore", "-U", user, "--single-transaction",
+                    "--exit-on-error", "-d", database, f"/tmp/{source}-{database}.dump")
     finally:
         if services:
             compose("start", *services)
@@ -281,13 +287,16 @@ def seal_tamper(ctx):
         f"FROM mint.seal_batches WHERE instance_id='{instance()}' ORDER BY to_seal_seq DESC "
         "LIMIT 1) b", "mint"))
     state_file("seal-tamper.json").write_text(json.dumps(row), encoding="utf-8")
-    psql(f"UPDATE mint.seal_batches SET tail_hash=decode(repeat('00',32),'hex') "
+    # 추가 전용 트리거는 슈퍼유저 세션의 복제 역할로만 우회한다(시험 스택 한정).
+    psql(f"SET session_replication_role=replica; "
+         f"UPDATE mint.seal_batches SET tail_hash=decode(repeat('00',32),'hex') "
          f"WHERE instance_id='{instance()}' AND to_seal_seq={row['to_seal_seq']}", "mint")
 
 
 def seal_tamper_undo(ctx):
     row = json.loads(state_file("seal-tamper.json").read_text(encoding="utf-8"))
-    psql(f"UPDATE mint.seal_batches SET tail_hash=decode('{row['h']}','hex') "
+    psql(f"SET session_replication_role=replica; "
+         f"UPDATE mint.seal_batches SET tail_hash=decode('{row['h']}','hex') "
          f"WHERE instance_id='{instance()}' AND to_seal_seq={row['to_seal_seq']}", "mint")
 
 
@@ -354,26 +363,33 @@ def as_role(env_name, sql):
         return 0, error.sqlstate
 
 
+def count(sql):
+    return int(psql(sql, "mint") or 0)
+
+
 @adapter("confirmation_plugin_insert")
 def confirmation_plugin_insert(ctx):
+    """플러그인 역할은 대기 행만 추가한다. 확인자 열을 채우면 열 권한 부족이어야 한다."""
     gate("confirmation_plugin_insert")
+    where = "SELECT count(*) FROM mint.self_confirmations WHERE confirmed_by_user_id IS NOT NULL"
+    before = count(where)
     _, sqlstate = as_role("ACC_PLUGIN_DATABASE_URL",
-                          "INSERT INTO mint.self_confirmations (id) VALUES (gen_random_uuid())")
-    after = int(psql("SELECT count(*) FROM mint.self_confirmations WHERE principal_id IS NULL",
-                     "mint") or 0)
-    write_observation(ctx, sqlstate=sqlstate, inserted=after)
+                          "INSERT INTO mint.self_confirmations (id, confirmed_by_user_id) "
+                          "VALUES (gen_random_uuid(), 'acceptance')")
+    write_observation(ctx, sqlstate=sqlstate, inserted=count(where) - before)
 
 
 @adapter("confirmation_plugin_confirm")
 def confirmation_plugin_confirm(ctx):
+    """플러그인 로그인 역할은 확인자 열을 바꿀 수 없다(열 권한)."""
     gate("confirmation_plugin_confirm")
-    before = int(psql("SELECT count(*) FROM mint.self_confirmations WHERE status='confirmed'",
-                      "mint"))
+    where = "SELECT count(*) FROM mint.self_confirmations WHERE confirmed_by_user_id IS NOT NULL"
+    before = count(where)
     _, sqlstate = as_role("ACC_PLUGIN_DATABASE_URL",
-                          "UPDATE mint.self_confirmations SET status='confirmed' WHERE false")
-    after = int(psql("SELECT count(*) FROM mint.self_confirmations WHERE status='confirmed'",
-                     "mint"))
-    write_observation(ctx, sqlstate=sqlstate, confirmed=after - before)
+                          "UPDATE mint.self_confirmations SET confirmed_by_user_id = 'acceptance', "
+                          "confirmed_by_key_token = 'acceptance', confirmed_at = now() "
+                          "WHERE false")
+    write_observation(ctx, sqlstate=sqlstate, confirmed=count(where) - before)
 
 
 # ---------------------------------------------------------------- 시나리오 어댑터(본문 대기)
