@@ -2,6 +2,7 @@
 MINT_TEST_DATABASE_URL이 없으면 건너뛴다."""
 
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -68,15 +69,17 @@ def sctx(world, user=USER):
     return staff.StaffContext(staff_conn, control_conn, INSTANCE, user, consent_max_days=90)
 
 
-def add_confirmation(url, user=USER, *, expires=None, requested_key=HARNESS_KEY, tool="echo"):
+def add_confirmation(
+    url, user=USER, *, expires=None, requested_key=HARNESS_KEY, tool="echo", display=None,
+):
     cid = uuid.uuid4()
     with psycopg.connect(url) as admin:
         admin.execute(
             "INSERT INTO mint.self_confirmations (id, instance_id, org_id, principal_id,"
             " server_id, tool, args_fp, fp_key_version, policy_version_id, purpose,"
-            " requested_by_key_token, expires_at) VALUES (%s, %s, 'acme', %s, 'srv', %s, %s, 1,"
-            " 'v1', '결제', %s, %s)",
-            (cid, INSTANCE, user, tool, HEX, requested_key, expires or later(minutes=10)),
+            " requested_by_key_token, expires_at, display)"
+            " VALUES (%s, %s, 'acme', %s, 'srv', %s, %s, 1, 'v1', '결제', %s, %s, %s::jsonb)",
+            (cid, INSTANCE, user, tool, HEX, requested_key, expires or later(minutes=10), display),
         )
     return str(cid)
 
@@ -305,3 +308,192 @@ def test_a_staff_transaction_refuses_a_connection_inside_a_transaction(world):
     with context.staff.transaction():
         with pytest.raises(RuntimeError):
             staff.list_consents(context)
+
+
+# --- 선확인 뒤 상태가 바뀌어도 직원 쓰기 함수가 다시 막는다 ------------------
+
+@pytest.mark.parametrize("change", ["session", "server", "membership", "relation", "org"])
+def test_confirmation_rechecks_state_after_the_service_read(world, monkeypatch, change):
+    url = world[0]
+    cid = add_confirmation(url)
+    login(world)
+    original = staff._confirmation
+
+    def read_then_change(*args):
+        result = original(*args)
+        with psycopg.connect(url) as admin:
+            statements = {
+                "session": "UPDATE mint.console_sessions SET revoked_at = now()",
+                "server": "UPDATE mint.servers SET status = 'suspended'",
+                "membership": "DELETE FROM mint.org_bindings WHERE subject_type = 'user'",
+                "relation": "UPDATE mint.usage_relations SET status = 'terminating'",
+                "org": "UPDATE mint.orgs SET status = 'closed'",
+            }
+            admin.execute(statements[change])
+        return result
+
+    monkeypatch.setattr(staff, "_confirmation", read_then_change)
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        staff.confirm(sctx(world), SESSION, cid)
+    assert row(url, "SELECT status FROM mint.self_confirmations WHERE id = %s", cid) == {
+        "status": "pending",
+    }
+    assert row(url, "SELECT count(*) AS n FROM mint.events"
+                    " WHERE kind = 'call_approval_approved'")["n"] == 0
+
+
+def test_consent_rechecks_server_after_service_precheck(world, monkeypatch):
+    login(world)
+    original = staff._check_consent_target
+
+    def read_then_suspend(*args):
+        original(*args)
+        with psycopg.connect(world[0]) as admin:
+            admin.execute("UPDATE mint.servers SET status = 'suspended'")
+
+    monkeypatch.setattr(staff, "_check_consent_target", read_then_suspend)
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        staff.grant_consent(sctx(world), SESSION, **consent_args())
+    assert row(world[0], "SELECT count(*) AS n FROM mint.consents")["n"] == 0
+
+
+@pytest.mark.parametrize("setting", [
+    "mint.staff_user_id", "mint.staff_instance_id", "mint.staff_session_id_hash",
+    "mint.staff_team_ids",
+])
+@pytest.mark.parametrize("empty", [False, True])
+def test_direct_staff_writes_deny_missing_and_empty_context(world, setting, empty):
+    cid = add_confirmation(world[0])
+    login(world)
+    values = {
+        "mint.staff_user_id": USER, "mint.staff_instance_id": INSTANCE,
+        "mint.staff_session_id_hash": SESSION, "mint.staff_team_ids": "[]",
+    }
+    # 새 연결은 GUC 자체가 없는 경우도 시험한다(풀의 빈 값으로 초기화된 경우와 분리).
+    with as_login(world[0], "mint_staff") as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege), conn.transaction():
+            for key, value in values.items():
+                if key != setting or empty:
+                    conn.execute("SELECT set_config(%s, %s, true)",
+                                 (key, "" if key == setting else value))
+            conn.execute("SELECT mint.staff_confirm(%s, %s)", (cid, CONSOLE_KEY))
+
+
+def test_direct_staff_write_denies_a_different_instance_and_forged_confirmation_key(world):
+    cid = add_confirmation(world[0])
+    login(world)
+    for context, key in ((replace(sctx(world), instance_id="another-instance"), CONSOLE_KEY),
+                         (sctx(world), "forged-console-key")):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with staff._staff_transaction(context, SESSION) as conn:
+                conn.execute("SELECT mint.staff_confirm(%s, %s)", (cid, key))
+
+
+def test_direct_same_key_confirmation_is_refused_by_db_even_if_service_is_skipped(world):
+    cid = add_confirmation(world[0])
+    login(world, key=HARNESS_KEY)
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with staff._staff_transaction(sctx(world), SESSION) as conn:
+            conn.execute("SELECT mint.staff_confirm(%s, %s)", (cid, HARNESS_KEY))
+
+
+def test_team_bindings_in_several_orgs_allow_only_members_of_that_set(world):
+    login(world)
+    with psycopg.connect(world[0]) as admin:
+        admin.execute("DELETE FROM mint.org_bindings WHERE subject_type = 'user'")
+        for org in ("beta", "gamma"):
+            admin.execute(
+                "INSERT INTO mint.orgs (instance_id, org_id, name) VALUES (%s, %s, %s)",
+                (INSTANCE, org, org),
+            )
+            admin.execute(
+                "INSERT INTO mint.usage_relations (id, instance_id, org_id, server_id, purpose)"
+                " VALUES (gen_random_uuid(), %s, %s, 'srv', 'ops')", (INSTANCE, org),
+            )
+        for team, org in (("team-a", "acme"), ("team-b", "beta")):
+            admin.execute(
+                "INSERT INTO mint.org_bindings (id, instance_id, org_id, subject_type, subject_id,"
+                " created_by) VALUES (gen_random_uuid(), %s, %s, 'team', %s, 'root')",
+                (INSTANCE, org, team),
+            )
+    context = replace(sctx(world), team_ids=("team-a", "team-b"))
+    for org in ("acme", "beta", "gamma"):
+        def direct(org=org):
+            with staff._staff_transaction(context, SESSION) as conn:
+                conn.execute(
+                    "SELECT mint.staff_grant_consent(%s, %s, 'srv', 'ops', 'all', 'v1', %s)",
+                    (uuid.uuid4(), org, later(days=1)),
+                )
+
+        if org == "gamma":
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                direct()
+        else:
+            direct()
+
+
+def test_temp_objects_cannot_intercept_staff_function_tables_or_functions(world):
+    cid = add_confirmation(world[0])
+    login(world)
+    with staff._staff_transaction(sctx(world), SESSION) as conn:
+        for table in ("console_sessions", "self_confirmations", "org_bindings", "orgs",
+                      "settings", "servers", "usage_relations", "events"):
+            conn.execute(f"CREATE TEMP TABLE {table} (hijacked text)")
+        conn.execute("CREATE FUNCTION pg_temp.staff_user() RETURNS text LANGUAGE sql"
+                     " AS $$ SELECT 'attacker'::text $$")
+        conn.execute("SELECT mint.staff_confirm(%s, %s)", (cid, CONSOLE_KEY))
+        for table in ("console_sessions", "self_confirmations", "org_bindings", "orgs",
+                      "settings", "servers", "usage_relations", "events"):
+            assert conn.execute(f"SELECT count(*) FROM pg_temp.{table}").fetchone() == (0,)
+    assert row(world[0], "SELECT status FROM mint.self_confirmations WHERE id = %s", cid) == {
+        "status": "confirmed",
+    }
+
+
+def test_unprivileged_and_plugin_roles_cannot_execute_any_staff_function(world):
+    role = "no_staff_" + uuid.uuid4().hex[:12]
+    with psycopg.connect(world[0]) as admin:
+        admin.execute(f"CREATE ROLE {role} NOLOGIN")
+        functions = admin.execute(
+            "SELECT p.oid::regprocedure::text FROM pg_proc p"
+            " JOIN pg_namespace n ON n.oid = p.pronamespace"
+            " WHERE n.nspname = 'mint' AND p.proname LIKE 'staff\\_%'",
+        ).fetchall()
+        for subject in (role, "mint_plugin_app"):
+            for (function,) in functions:
+                assert admin.execute("SELECT has_function_privilege(%s, %s, 'EXECUTE')",
+                                     (subject, function)).fetchone() == (False,)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege), admin.transaction():
+                admin.execute(f"SET LOCAL ROLE {subject}")
+                admin.execute("SELECT mint.staff_cancel(gen_random_uuid())")
+        admin.execute(f"DROP ROLE {role}")
+
+
+@pytest.mark.parametrize("target", ["rejected", "cancelled", "expired"])
+def test_terminal_confirmation_clears_display_with_the_state_change(world, target):
+    cid = add_confirmation(world[0], display='{"amount":"private-value"}')
+    login(world)
+    if target == "expired":
+        with psycopg.connect(world[0]) as admin:
+            admin.execute("UPDATE mint.self_confirmations SET status = 'expired' WHERE id = %s",
+                          (cid,))
+    else:
+        decide = staff.reject if target == "rejected" else staff.cancel
+        decide(sctx(world), SESSION, cid)
+    result = row(world[0], "SELECT status, display FROM mint.self_confirmations WHERE id = %s", cid)
+    assert result == {"status": target, "display": None}
+
+
+@pytest.mark.parametrize("days", [None, "", "0", "366"])
+def test_direct_consent_denies_unset_empty_or_out_of_range_max_days(world, days):
+    login(world)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with staff._staff_transaction(sctx(world), SESSION) as conn:
+            if days is None:
+                conn.execute("RESET mint.staff_consent_max_days")
+            else:
+                conn.execute("SELECT set_config('mint.staff_consent_max_days', %s, true)", (days,))
+            conn.execute(
+                "SELECT mint.staff_grant_consent(%s, 'acme', 'srv', 'ops', 'all', 'v1', %s)",
+                (uuid.uuid4(), later(days=1)),
+            )
