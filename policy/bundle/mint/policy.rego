@@ -91,6 +91,26 @@ valid_sizes(values) if {
 	every key, value in values { is_string(key); is_number(value); value >= 0; value == floor(value)}
 }
 
+pattern_names := {"url_external", "private_host", "path_traversal", "secret_like"}
+
+# 값이 있을 때만 쓴다(1단계 서버는 계약·패턴 값이 없어도 전면 차단되지 않는다).
+missing contains "arguments.patterns" if {
+	"patterns" in object.keys(input.arguments)
+	not valid_patterns
+}
+
+valid_patterns if {
+	patterns := input.arguments.patterns
+	is_object(patterns)
+	object.keys(patterns) == pattern_names
+	every _, value in patterns { is_boolean(value) }
+}
+
+missing contains "approval.conditions.allowed_arg_keys" if {
+	"allowed_arg_keys" in object.keys(conditions)
+	not valid_strings(conditions.allowed_arg_keys)
+}
+
 missing contains "server.provider_allowed" if not is_boolean(input.server.provider_allowed)
 missing contains "server.auth_server_allowed" if not is_boolean(input.server.auth_server_allowed)
 missing contains "principal.type" if not input.principal.type in {"user", "team_key", "service_account"}
@@ -188,6 +208,26 @@ applied contains "R4" if {
 	input.consent.status != "granted"
 }
 
+# 2단계 정책(규칙 ID는 정본 번호). 모두 Block이고 카탈로그에서 observable이다.
+pattern_rules := {
+	"POL-E-07": "url_external",
+	"POL-E-09": "path_traversal",
+	"POL-E-14": "private_host",
+}
+
+applied contains id if {
+	some id, name in pattern_rules
+	object.get(input.arguments, ["patterns", name], false) == true
+}
+
+# POL-E-08(전송 범위)·POL-E-15(정의되지 않은 항목): 승인 conditions.allowed_arg_keys 밖의 인자 키.
+applied contains id if {
+	some id in {"POL-E-08", "POL-E-15"}
+	keys := conditions.allowed_arg_keys
+	allowed := {key | some key in keys}
+	count({key | some key in input.arguments.keys} - allowed) > 0
+}
+
 hours := object.get(conditions, "business_hours", data.mint.business_hours)
 
 within_business_hours if {
@@ -205,8 +245,9 @@ within_business_hours if {
 	current < (to_number(end[0]) * 60) + to_number(end[1])
 }
 
-block_observable := {"R1": true, "R3": true}
-block_rules := {id | some id in {"R1", "R3"}; id in applied}
+block_ids := {"R1", "R3", "POL-E-07", "POL-E-08", "POL-E-09", "POL-E-14", "POL-E-15"}
+block_observable := {id: true | some id in block_ids}
+block_rules := {id | some id in block_ids; id in applied}
 
 default verdict := "Allow"
 
