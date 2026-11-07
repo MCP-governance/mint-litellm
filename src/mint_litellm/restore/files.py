@@ -98,9 +98,13 @@ def document_bytes(document: dict[str, Any]) -> bytes:
 
 def atomic_write(path: Path, document: dict[str, Any]) -> None:
     """임시 파일에 쓰고 fsync한 뒤 이름을 바꾼다. 읽는 쪽은 옛 파일이나 새 파일만 본다."""
+    atomic_write_bytes(path, document_bytes(document))
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """바이트를 같은 방식(임시 파일·fsync·이름 바꾸기)으로 쓴다. 표지 파일도 이것을 쓴다."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    data = document_bytes(document)
     try:
         with open(temp, "wb") as handle:
             handle.write(data)

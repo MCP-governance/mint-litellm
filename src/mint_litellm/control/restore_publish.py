@@ -12,6 +12,7 @@ DB에서 ``pending``으로 되살아나도 다시 게시하지 않는다(최신 
 """
 
 import hashlib
+import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,64 +47,75 @@ def archive(settings, instance_id: str, request_id: str) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     marker = dest / _MARKER
     if not marker.exists():  # 이동 전에 표식을 먼저 쓴다. 중간에 죽으면 다음 실행이 이어서 옮긴다.
-        marker.write_text(files.now(), encoding="utf-8")
+        _marker(marker, files.now())
     for name in ("latest.json", "negative"):
         source = root / name
         if source.exists() and not (dest / name).exists():
             shutil.move(str(source), str(dest / name))
-    (dest / _MOVED).write_text(files.now(), encoding="utf-8")
+    _marker(dest / _MOVED, files.now())
 
 
 def _stamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _done_at(path: Path) -> datetime:
+def _marker(path: Path, *lines: str) -> None:
+    """표지 파일을 원자적으로 쓴다(비우다 중단돼 빈 표지가 남지 않는다)."""
+    files.atomic_write_bytes(path, (chr(10).join(lines) + chr(10)).encode("utf-8"))
+
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _read_marker(path: Path) -> tuple[datetime, str | None] | None:
+    """표지의 (시각, 선택적 해시). 없거나 형식이 깨졌으면 None이다."""
     try:
-        return datetime.fromisoformat(path.read_text(encoding="utf-8").split("\n")[0].strip())
-    except (OSError, ValueError):
-        return datetime.max.replace(tzinfo=UTC)  # 읽을 수 없는 표지는 가장 나중으로 본다(거부)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        stamp = datetime.fromisoformat(lines[0].strip())
+        if stamp.tzinfo is None:
+            return None
+        if len(lines) == 1:
+            return stamp, None
+        digest = lines[1].strip()
+        return (stamp, digest) if len(lines) == 2 and _HEX64.fullmatch(digest) else None
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _own_latest_hash(dest: Path) -> str | None:
-    """이 요청이 쓰려고 표지에 적어 둔 새 ``latest.json``의 해시(둘째 줄)."""
-    try:
-        lines = (dest / _PUBLISHING).read_text(encoding="utf-8").strip().splitlines()
-    except OSError:
-        return None
-    return lines[1] if len(lines) > 1 else None
+    """이 요청이 쓰려고 표지에 적어 둔 새 ``latest.json``의 해시. 표지가 깨졌으면 None."""
+    marker = _read_marker(dest / _PUBLISHING)
+    return None if marker is None else marker[1]
 
 
-def _other_restore_marker(settings, instance_id: str, request: dict[str, Any]) -> bool:
-    """이 요청이 만들어진 뒤에 다른 복원이 게시를 시작했거나 끝냈는가
-    (``restored/<다른 식별자>/.publishing``·``.done``)."""
+def _bound_problem(settings, instance_id: str, request: dict[str, Any]) -> str | None:
+    """게시(재개 포함) 직전에 원래 위치의 현재 ``latest.json``만 본다(보관본은 보지 않는다).
+
+    파일이 없으면(이 요청이 옮겼거나 처음부터 없던 경우) 허용하고, 있으면 요청에 결속한 해시나
+    자기 표지에 적어 둔 해시와 같을 때만 허용한다. 다른 복원이 게시를 시작했거나 끝냈다면 거부하고,
+    다른 식별자의 표지가 깨져 있으면 시각을 해석하지 않고 거부한다. 문제가 없으면 None.
+    """
     root = settings.export_dir / instance_id / "restored"
     created = request["created_at"].astimezone(UTC)
     mine = str(request["id"])
-    if not root.is_dir():
-        return False
-    for name in (_PUBLISHING, _DONE):
-        for marker in root.glob(f"*/{name}"):
-            if marker.parent.name != mine and _done_at(marker) >= created:
-                return True
-    return False
+    if root.is_dir():
+        for name in (_PUBLISHING, _DONE):
+            for marker in root.glob(f"*/{name}"):
+                if marker.parent.name == mine:
+                    continue
+                read = _read_marker(marker)
+                if read is None:
+                    return "foreign_marker_malformed"
+                if read[0] >= created:
+                    return "other_restore"
+    current = files.file_sha256(files.latest_path(settings.export_dir, instance_id))
+    own = _own_latest_hash(_dest(settings, instance_id, mine))
+    if current in ("absent", request["bound_latest"]) or (own is not None and current == own):
+        return None
+    return "latest_changed"
 
 
-def _bound_ok(settings, instance_id: str, request: dict[str, Any]) -> bool:
-    """게시(재개 포함) 직전에 원래 위치의 현재 ``latest.json``만 본다(보관본은 보지 않는다).
-
-    파일이 없으면(이 요청이 옮겼거나 처음부터 없던 경우) 허용하고, 있으면 요청에 결속한 해시와
-    같을 때만 허용한다. 다른 복원이 게시를 시작했거나 끝냈다면 거부한다.
-    """
-    if _other_restore_marker(settings, instance_id, request):
-        return False
-    path = files.latest_path(settings.export_dir, instance_id)
-    current = files.file_sha256(path)
-    own = _own_latest_hash(_dest(settings, instance_id, str(request["id"])))
-    return current in ("absent", request["bound_latest"]) or (own is not None and current == own)
-
-
-def _reject(job: JobContext, request: dict[str, Any]) -> None:
+def _reject(job: JobContext, request: dict[str, Any], reason: str) -> None:
     conn, iid = job.conn, job.instance_id
     with conn.transaction():
         conn.execute(
@@ -112,7 +124,7 @@ def _reject(job: JobContext, request: dict[str, Any]) -> None:
         alerts.raise_alert(
             conn, iid, kind="restore_request_rejected", severity="critical",
             dedup_key=f"restore_request_rejected:{request['id']}",
-            subject={"request_id": str(request["id"]), "reason": "latest_changed"})
+            subject={"request_id": str(request["id"]), "reason": reason})
     raise PermanentFailure("restore_binding_mismatch")
 
 
@@ -256,13 +268,16 @@ def publish(job: JobContext) -> None:
         job.checkpoint()
         if request["bound_latest"] is None:  # 복원 명령이 만들지 않은 요청
             raise ControlError("복원 요청에 외부 기준(latest.json 해시) 결속이 없습니다.")
-        if not _bound_ok(settings, iid, request):
-            _reject(job, request)
+        problem = _bound_problem(settings, iid, request)
+        if problem is not None:
+            _reject(job, request, problem)
         validate(job, request)
         archive(settings, iid, str(request["id"]))
         publishing = _dest(settings, iid, str(request["id"])) / _PUBLISHING
-        if not publishing.exists():  # 다른 요청이 이 시점 뒤에 재개하지 못하게 먼저 남긴다
-            publishing.write_text(_stamp(), encoding="utf-8")
+        marker = _read_marker(publishing)
+        if marker is None:  # 없거나 깨진 표지: 해시 없이 새로 남긴다(처음부터 다시 게시한다)
+            _marker(publishing, _stamp())  # 다른 요청이 이 시점 뒤에 재개하지 못하게 먼저 남긴다
+            marker = _read_marker(publishing)
         job.checkpoint()
         own = _own_latest_hash(publishing.parent)
         if own is not None and files.file_sha256(
@@ -280,17 +295,17 @@ def publish(job: JobContext) -> None:
             )
             job.checkpoint()
             # 쓰려는 파일의 해시를 표지에 먼저 적는다(쓴 직후 죽어도 자기 파일임을 안다).
-            stamp = publishing.read_text(encoding="utf-8").splitlines()[0]
+            stamp = marker[0].isoformat()
             digest = hashlib.sha256(files.document_bytes(
                 exports.latest_document(settings, iid, checkpoint))).hexdigest()
-            publishing.write_text(f"{stamp}\n{digest}\n", encoding="utf-8")
+            _marker(publishing, stamp, digest)
             # latest.json은 맨 마지막이다: 그 전에 죽으면 파일이 없어 차단이 유지된다.
             exports.write_latest_file(settings, iid, checkpoint, force=True)
         state = judge.read_files(settings.export_dir, iid, exports.keys(settings))
         if state.error is not None or state.latest is None:
             raise exports.ExportFailed("게시한 파일을 다시 읽어 검증하지 못했습니다.")
         done = _dest(settings, iid, str(request["id"])) / _DONE
-        done.write_text(_stamp(), encoding="utf-8")  # 완료 표지는 DB 확정보다 먼저 남긴다
+        _marker(done, _stamp())  # 완료 표지는 DB 확정보다 먼저 남긴다
         conn.execute(
             "UPDATE mint.restore_requests SET status = 'published', published_at = now()"
             " WHERE id = %s AND status = 'pending'", (request["id"],),

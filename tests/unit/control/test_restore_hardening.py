@@ -487,3 +487,64 @@ def test_a_request_that_died_right_after_writing_its_own_latest_finishes_on_reru
     with psycopg.connect(world["restored"], autocommit=True) as conn:
         assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "published"
     assert (dest / ".done").exists()
+
+
+@pytest.mark.parametrize("broken", ["", "2026-11-0", "2026-11-08T01:02:03+00:00\nabc"])
+def test_a_request_with_an_empty_or_truncated_own_marker_publishes_again_from_scratch(
+    world, monkeypatch, broken
+):
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    settings = world["settings"]
+
+    def dying(*args, **kwargs):
+        raise OSError("killed")
+
+    monkeypatch.setattr(exports, "write_export", dying)
+    run_worker(world)  # 보관과 표지까지 끝났다
+    monkeypatch.undo()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        rid = str(fetchone(conn, "SELECT id FROM mint.restore_requests")["id"])
+        conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'")
+    marker = settings.export_dir / INSTANCE / "restored" / rid / ".publishing"
+    assert marker.exists()
+    marker.write_text(broken, encoding="utf-8")  # 비우다 중단된 표지
+    assert run_worker(world).state == judge.OK
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "published"
+    assert (marker.parent / ".done").exists()
+
+
+@pytest.mark.parametrize("name", [".publishing", ".done"])
+@pytest.mark.parametrize("broken", ["", "2026-11-0"])
+def test_a_malformed_marker_of_another_request_rejects_with_an_alert(world, name, broken):
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    settings = world["settings"]
+    other = settings.export_dir / INSTANCE / "restored" / "other-request"
+    other.mkdir(parents=True)
+    (other / name).write_text(broken, encoding="utf-8")
+    run_worker(world)
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "rejected"
+        alert = fetchone(conn, "SELECT subject FROM mint.alerts"
+                         " WHERE kind = 'restore_request_rejected'")
+        assert alert["subject"]["reason"] == "foreign_marker_malformed"
+
+
+def test_markers_are_written_through_a_temporary_file_and_a_rename(world, monkeypatch):
+    from mint_litellm.control import restore_publish
+
+    seen = []
+    real = files.atomic_write_bytes
+    monkeypatch.setattr(files, "atomic_write_bytes",
+                        lambda path, data: (seen.append(path.name), real(path, data))[1])
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    assert run_worker(world).state == judge.OK
+    assert {".archived", ".moved", ".publishing", ".done"} <= set(seen)
+    assert restore_publish._read_marker(
+        next(world["settings"].export_dir.glob("*/restored/*/.done"))) is not None
