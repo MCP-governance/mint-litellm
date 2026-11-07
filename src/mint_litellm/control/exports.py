@@ -20,27 +20,28 @@ from mint_litellm.restore import files
 from mint_litellm.types.events import EventKind
 
 # 부정 상태 항목 일곱 종류(철회·거부·중지·종료·rejected 서버, 종료 관계, 닫힌 조직, 해제된 허용
-# 목록, 철회된 동의). ``id``는 서버만 server_id이고 나머지는 행 식별자다.
+# 목록, 철회된 동의). ``id``는 서버만 server_id이고 나머지는 행 식별자다. 항목마다 행 전체
+# 스냅숏(``row``, 모든 열)을 담아 복원 때 같은 id로 되돌릴 수 있게 한다.
 # ponytail: 항목을 전부 한 파일에 담는다(철회가 수만 건이 되면 증분 파일로 나눈다).
 SNAPSHOT_SQL = """
 WITH items AS (
-  SELECT 'approval' AS kind, id::text AS id, state_version, status AS state, NULL::jsonb AS extra
-    FROM mint.approvals WHERE instance_id = %(i)s AND status = 'revoked'
-  UNION ALL SELECT 'denial', id::text, state_version, 'active',
-    jsonb_build_object('org_id', org_id, 'scope_type', scope_type, 'scope_id', scope_id,
-      'server_id', server_id, 'tools', tools, 'reason', reason, 'created_by', created_by)
-    FROM mint.denials WHERE instance_id = %(i)s AND lifted_at IS NULL
-  UNION ALL SELECT 'server', server_id, state_version, status, NULL
-    FROM mint.servers WHERE instance_id = %(i)s
-     AND status IN ('rejected', 'suspended', 'terminating', 'terminated')
-  UNION ALL SELECT 'relation', id::text, state_version, status, NULL
-    FROM mint.usage_relations WHERE instance_id = %(i)s AND status IN ('terminating', 'terminated')
-  UNION ALL SELECT 'org', org_id, state_version, status, NULL
-    FROM mint.orgs WHERE instance_id = %(i)s AND status = 'closed'
-  UNION ALL SELECT 'allowlist', id::text, state_version, status, NULL
-    FROM mint.allowlists WHERE instance_id = %(i)s AND status = 'lifted'
-  UNION ALL SELECT 'consent', id::text, state_version, 'revoked', NULL
-    FROM mint.consents WHERE instance_id = %(i)s AND revoked_at IS NOT NULL
+  SELECT 'approval' AS kind, t.id::text AS id, t.state_version, t.status AS state,
+         to_jsonb(t) AS row
+    FROM mint.approvals t WHERE t.instance_id = %(i)s AND t.status = 'revoked'
+  UNION ALL SELECT 'denial', t.id::text, t.state_version, 'active', to_jsonb(t)
+    FROM mint.denials t WHERE t.instance_id = %(i)s AND t.lifted_at IS NULL
+  UNION ALL SELECT 'server', t.server_id, t.state_version, t.status, to_jsonb(t)
+    FROM mint.servers t WHERE t.instance_id = %(i)s
+     AND t.status IN ('rejected', 'suspended', 'terminating', 'terminated')
+  UNION ALL SELECT 'relation', t.id::text, t.state_version, t.status, to_jsonb(t)
+    FROM mint.usage_relations t WHERE t.instance_id = %(i)s
+     AND t.status IN ('terminating', 'terminated')
+  UNION ALL SELECT 'org', t.org_id, t.state_version, t.status, to_jsonb(t)
+    FROM mint.orgs t WHERE t.instance_id = %(i)s AND t.status = 'closed'
+  UNION ALL SELECT 'allowlist', t.id::text, t.state_version, t.status, to_jsonb(t)
+    FROM mint.allowlists t WHERE t.instance_id = %(i)s AND t.status = 'lifted'
+  UNION ALL SELECT 'consent', t.id::text, t.state_version, 'revoked', to_jsonb(t)
+    FROM mint.consents t WHERE t.instance_id = %(i)s AND t.revoked_at IS NOT NULL
 ), last AS (
   SELECT to_seal_seq, encode(tail_hash, 'hex') AS tail FROM mint.seal_batches
   WHERE instance_id = %(i)s ORDER BY to_seal_seq DESC LIMIT 1
@@ -48,9 +49,8 @@ WITH items AS (
 SELECT coalesce((SELECT epoch FROM mint.state_epoch WHERE instance_id = %(i)s), 0) AS epoch,
        (SELECT to_seal_seq FROM last) AS seq, (SELECT tail FROM last) AS tail,
        coalesce((SELECT jsonb_agg(jsonb_build_object('kind', kind, 'id', id,
-           'state_version', state_version, 'state', state)
-           || CASE WHEN extra IS NULL THEN '{}'::jsonb
-                   ELSE jsonb_build_object('recreate', extra) END ORDER BY kind, id) FROM items),
+           'state_version', state_version, 'state', state, 'row', row)
+           ORDER BY kind, id) FROM items),
          '[]'::jsonb) AS items
 """
 
@@ -63,7 +63,10 @@ class ExportFailed(ControlError):
 
 def snapshot(conn: psycopg.Connection, instance_id: str) -> dict[str, Any]:
     """한 문장(한 시점)으로 세대·봉인 끝·부정 상태 항목 전체를 읽는다."""
-    return fetchone(conn, SNAPSHOT_SQL, {"i": instance_id})
+    # 행 스냅숏의 시각 문자열이 세션 시간대에 따라 달라지지 않게 UTC로 고정한다.
+    with conn.transaction():
+        conn.execute("SELECT set_config('TimeZone', 'UTC', true)")
+        return fetchone(conn, SNAPSHOT_SQL, {"i": instance_id})
 
 
 def keys(settings: Stage2Settings) -> list[bytes]:
@@ -111,17 +114,19 @@ def write_export(
     force_latest: bool = False,
     actor: str = "worker",
     guard: Callable[[], None] = lambda: None,
+    republish: bool = False,
 ) -> dict[str, Any] | None:
     """``kind``(``negative_state``|``checkpoint``) 파일을 쓰고 수령을 확인한다.
 
     이미 ``min_epoch`` 이상의 부정 상태 파일이 쓰였으면 아무것도 하지 않고 None을 돌려준다.
     ``force_latest``는 DB 기준으로 ``latest.json``을 더 낮은 세대로도 덮는다(accept-stale).
     """
-    if kind == "negative_state" and min_epoch and _already_written(conn, instance_id, min_epoch):
+    skip_done = kind == "negative_state" and not republish
+    if skip_done and min_epoch and _already_written(conn, instance_id, min_epoch):
         return None
     snap = snapshot(conn, instance_id)
     epoch, seq, tail = snap["epoch"], snap["seq"], snap["tail"]
-    if kind == "negative_state" and _already_written(conn, instance_id, epoch):
+    if skip_done and _already_written(conn, instance_id, epoch):
         return None
     export_dir = settings.export_dir
     row = None
@@ -146,6 +151,14 @@ def write_export(
     }
     sha = files.content_sha256({k: v for k, v in body.items() if k != "written_at"})
     relative = str(path.relative_to(export_dir)).replace("\\", "/")
+    if republish and row is not None and row["status"] == "written":
+        # 복원 게시: 보관으로 사라진 파일을 다시 쓴다. 행은 이미 확정되어 있다.
+        guard()
+        path_signed = files.sign(body, settings.export_hmac_key)
+        files.atomic_write(path, path_signed)
+        again = files.read_verified(path, keys(settings))
+        latest_written = _write_latest(settings, instance_id, again, force_latest)
+        return {**again, "path": relative, "latest_written": latest_written}
     if row is None:
         row = fetchone(
             conn,
@@ -238,33 +251,3 @@ def export_checkpoint(job: JobContext) -> None:
     except (OSError, files.ExportUnverified):
         raise ExportFailed("옛 키로 서명된 부정 상태 파일을 다시 서명하지 못했습니다.") from None
 
-
-def write_files(
-    conn: psycopg.Connection,
-    instance_id: str,
-    settings: Stage2Settings,
-    *,
-    force_latest: bool = False,
-) -> str:
-    """DB 기준 부정 상태 파일과 체크포인트 파일, ``latest.json``을 ``exports`` 행 없이 쓴다.
-
-    복원 해제 명령이 쓴다. 제어 평면 역할은 ``exports``에 쓰지 못하고, 되돌림 상태의 작업
-    실행기는 쓰기를 멈추기 때문이다. 다음 정상 체크포인트가 행을 남긴다. 새 부정 상태 파일의
-    경로를 돌려준다.
-    """
-    snap = snapshot(conn, instance_id)
-    body: dict[str, Any] = {
-        "format": files.FORMAT, "instance_id": instance_id, "state_epoch": snap["epoch"],
-        "to_seal_seq": snap["seq"], "tail_hash": snap["tail"], "items": snap["items"],
-        "written_at": files.now(),
-    }
-    key = settings.export_hmac_key
-    negative = files.negative_path(settings.export_dir, instance_id, snap["epoch"])
-    checkpoint = files.checkpoint_path(settings.export_dir, instance_id, datetime.now(UTC))
-    try:
-        for kind, path in (("negative_state", negative), ("checkpoint", checkpoint)):
-            files.atomic_write(path, files.sign({**body, "kind": kind}, key))
-        _write_latest(settings, instance_id, body, force_latest)
-    except OSError as error:
-        raise ExportFailed(f"내보내기 파일을 쓰지 못했습니다: {type(error).__name__}") from None
-    return str(negative.relative_to(settings.export_dir)).replace("\\", "/")

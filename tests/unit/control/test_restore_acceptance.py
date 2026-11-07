@@ -124,7 +124,36 @@ def operator(name="root", user="root-user", role="admin"):
     return Operator(name, role, user)
 
 
-def test_restore_check_attest_releases_the_block_and_records_the_event(world):
+def run_worker(world, which="restored", settings=None):
+    """작업 실행기를 한 번 돌려 대기 작업이 없을 때까지 처리한다(되돌림 판정 포함)."""
+    from mint_litellm.control.worker import RestoreCheck, Worker
+
+    settings = settings or world["settings"]
+    login = url_for(world[which], world["clone"] if which == "restored" else
+                    conninfo_to_dict(world["live"])["dbname"], "mint_worker")
+    worker = Worker(login, INSTANCE, settings, restore_check=RestoreCheck(settings, 0))
+    try:
+        worker.open()
+        while worker.step():
+            pass
+        return worker.verdict
+    finally:
+        worker.close()
+
+
+def verdict_of(url, settings):
+    with psycopg.connect(url, autocommit=True) as conn:
+        return judge.Judge().evaluate(conn, settings.export_dir, INSTANCE, exports.keys(settings))
+
+
+def attest_restored(world, reason="복구 확인"):
+    with psycopg.connect(world["restored"]) as conn:
+        out = restore.attest(make_ctx(conn), world["settings"], reason)
+        conn.commit()
+    return out
+
+
+def test_restore_check_then_attest_publishes_through_the_worker_and_releases_the_block(world):
     file_epoch = revoke_and_export(world)
     overtake_epoch(world["restored"], file_epoch)
     settings = world["settings"]
@@ -135,9 +164,11 @@ def test_restore_check_attest_releases_the_block_and_records_the_event(world):
         ctx = make_ctx(conn)
         with pytest.raises(ControlError, match="--reason"):
             restore.attest(ctx, settings, " ")
-        out = restore.attest(ctx, settings, "복구 확인")
-        conn.commit()
-    assert out["reapplied"] == [{"kind": "org", "id": "acme"}]
+    latest = files.latest_path(settings.export_dir, INSTANCE)
+    before = latest.read_bytes()
+    out = attest_restored(world)
+    assert latest.read_bytes() == before  # 복원 명령은 파일을 쓰지 않는다
+    assert [r["kind"] for r in out["reapplied"]] == ["org"]
     with psycopg.connect(world["restored"], autocommit=True) as conn:
         assert fetchone(conn, "SELECT status FROM mint.orgs")["status"] == "closed"
         assert fetchone(conn, "SELECT epoch FROM mint.state_epoch")["epoch"] > file_epoch
@@ -146,23 +177,32 @@ def test_restore_check_attest_releases_the_block_and_records_the_event(world):
         assert len(events) == 1 and events[0]["source_key"] == (
             f"restore:{file_epoch}:1:restore_attested")
         assert events[0]["payload"]["reason"] == "복구 확인"
-        j = judge.Judge()
-        verdict = j.evaluate(conn, settings.export_dir, INSTANCE, exports.keys(settings))
-        assert verdict.state == judge.OK  # 새 파일이 DB 기준으로 쓰였다
+        request = fetchone(conn, "SELECT * FROM mint.restore_requests")
+        assert request["status"] == "pending" and request["kind"] == "attest"
+    final = run_worker(world)  # 차단 상태에서도 restore_publish는 실행된다
+    assert final.state == judge.OK
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        request = fetchone(conn, "SELECT * FROM mint.restore_requests")
+        assert request["status"] == "published"
+        assert fetchone(conn, "SELECT count(*) AS n FROM mint.exports WHERE status = 'written'"
+                        " AND kind = 'checkpoint'")["n"] >= 1
+    kept = settings.export_dir / INSTANCE / "restored" / str(request["id"])
+    assert (kept / "latest.json").exists() and (kept / "negative").is_dir()
 
 
-def test_attest_notes_rows_that_are_absent_in_the_restored_database(world):
-    """없음이 곧 차단인 종류는 진행하고 「효력 없음」으로 표시한다."""
+def test_attest_puts_back_a_missing_row_with_the_same_id_and_is_idempotent(world):
     file_epoch = revoke_and_export(world)
     with psycopg.connect(world["restored"], autocommit=True) as conn:
         conn.execute("DELETE FROM mint.orgs WHERE org_id = 'acme'")
     overtake_epoch(world["restored"], file_epoch)
-    with psycopg.connect(world["restored"]) as conn:
-        out = restore.attest(make_ctx(conn), world["settings"], "x")
-        conn.commit()
-    assert out["absent"] == [
-        {"kind": "org", "id": "acme", "note": "복구 DB에 없음(효력 없음)"}]
-    assert out["reapplied"] == []
+    first = attest_restored(world)
+    assert first["reapplied"] == [{"kind": "org", "id": "acme", "was": "missing_row"}]
+    second = attest_restored(world, "한 번 더")  # 반복 attest는 아무것도 다시 하지 않는다
+    assert second["reapplied"] == []
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.orgs")["status"] == "closed"
+        assert fetchone(conn, "SELECT count(*) AS n FROM mint.restore_requests")["n"] == 2
+    assert run_worker(world).state == judge.OK
 
 
 def test_attest_recreates_a_denial_with_the_same_id_so_the_subject_is_denied_again(world):
@@ -176,41 +216,196 @@ def test_attest_recreates_a_denial_with_the_same_id_so_the_subject_is_denied_aga
     overtake_epoch(world["restored"], file_epoch)  # 거부를 만들기 전 시점으로 복구했다
     with psycopg.connect(world["restored"]) as conn:
         assert fetchall(conn, "SELECT id FROM mint.denials") == []
-        out = restore.attest(make_ctx(conn), world["settings"], "복구 확인")
-        conn.commit()
-    assert out["reapplied"] == [{"kind": "denial", "id": str(denial), "recreated": True}]
+    out = attest_restored(world)
+    assert out["reapplied"] == [{"kind": "denial", "id": str(denial), "was": "missing_row"}]
     with psycopg.connect(world["restored"]) as conn:
         row = fetchone(conn, "SELECT * FROM mint.denials")
         assert row["id"] == denial and row["lifted_at"] is None
         assert (row["scope_type"], row["scope_id"], row["reason"]) == ("org", "acme", "유출 의심")
 
 
-def test_the_first_checkpoint_after_release_leaves_the_exports_row(world):
-    from mint_litellm.control.worker import RestoreCheck, Worker
+def seed_rows(url):
+    """서버 하나와 활성 관계·승인 하나(복구 DB에도 있는 것)."""
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute("INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256,"
+                     " transport, auth_type, registered_by) VALUES (gen_random_uuid(), %s, 's1',"
+                     " 'awaiting_approval', repeat('a', 64), 'http', 'none', 'x')", (INSTANCE,))
+        conn.execute("UPDATE mint.servers SET status = 'approved'")
+        return add_relation_with_approval(conn, "ops")
+
+
+def add_relation_with_approval(conn, purpose):
+    rel = fetchone(conn, "INSERT INTO mint.usage_relations (id, instance_id, org_id, purpose,"
+                   " server_id) VALUES (gen_random_uuid(), %s, 'acme', %s, 's1') RETURNING id",
+                   (INSTANCE, purpose))["id"]
+    appr = fetchone(
+        conn, "INSERT INTO mint.approvals (id, instance_id, org_id, relation_id, class, server_id,"
+        " tools, scope_type, scope_id, valid_from, valid_until, basis, granted_by, requested_by,"
+        " status) VALUES (gen_random_uuid(), %s, 'acme', %s, 'standard', 's1', ARRAY['t'], 'user',"
+        " 'u1', now() - interval '1 day', now() + interval '30 days', '{}', 'root', 'x', 'active')"
+        " RETURNING id", (INSTANCE, rel))["id"]
+    return rel, appr
+
+
+def test_attest_restores_revocation_history_and_a_terminated_relation_beside_an_active_one(
+    fresh_db, login_roles, tmp_path
+):
+    """철회 이력(사유·시각)과 종료 관계를 되돌리고 다른 활성 승인은 건드리지 않는다."""
+    base = conninfo_to_dict(fresh_db)["dbname"]
+    with psycopg.connect(fresh_db) as conn:
+        ensure(conn, INSTANCE)
+        conn.execute("INSERT INTO mint.orgs (instance_id, org_id, name) VALUES (%s, 'acme', 'a')",
+                     (INSTANCE,))
+        conn.commit()
+    seed_rows(fresh_db)  # 서버(복구 DB에도 있다)와 활성 관계·승인 하나
+    clone = f"{base}_restored"
+    with psycopg.connect(url_for(fresh_db, "postgres"), autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{clone}" TEMPLATE "{base}"')
+    settings = Stage2Settings.from_env(
+        {"MINT_EXPORT_DIR": str(tmp_path / "ex"), "MINT_EXPORT_HMAC_KEY": KEY})
+    world = {"live": fresh_db, "restored": url_for(fresh_db, clone), "settings": settings,
+             "clone": clone}
+    try:
+        with psycopg.connect(fresh_db, autocommit=True) as conn:
+            rel, appr = add_relation_with_approval(conn, "audit")  # 복구 시점 뒤에 생김
+            conn.execute("UPDATE mint.approvals SET status = 'revoked', revoked_at = now(),"
+                         " revoke_reason = '유출 의심' WHERE id = %s", (appr,))
+            conn.execute("UPDATE mint.usage_relations SET status = 'terminating' WHERE id = %s",
+                         (rel,))
+            conn.execute("UPDATE mint.usage_relations SET status = 'terminated' WHERE id = %s",
+                         (rel,))
+            revoked_at = fetchone(conn, "SELECT revoked_at FROM mint.approvals WHERE id = %s",
+                                  (appr,))["revoked_at"]
+            exports.write_export(conn, INSTANCE, settings, "negative_state")
+            exports.write_export(conn, INSTANCE, settings, "checkpoint")
+            file_epoch = fetchone(conn, "SELECT epoch FROM mint.state_epoch")["epoch"]
+        overtake_epoch(world["restored"], file_epoch)
+        out = attest_restored(world)
+        assert {(r["kind"]) for r in out["reapplied"]} == {"relation", "approval"}
+        with psycopg.connect(world["restored"], autocommit=True) as conn:
+            row = fetchone(conn, "SELECT * FROM mint.approvals WHERE id = %s", (appr,))
+            assert row["status"] == "revoked" and row["revoke_reason"] == "유출 의심"
+            assert row["revoked_at"] == revoked_at and row["granted_by"] == "root"
+            assert fetchone(conn, "SELECT status FROM mint.usage_relations WHERE id = %s",
+                            (rel,))["status"] == "terminated"
+            others = fetchall(conn, "SELECT status FROM mint.approvals WHERE id <> %s", (appr,))
+            assert [r["status"] for r in others] == ["active"]  # 다른 활성 승인은 그대로
+            assert fetchone(conn, "SELECT status FROM mint.usage_relations"
+                            " WHERE purpose = 'ops'")["status"] == "active"
+        assert run_worker(world).state == judge.OK
+    finally:
+        with psycopg.connect(url_for(fresh_db, "postgres"), autocommit=True) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{clone}" WITH (FORCE)')
+
+
+def test_attest_refuses_and_lists_rows_whose_parents_are_missing(world):
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        conn.execute("INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256,"
+                     " transport, auth_type, registered_by) VALUES (gen_random_uuid(), %s, 's9',"
+                     " 'awaiting_approval', repeat('a', 64), 'http', 'none', 'x')", (INSTANCE,))
+        conn.execute("UPDATE mint.servers SET status = 'approved'")
+        rel, appr = add_relation_with_approval_s9(conn)
+        conn.execute("UPDATE mint.approvals SET status = 'revoked', revoked_at = now() "
+                     "WHERE id = %s", (appr,))
+        exports.write_export(conn, INSTANCE, world["settings"], "negative_state")
+        exports.write_export(conn, INSTANCE, world["settings"], "checkpoint")
+        file_epoch = fetchone(conn, "SELECT epoch FROM mint.state_epoch")["epoch"]
+    overtake_epoch(world["restored"], file_epoch)
+    with psycopg.connect(world["restored"]) as conn:
+        with pytest.raises(ControlError, match=f"approval:{appr}"):
+            restore.attest(make_ctx(conn), world["settings"], "x")
+    with psycopg.connect(world["restored"], autocommit=True) as conn:  # 아무것도 커밋되지 않았다
+        assert fetchall(conn, "SELECT id FROM mint.approvals") == []
+        assert fetchall(conn, "SELECT id FROM mint.restore_requests") == []
+
+
+def add_relation_with_approval_s9(conn):
+    rel = fetchone(conn, "INSERT INTO mint.usage_relations (id, instance_id, org_id, purpose,"
+                   " server_id) VALUES (gen_random_uuid(), %s, 'acme', 'p', 's9') RETURNING id",
+                   (INSTANCE,))["id"]
+    appr = fetchone(
+        conn, "INSERT INTO mint.approvals (id, instance_id, org_id, relation_id, class, server_id,"
+        " tools, scope_type, scope_id, valid_from, valid_until, basis, granted_by, requested_by,"
+        " status) VALUES (gen_random_uuid(), %s, 'acme', %s, 'standard', 's9', ARRAY['t'], 'user',"
+        " 'u1', now() - interval '1 day', now() + interval '30 days', '{}', 'root', 'x', 'active')"
+        " RETURNING id", (INSTANCE, rel))["id"]
+    return rel, appr
+
+
+def test_a_publish_that_dies_midway_keeps_the_block_and_converges_on_rerun(world, monkeypatch):
+    from mint_litellm.control import jobs
 
     file_epoch = revoke_and_export(world)
     overtake_epoch(world["restored"], file_epoch)
     settings = world["settings"]
-    with psycopg.connect(world["restored"]) as conn:
-        restore.attest(make_ctx(conn), settings, "복구 확인")
-        conn.commit()
+    attest_restored(world)
+    real = exports.write_export
+    calls = []
+
+    def dying(*args, **kwargs):
+        if kwargs.get("republish"):
+            calls.append(1)
+        if kwargs.get("republish") and len(calls) == 1:
+            raise OSError("killed")  # 보관은 끝났고 새 파일은 아직 없다
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(exports, "write_export", dying)
+    verdict = run_worker(world)
+    assert verdict.blocked  # 새 latest.json이 없어 차단이 유지된다
+    assert verdict_of(world["restored"], settings).blocked
     with psycopg.connect(world["restored"], autocommit=True) as conn:
-        before = fetchone(conn, "SELECT count(*) AS n FROM mint.exports"
-                          " WHERE kind = 'checkpoint' AND status = 'written'")["n"]
-    login = url_for(world["restored"], world["clone"], "mint_worker")
-    worker = Worker(login, INSTANCE, settings, restore_check=RestoreCheck(settings, 0))
+        job = fetchone(conn, "SELECT * FROM mint.jobs WHERE kind = 'restore_publish'")
+        assert job["status"] == "pending" and job["attempts"] == 1
+        conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'")
+    assert run_worker(world).state == judge.OK  # 재수렴: 보관은 다시 하지 않는다
+    kept = list((settings.export_dir / INSTANCE / "restored").iterdir())
+    assert len(kept) == 1 and (kept[0] / "latest.json").exists()
+    assert jobs.KINDS["restore_publish"].external_write is False
+
+
+def test_a_lost_lease_stops_the_publish_and_a_second_run_finishes_it(world, monkeypatch):
+    from mint_litellm.control import jobs
+
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    real = exports.write_export
+    state = {"first": True}
+
+    def losing(*args, **kwargs):
+        if state["first"] and kwargs.get("republish"):
+            state["first"] = False
+            raise jobs.Cancelled  # 임대를 잃어 외부 쓰기를 멈춘다
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(exports, "write_export", losing)
+    assert run_worker(world).state == judge.OK  # 멈춘 작업은 시도로 세지 않고 바로 이어서 끝난다
+    assert state["first"] is False
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        job = fetchone(conn, "SELECT * FROM mint.jobs WHERE kind = 'restore_publish'")
+        assert job["status"] == "done" and job["attempts"] == 0
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "published"
+
+
+def test_concurrent_publishers_are_serialized_by_the_instance_lock(world):
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    settings = world["settings"]
+    holder = psycopg.connect(world["restored"], autocommit=True)
     try:
-        worker.open()
-        worker.enqueue_startup_checkpoint()
-        while worker.step():
-            pass
-        assert worker.verdict.state == judge.OK
+        holder.execute("SELECT pg_advisory_lock(hashtext(%s))",
+                       (f"mint.restore_publish:{INSTANCE}",))
+        run_worker(world)  # 다른 실행기가 게시 중이면 이 실행기는 물러난다(파일은 그대로)
+        assert not (world["settings"].export_dir / INSTANCE / "restored").exists()
+        with psycopg.connect(world["restored"], autocommit=True) as conn:
+            job = fetchone(conn, "SELECT * FROM mint.jobs WHERE kind = 'restore_publish'")
+            assert job["status"] == "pending" and job["attempts"] == 1
+            conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'")
     finally:
-        worker.close()
-    with psycopg.connect(world["restored"], autocommit=True) as conn:
-        after = fetchone(conn, "SELECT count(*) AS n FROM mint.exports"
-                         " WHERE kind = 'checkpoint' AND status = 'written'")["n"]
-    assert after >= before + 1  # 기동 체크포인트(와 일정이 등록한 것)가 행을 남긴다
+        holder.close()  # 세션 잠금이 풀린다
+    assert run_worker(world).state == judge.OK
+    assert verdict_of(world["restored"], settings).state == judge.OK
 
 
 def test_accept_stale_needs_two_admins_and_a_missing_or_unverified_file(world):
@@ -228,31 +423,37 @@ def test_accept_stale_needs_two_admins_and_a_missing_or_unverified_file(world):
             restore.accept_stale(ctx, settings, "r", operator("same", "root-user"))
         with pytest.raises(ControlError, match="두 번째 승인"):
             restore.accept_stale(ctx, settings, "r", operator("v", "u9", role="viewer"))
-        assert judge.Judge().evaluate(
-            conn, settings.export_dir, INSTANCE, exports.keys(settings)).cause == "export_missing"
         out = restore.accept_stale(ctx, settings, "볼륨 복구", operator("second", "u2"))
         conn.commit()
         assert out["cause"] == "missing"
-        verdict = judge.Judge().evaluate(
-            conn, settings.export_dir, INSTANCE, exports.keys(settings))
-        assert verdict.state == judge.OK
+    assert not latest.exists()  # 명령은 파일을 쓰지 않는다
+    assert verdict_of(world["live"], settings).cause == "export_missing"
+    assert run_worker(world, "live").state == judge.OK  # 차단 중에도 게시 작업은 돈다
+    with psycopg.connect(world["live"], autocommit=True) as conn:
         kinds = [r["kind"] for r in fetchall(conn, "SELECT kind FROM mint.events")]
         assert "restore_stale_accepted" in kinds
-    # 증거로 남은 옛 부정 상태 파일은 지우지 않고 이름만 바뀐다
-    assert list((settings.export_dir / INSTANCE).glob("negative.stale-*"))
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "published"
 
 
-def test_unverifiable_files_are_set_aside_by_accept_stale(world, tmp_path):
+def test_unverifiable_files_are_set_aside_by_the_published_accept_stale(world):
     revoke_and_export(world)
     settings = world["settings"]
     other = Stage2Settings.from_env(
         {"MINT_EXPORT_DIR": str(settings.export_dir), "MINT_EXPORT_HMAC_KEY": "B" * 43})
+    assert verdict_of(world["live"], other).cause == "export_unverified"
     with psycopg.connect(world["live"]) as conn:
-        verdict = judge.Judge().evaluate(
-            conn, other.export_dir, INSTANCE, exports.keys(other))
-        assert verdict.cause == "export_unverified"
-        restore.accept_stale(make_ctx(conn), other, "키 분실", operator("second", "u2"))
+        out = restore.accept_stale(make_ctx(conn), other, "키 분실", operator("second", "u2"))
         conn.commit()
-        assert judge.Judge().evaluate(
-            conn, other.export_dir, INSTANCE, exports.keys(other)).state == judge.OK
+    assert run_worker(world, "live", other).state == judge.OK
+    kept = settings.export_dir / INSTANCE / "restored" / out["request_id"]
+    assert (kept / "latest.json").exists()  # 증거는 지우지 않고 옮겨 둔다
 
+
+def test_the_first_checkpoint_after_release_leaves_the_exports_row(world):
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    assert run_worker(world).state == judge.OK
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        rows = fetchall(conn, "SELECT kind, status FROM mint.exports WHERE status = 'written'")
+    assert {"negative_state", "checkpoint"} <= {r["kind"] for r in rows}

@@ -47,6 +47,8 @@ KINDS: dict[str, JobKind] = {
     "approval_expiry_scan": JobKind(),
     "evidence_expiry_scan": JobKind(),
     "session_verify": JobKind(),
+    # 해제 경로: 되돌림 차단 상태에서도 실행한다(외부 쓰기 목록에 넣지 않는다).
+    "restore_publish": JobKind(),
 }
 
 # 우선순위: export_negative_state > sync_* > 나머지(같으면 run_after 순).
@@ -118,6 +120,12 @@ def _export_negative_state(job: JobContext) -> None:
     exports.export_negative_state(job)
 
 
+def _restore_publish(job: JobContext) -> None:
+    from mint_litellm.control import restore_publish
+
+    restore_publish.publish(job)
+
+
 def _export_checkpoint(job: JobContext) -> None:
     from mint_litellm.control import exports
 
@@ -130,6 +138,7 @@ HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "seal": _seal,
     "export_negative_state": _export_negative_state,
     "export_checkpoint": _export_checkpoint,
+    "restore_publish": _restore_publish,
 }
 
 # 일정(주기 작업): 종류 -> 설정에서 주기(초)를 얻는 함수. 처리기가 있는 종류만 일정을 만든다.

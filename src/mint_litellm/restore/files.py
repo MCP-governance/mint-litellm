@@ -14,7 +14,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from mint_litellm.types.frozen import no_floats
+
 FORMAT = 1
+
+# 서명 입력은 ``hmac`` 필드를 뺀 본문 전체이고, 배열은 저장 순서, 시각은 UTC ISO 8601 초 단위 ``Z``,
+# 자료형은 문자열·정수·참거짓·null·배열·객체뿐이다.
 
 
 class ExportUnverified(Exception):
@@ -31,19 +36,11 @@ def key_id(key: bytes) -> str:
 CANONICAL_JSON = {"sort_keys": True, "separators": (",", ":"), "ensure_ascii": False}
 
 
-def _no_floats(value: Any) -> None:
-    if isinstance(value, float):
-        raise ValueError("정규 JSON은 실수 값을 받지 않습니다.")
-    if isinstance(value, dict):
-        for item in value.values():
-            _no_floats(item)
-    elif isinstance(value, list):
-        for item in value:
-            _no_floats(item)
-
-
 def canonical_json(value: Any) -> bytes:
-    _no_floats(value)
+    try:
+        no_floats(value)
+    except ValueError:
+        raise ValueError("정규 JSON은 실수 값을 받지 않습니다.") from None
     return json.dumps(value, **CANONICAL_JSON).encode("utf-8")
 
 
@@ -139,4 +136,4 @@ def newest_negative(export_dir: Path, instance_id: str) -> Path | None:
 
 
 def now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

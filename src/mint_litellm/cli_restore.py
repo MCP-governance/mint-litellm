@@ -130,7 +130,8 @@ def _restore_check(run) -> None:
 def _restore_attest(run) -> None:
     out = restore_service.attest(run.context(), _settings(run), run.args.reason)
     run.data.update(out)
-    run.say(f"복원을 확인했습니다. 세대 {out['db_epoch']}, 다시 적용 {len(out['reapplied'])}건.")
+    run.say(f"복원을 확인했습니다. 세대 {out['db_epoch']}, 되돌린 항목 {len(out['reapplied'])}건. "
+            "새 파일은 작업 실행기가 게시하면(최대 1분) 차단이 풀립니다.")
 
 
 def _second(run):
@@ -146,7 +147,7 @@ def _restore_accept_stale(run) -> None:
     out = restore_service.accept_stale(
         run.context(), _settings(run), run.args.reason, _second(run))
     run.data.update(out)
-    run.say(f"DB 기준 새 파일로 해제했습니다. 세대 {out['db_epoch']}.")
+    run.say(f"해제를 요청했습니다. 세대 {out['db_epoch']}. 새 파일은 작업 실행기가 게시합니다.")
 
 
 HANDLERS = {

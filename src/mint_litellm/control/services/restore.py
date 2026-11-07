@@ -1,14 +1,11 @@
 """복원 확인·해제: ``restore check|attest|accept-stale``.
 
-``check``는 파일의 부정 상태와 DB를 비교해 보여 준다. ``attest``는 누락된 부정 상태를 다시 적용하고
-세대를 파일 세대 + 1로 올린 뒤 사건을 남기고 DB 기준 새 파일을 쓴다.
-``accept-stale``은 파일이 없거나
-검증되지 않을 때 admin 2인이 DB 기준 새 ``latest.json``을 쓰고 해제한다. 증거로 남은 옛 파일은
-지우지 않고 이름만 바꿔 둔다.
+복원 명령은 파일을 쓰지 않는다. ``attest``는 DB에서 누락된 부정 상태를 파일의 행 스냅숏대로
+되돌리고 세대를 파일 세대 + 1로 올린 뒤 복원 요청과 사건을 커밋하고 작업 ``restore_publish``를
+등록한다. ``accept-stale``(admin 2인)은 파일이 없거나 검증되지 않을 때 복원 요청과 사건만 커밋하고
+같은 작업을 등록한다. 파일 보존·게시·검증은 작업 실행기(``control/restore_publish.py``)가 한다.
 """
 
-import shutil
-from datetime import UTC, datetime
 from typing import Any
 
 import psycopg
@@ -17,39 +14,12 @@ from mint_litellm.control import exports
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.errors import ControlError, forbidden, separation_of_duties
+from mint_litellm.control.services import restore_rows
+from mint_litellm.control.services.base import enqueue_job
 from mint_litellm.control.stage2_config import Stage2Settings
 from mint_litellm.restore import judge
 from mint_litellm.types.events import EventKind
-
-# 항목 종류 -> (표, 식별 열, 현재 상태 식)
-_DENIAL = "CASE WHEN lifted_at IS NULL THEN 'active' ELSE 'lifted' END"
-_CONSENT = "CASE WHEN revoked_at IS NULL THEN 'active' ELSE 'revoked' END"
-_ITEMS = {
-    "approval": ("approvals", "id::text", "status"),
-    "denial": ("denials", "id::text", _DENIAL),
-    "server": ("servers", "server_id", "status"),
-    "relation": ("usage_relations", "id::text", "status"),
-    "org": ("orgs", "org_id", "status"),
-    "allowlist": ("allowlists", "id::text", "status"),
-    "consent": ("consents", "id::text", _CONSENT),
-}
-# 다시 적용하는 문장. 거부 해제는 되돌릴 수 없어 적용 대상이 아니다.
-_WHERE = " WHERE instance_id = %s AND "
-_REAPPLY = {
-    "approval": "UPDATE mint.approvals SET status = 'revoked', revoked_at = now()"
-                + _WHERE + "id::text = %s",
-    "server": "UPDATE mint.servers SET status = %s" + _WHERE + "server_id = %s",
-    "relation": "UPDATE mint.usage_relations SET status = %s" + _WHERE + "id::text = %s",
-    "org": "UPDATE mint.orgs SET status = %s" + _WHERE + "org_id = %s",
-    "allowlist": "UPDATE mint.allowlists SET status = 'lifted'" + _WHERE + "id::text = %s",
-    "consent": "UPDATE mint.consents SET revoked_at = now()" + _WHERE + "id::text = %s",
-}
-_DENIAL_COLUMNS = ("org_id", "scope_type", "scope_id", "server_id", "tools", "reason", "created_by")
-_RECREATE_DENIAL = (
-    "INSERT INTO mint.denials (id, instance_id, org_id, scope_type, scope_id, server_id, tools,"
-    " reason, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
-)
-_STATE_PARAM = {"server", "relation", "org"}
+from mint_litellm.types.ids import new_uuid7
 
 
 def _admin(ctx: Context) -> None:
@@ -62,23 +32,27 @@ def _read(settings: Stage2Settings, instance_id: str) -> judge.FileState:
 
 
 def compare(conn: psycopg.Connection, instance_id: str, items: list[dict]) -> list[dict]:
-    """파일의 항목마다 DB의 현재 값과 비교해 어긋난 것만 돌려준다(``problem``: 종류별 사유)."""
+    """파일의 항목마다 DB의 현재 값과 비교해 어긋난 것만 돌려준다."""
     found = []
     for item in items:
-        table, column, state = _ITEMS[item["kind"]]
-        row = fetchone(
-            conn,
-            f"SELECT state_version, {state} AS state FROM mint.{table}"
-            f" WHERE instance_id = %s AND {column} = %s",
-            (instance_id, item["id"]),
-        )
-        if row is None:
-            # 없음이 곧 차단인 종류는 효력 없음, 거부는 없으면 허용이 되므로 다시 만들어야 한다
-            problem = "missing_row" if item["kind"] == "denial" else "absent_no_effect"
-            found.append({**item, "problem": problem})
-        elif row["state"] != item["state"]:
-            found.append({**item, "problem": "reapply", "db_state": row["state"]})
+        current = restore_rows._current(conn, instance_id, item["kind"], item["id"])
+        if current is None:
+            found.append({**item, "problem": "missing_row"})
+            continue
+        _table, _column, status, *_ = restore_rows._META[item["kind"]]
+        if status is not None:
+            state = current[status]
+        elif item["kind"] == "denial":
+            state = "active" if current["lifted_at"] is None else "lifted"
+        else:
+            state = "active" if current["revoked_at"] is None else "revoked"
+        if state != item["state"] or current["state_version"] < item["state_version"]:
+            found.append({**item, "problem": "reapply", "db_state": state})
     return found
+
+
+def _brief(problem: dict) -> dict:
+    return {k: v for k, v in problem.items() if k != "row"}
 
 
 def check(conn: psycopg.Connection, instance_id: str, settings: Stage2Settings) -> dict[str, Any]:
@@ -103,7 +77,7 @@ def check(conn: psycopg.Connection, instance_id: str, settings: Stage2Settings) 
         "last_export_at": since,
         "anchor_ok": bool(facts["anchor_ok"]),
         "mismatch": verdict.state != judge.OK,
-        "items": compare(conn, instance_id, negative.get("items") or []),
+        "items": [_brief(p) for p in compare(conn, instance_id, negative.get("items") or [])],
         # 마지막 성공 전송 이후 구간에 활동이 있었던 서버: LiteLLM 권한의 현재값을 점검한다
         "review_servers": [r["server_id"] for r in activity],
     }
@@ -118,13 +92,23 @@ def _sequence(conn: psycopg.Connection, instance_id: str, epoch: int, kind: Even
     )["n"]
 
 
-def _record(ctx: Context, kind: EventKind, epoch: int, payload: dict[str, Any]) -> None:
-    ctx.emit(kind, epoch, _sequence(ctx.conn, ctx.instance_id, epoch, kind), payload)
+def _request(
+    ctx: Context, kind: str, reason: str, file_epoch: int | None, target: int,
+    cause: str | None, second: str | None,
+) -> str:
+    request_id = str(new_uuid7())
+    ctx.conn.execute(
+        "INSERT INTO mint.restore_requests (id, instance_id, kind, reason, requested_by,"
+        " second_approver, file_epoch, target_epoch, cause) VALUES (%s, %s, %s, %s, %s, %s, %s,"
+        " %s, %s)",
+        (request_id, ctx.instance_id, kind, reason, ctx.operator.name, second, file_epoch,
+         target, cause),
+    )
+    enqueue_job(ctx, "restore_publish", request_id, f"restore_publish:{request_id}")
+    return request_id
 
 
-def attest(
-    ctx: Context, settings: Stage2Settings, reason: str
-) -> dict[str, Any]:
+def attest(ctx: Context, settings: Stage2Settings, reason: str) -> dict[str, Any]:
     _admin(ctx)
     if not reason.strip():
         raise ControlError("--reason이 필요합니다.")
@@ -135,42 +119,24 @@ def attest(
         )
     file_epoch = int(state.latest["state_epoch"])
     items = (state.negative or {}).get("items") or []
-    reapplied, failed, absent = [], [], []
+    rank = {kind: i for i, kind in enumerate(restore_rows.ORDER)}
+    reapplied, failed = [], []
     with ctx.conn.transaction():
-        for problem in compare(ctx.conn, ctx.instance_id, items):
-            kind, ident = problem["kind"], problem["id"]
-            if problem["problem"] == "absent_no_effect":
-                absent.append({"kind": kind, "id": ident, "note": "복구 DB에 없음(효력 없음)"})
-                continue
-            if problem["problem"] == "missing_row":  # 거부: 같은 id로 다시 만든다
-                spec = problem.get("recreate")
-                try:
-                    if spec is None:
-                        raise ValueError
-                    with ctx.conn.transaction():
-                        ctx.conn.execute(_RECREATE_DENIAL, (ident, ctx.instance_id, *(
-                            spec[k] for k in _DENIAL_COLUMNS)))
-                    reapplied.append({"kind": kind, "id": ident, "recreated": True})
-                except (psycopg.Error, ValueError, KeyError):
-                    failed.append({**problem, "problem": "not_applicable"})
-                continue
-            if kind not in _REAPPLY:
-                failed.append(problem)
-                continue
-            params = (ctx.instance_id, ident)
-            if kind in _STATE_PARAM:
-                params = (problem["state"], ctx.instance_id, ident)
+        for problem in sorted(compare(ctx.conn, ctx.instance_id, items),
+                              key=lambda p: rank[p["kind"]]):
             try:
                 with ctx.conn.transaction():
-                    ctx.conn.execute(_REAPPLY[kind], params)
-                reapplied.append({"kind": kind, "id": ident})
-            except psycopg.Error:
-                failed.append({**problem, "problem": "not_applicable"})
+                    restore_rows.restore_item(ctx.conn, ctx.instance_id, problem)
+                reapplied.append({"kind": problem["kind"], "id": problem["id"],
+                                  "was": problem["problem"]})
+            except (psycopg.Error, ValueError) as error:
+                failed.append({"kind": problem["kind"], "id": problem["id"],
+                               "reason": type(error).__name__})
         if failed:
             raise ControlError(
-                "다시 적용하지 못한 부정 상태가 있습니다(행이 없거나 되돌릴 수 없는 전이): "
-                + ", ".join(f"{f['kind']}:{f['id']}" for f in failed)
-                + ". 같은 항목을 일반 명령으로 먼저 등록한 뒤 다시 실행하십시오."
+                "되돌리지 못한 부정 상태가 있습니다(부모 행이 없거나 되돌릴 수 없는 전이): "
+                + ", ".join(f"{f['kind']}:{f['id']}({f['reason']})" for f in failed)
+                + ". 부모 행이 없으면 restore accept-stale(admin 2인)을 쓰십시오."
             )
         target = file_epoch + 1
         current = fetchone(
@@ -182,12 +148,13 @@ def attest(
             ctx.conn.execute(
                 "SELECT mint.restore_attest_epoch(%s, %s)", (ctx.instance_id, current)
             )
-        _record(ctx, EventKind.RESTORE_ATTESTED, file_epoch,
-                {"reason": reason, "file_epoch": file_epoch, "db_epoch": current,
-                 "reapplied": reapplied, "absent": absent})
-    path = exports.write_files(ctx.conn, ctx.instance_id, settings)
+        request_id = _request(ctx, "attest", reason, file_epoch, current, None, None)
+        ctx.emit(EventKind.RESTORE_ATTESTED, file_epoch,
+                 _sequence(ctx.conn, ctx.instance_id, file_epoch, EventKind.RESTORE_ATTESTED),
+                 {"reason": reason, "file_epoch": file_epoch, "db_epoch": current,
+                  "request_id": request_id, "reapplied": reapplied})
     return {"file_epoch": file_epoch, "db_epoch": current, "reapplied": reapplied,
-            "absent": absent, "export": path}
+            "request_id": request_id}
 
 
 def accept_stale(
@@ -211,16 +178,13 @@ def accept_stale(
             "파일이 없거나 검증되지 않는 경우에만 쓸 수 있습니다. "
             "내용 불일치는 restore attest를 쓰십시오."
         )
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    root = settings.export_dir / ctx.instance_id
-    for name in ("latest.json", "negative"):  # 증거는 지우지 않고 이름만 바꾼다
-        path = root / name
-        if path.exists():
-            shutil.move(str(path), str(root / f"{name}.stale-{stamp}"))
-    snap = exports.snapshot(ctx.conn, ctx.instance_id)
     with ctx.conn.transaction():
-        _record(ctx, EventKind.RESTORE_STALE_ACCEPTED, snap["epoch"],
-                {"reason": reason, "second_approver": second.name, "cause": state.error})
-    path = exports.write_files(ctx.conn, ctx.instance_id, settings, force_latest=True)
-    return {"cause": state.error, "db_epoch": snap["epoch"],
-            "latest": path}
+        epoch = fetchone(
+            ctx.conn, "SELECT coalesce(max(epoch), 0) AS e FROM mint.state_epoch"
+            " WHERE instance_id = %s", (ctx.instance_id,))["e"]
+        request_id = _request(ctx, "stale_accepted", reason, None, epoch, state.error, second.name)
+        ctx.emit(EventKind.RESTORE_STALE_ACCEPTED, epoch,
+                 _sequence(ctx.conn, ctx.instance_id, epoch, EventKind.RESTORE_STALE_ACCEPTED),
+                 {"reason": reason, "second_approver": second.name, "cause": state.error,
+                  "request_id": request_id})
+    return {"cause": state.error, "db_epoch": epoch, "request_id": request_id}

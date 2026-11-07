@@ -151,7 +151,11 @@ def test_the_negative_state_file_is_signed_received_and_latest_follows(
     keys = exports.keys(settings)
     path = files.negative_path(settings.export_dir, INSTANCE, epoch(admin))
     doc = files.read_verified(path, keys)
-    assert doc["items"] == [{"kind": "org", "id": "a", "state_version": 2, "state": "closed"}]
+    [item] = doc["items"]  # 항목마다 행 전체 스냅숏(모든 열)이 들어 있다
+    assert (item["kind"], item["id"], item["state_version"], item["state"]) == (
+        "org", "a", 2, "closed")
+    assert item["row"] == {"instance_id": INSTANCE, "org_id": "a", "name": "a",
+                           "status": "closed", "state_version": 2}
     assert doc["key_id"] == files.key_id(settings.export_hmac_key)
     latest = files.read_verified(files.latest_path(settings.export_dir, INSTANCE), keys)
     assert latest["state_epoch"] == epoch(admin) and latest["to_seal_seq"] == doc["to_seal_seq"]
@@ -355,3 +359,38 @@ def test_canonical_json_is_fixed_and_rejects_floats():
         files.canonical_json({"a": [1.5]})
     with pytest.raises(ValueError):
         files.sign({"x": 0.1}, b"k" * 32)
+
+
+# 공통 시험 벡터: 다른 구현이 같은 서명을 만들어 내는지 확인하는 고정 값이다.
+VECTOR_DOC = {"b": [3, 1, 2], "a": {"z": "한글", "y": None, "x": True}, "key_id": "x"}
+VECTOR_CANONICAL = '{"a":{"x":true,"y":null,"z":"한글"},"b":[3,1,2],"key_id":"x"}'
+VECTOR_HMAC = "017223bfcfe283c6d7d669ae50c869dded2723fbc166dafd7c7ebc96317d0847"
+
+
+def test_signature_test_vector_is_fixed():
+    import hashlib
+    import hmac
+    import re
+
+    key = b"k" * 32
+    assert files.canonical_json(VECTOR_DOC) == VECTOR_CANONICAL.encode("utf-8")
+    digest = hmac.new(key, VECTOR_CANONICAL.encode("utf-8"), hashlib.sha256).hexdigest()
+    assert digest == VECTOR_HMAC
+    # 서명 입력은 hmac 필드를 뺀 본문 전체(key_id 포함)이고 배열은 저장 순서 그대로다
+    signed = files.sign({k: v for k, v in VECTOR_DOC.items() if k != "key_id"}, key)
+    assert signed["key_id"] == files.key_id(key)
+    body = {k: v for k, v in signed.items() if k != "hmac"}
+    assert signed["hmac"] == hmac.new(key, files.canonical_json(body), hashlib.sha256).hexdigest()
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", files.now())  # UTC 초 단위 Z
+
+
+def test_events_refuse_float_payloads():
+    from datetime import UTC, datetime
+
+    from mint_litellm.types.events import Event, EventKind
+
+    base = dict(instance_id="i", inserted_at=datetime.now(UTC), kind=EventKind.ORG_CREATED,
+                source_key="org:a:1:org_created", actor="x")
+    Event(**base, payload={"n": 1})
+    with pytest.raises(ValueError):
+        Event(**base, payload={"n": [1.5]})
