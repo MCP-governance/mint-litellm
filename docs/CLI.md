@@ -47,6 +47,8 @@
 | `mint-litellm settings observable` | `admin` | 관측 모드로 전환할 수 있는 사유 계열과 정책을 정한다. | - | `settings_changed` |
 | `mint-litellm policy activate` | `admin` | 정책 번들을 검증하고 정책 엔진에 적재한 뒤 활성 판본으로 전환한다. | - | `policy_activated` |
 | `mint-litellm ledger list` | 모든 역할 | 원장 사건을 종류·기간·호출 식별자로 조회한다. | - | - |
+| `mint-litellm sync status` | 모든 역할 | LiteLLM에 반영한 키·팀·서버 권한의 확인 상태, 외부 삭제 횟수, 보류 여부를 조회한다. | - | - |
+| `mint-litellm sync resume` | `admin` | 반복 외부 삭제로 보류된 항목을 풀고 다시 부여한다. | - | `sync_applied` |
 
 ## 정책 활성화 실패와 복원
 
@@ -70,6 +72,10 @@
 - 이 판본에서 처리기가 있는 작업은 `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시)뿐이다. 나머지 종류(동기화·관측·봉인·내보내기·경보 전송 등)는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
 - 되돌림 판정은 아직 없어 언제나 정상으로 본다. 판정이 들어오면 되돌림 상태에서 외부 쓰기 작업은 실행되지 않고 `restore_blocked`로 대기한다.
 - SIGTERM·SIGINT를 받으면 실행 중인 작업에 취소를 알린다. 작업이 그대로 끝나면 완료로 기록하고, 취소를 받아 멈추면 시도 횟수를 올리지 않고 임대를 놓은 뒤 종료한다.
+
+## 권한 동기화 `sync`
+
+작업 실행기가 키·팀 범위 승인을 LiteLLM의 `object_permission`(`mcp_servers`, `mcp_tool_permissions`)에 맞춘다. 쓸 때마다 MINT가 넣지 않은 항목은 그대로 둔 전체 목록과 전체 맵을 보내고, 쓴 뒤 다시 읽어 반영 여부를 확인한다. 팀 소속 키는 팀이 허용한 서버만 받을 수 있어 팀이 먼저 맞춰진다. `MINT_RECONCILE_SECONDS`마다 재조회해 MINT가 반영한 항목이 외부에서 지워졌으면 다시 부여한다. 같은 항목이 `MINT_SYNC_HOLD_WINDOW_SECONDS` 안에 다시 지워지면 그 항목은 보류되어 다시 부여하지 않고 경보 `sync_divergence`와 사건 `sync_held`를 남긴다. `sync status --held`로 찾아 `sync resume <id>`로 풀거나, 승인을 철회한다. 작업 실행기가 LiteLLM을 부르려면 `MINT_LITELLM_URL`과 `MINT_LITELLM_KEY`가 필요하다.
 
 ## 서버를 LiteLLM에서 삭제하는 순서
 
@@ -137,6 +143,7 @@
 | `init` | `migrations`(이번에 적용한 마이그레이션), `login_roles`(설정한 로그인 역할), `snippet_path`(설정 조각 파일) 또는 `snippet`(`--out -`일 때 본문) |
 | `check` | `incomplete`(확인하지 못한 필수 행), `findings`(각 항목 `item`, `level`=`OK`·`INFO`·`WARN`·`FAIL`·`SKIP`, `message`), `observations`(관측 4항목) |
 | `status` | `instance_id`, `mode`(`stored`, `ceiling`, `effective`), `default_org_id`, `policy_version`, `policy_bundle`(`state`: `match`·`mismatch`·`unverified`·`none`, `detail`), `servers`(상태별 개수), `enforcement`(워커별 최근 집행 점검 전환: `worker_id`, `passed`, `failed`, `last_transition_at`, `run_id`), `alerts`, `observations` |
+| `sync status` | `grants`(각 항목 `id`, `target_type`, `target_id`, `item`, `server_id`, `tools`, `preexisting`, `observed`, `missing_count`, `held`, `held_at`, `last_applied_at`, `state_version`) |
 | `ledger list` | `events`(각 항목 `event_id`, `inserted_at`, `kind`, `source_key`, `invocation_id`, `attempt_id`, `actor`, `subject`, `payload`, `final`) |
 
 ## 종료 코드

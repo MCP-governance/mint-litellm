@@ -256,6 +256,18 @@ COMMANDS: tuple[CliCommand, ...] = (
         events=(EventKind.POLICY_ACTIVATED,),
     ),
     CliCommand(
+        path=("sync", "status"),
+        summary="LiteLLM에 반영한 키·팀·서버 권한의 확인 상태, 외부 삭제 횟수, 보류 여부를 "
+        "조회한다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("sync", "resume"),
+        summary="반복 외부 삭제로 보류된 항목을 풀고 다시 부여한다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.SYNC_APPLIED,),
+    ),
+    CliCommand(
         path=("ledger", "list"),
         summary="원장 사건을 종류·기간·호출 식별자로 조회한다.",
         roles=ALL_ROLES,
