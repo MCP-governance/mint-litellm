@@ -66,9 +66,9 @@
 `mint-litellm console`은 상주 프로세스다. FastAPI와 서버 렌더링 화면(Jinja2, HTMX, ECharts)을 한 프로세스로 띄우며 빌드 단계와 외부 자산이 없다(응답 헤더 `Content-Security-Policy: default-src 'self'`). `MINT_DATABASE_URL`은 `mint_control_app` 로그인의 주소여야 하고, `MINT_LITELLM_URL`(로그인 확인용)과 `MINT_EXPORT_DIR`·`MINT_EXPORT_HMAC_KEY`가 없으면 기동을 거부한다. `--host`(기본 `localhost`)·`--port`(기본 8080)·`--ssl-certfile`·`--ssl-keyfile`을 받는다. 쿠키는 항상 `Secure`이므로 브라우저는 HTTPS(또는 `localhost`)로 접속해야 한다.
 
 - **로그인**: 사람이 자기 LiteLLM 키를 낸다. 콘솔은 그 키로 `GET /key/info`와 `GET /user/info`를 부르고(키가 차단·만료·미등록이거나 마스터 키이거나 사용자에 결속되지 않았거나 사람 사용자가 아니면 거부) 평문 키를 바로 버린다. 그 사용자에 결속된 유효한 운영자(`operators`) 행이 있어야 하고, 화면 권한은 그 행의 역할이다.
-- **세션**: `__Host-mint_session` 쿠키(`HttpOnly`·`Secure`·`SameSite=Strict`), 유휴 30분·절대 8시간(`MINT_SESSION_IDLE_SECONDS`·`MINT_SESSION_ABSOLUTE_SECONDS`). 변경 요청은 CSRF 토큰(`X-CSRF-Token` 헤더 또는 폼 필드 `csrf`)과 같은 출처가 필요하다. 작업 실행기가 `MINT_SESSION_VERIFY_SECONDS`(기본 300)마다 제어 평면 키로 세션의 키·사용자·운영자 행을 다시 확인하고 맞지 않으면 폐기한다(그래서 작업 실행기에는 `MINT_LITELLM_URL`·`MINT_LITELLM_KEY`가 필요하다).
+- **세션**: `__Host-mint_session` 쿠키(`HttpOnly`·`Secure`·`SameSite=Strict`), 유휴 30분·절대 8시간(`MINT_SESSION_IDLE_SECONDS`·`MINT_SESSION_ABSOLUTE_SECONDS`). 변경 요청은 CSRF 토큰(`X-CSRF-Token` 헤더 또는 폼 필드 `csrf`)과 같은 출처가 필요하다. 작업 실행기가 `MINT_SESSION_VERIFY_SECONDS`(기본 300)마다 제어 평면 키로 세션의 키·사용자·운영자 행을 다시 확인하고 맞지 않으면 폐기한다. LiteLLM에 닿지 못하면 2주기까지는 세션을 유지하고 그 뒤에는 확인하지 못한 세션을 폐기한다(그래서 작업 실행기에는 `MINT_LITELLM_URL`·`MINT_LITELLM_KEY`가 필요하다).
 - **HTTP API** `/api/v1/<자원>`: 세션 쿠키 또는 `Authorization: Bearer <운영자 토큰>`. 변경 요청은 대상의 `state_version`을 보내야 하며 다르면 `409 MINT-ADMIN-CONFLICT`이다. 오류 본문은 `{code, message, reference}`이고 `X-Request-Id` 응답 헤더가 `reference`와 같다(사건이 있는 오류는 사건 키). 자원: `overview`, `servers`, `relations`, `approvals`, `denials`, `call-approvals`, `orgs`, `operators`, `allowlists`, `settings`, `policy/versions`, `ledger`(`/ledger/export?format=csv|json`).
-- 승인(`POST /approvals`)·운영자 등록·서버 등록은 LiteLLM 읽기가 필요하다. 콘솔 프로세스에 `MINT_LITELLM_KEY`가 없으면 거부하고, 그 변경은 명령줄에서 한다.
+- 승인(`POST /approvals`)·운영자 등록·서버 등록은 LiteLLM 읽기가 필요하다. 콘솔은 제어 평면 키(`MINT_LITELLM_KEY`)를 읽기 경로 전용 클라이언트로만 쓰며(쓰기는 작업 실행기만) 설치 기본은 키를 설정하는 것이다. 키가 없으면 이 동작은 거부되고 명령줄에서 한다. 오류 코드는 `MINT-ADMIN-<이유>`(`…-INVALID-INPUT`·`…-UNAVAILABLE` 포함)이다.
 
 ## 작업 실행기 `mint-litellm worker`
 

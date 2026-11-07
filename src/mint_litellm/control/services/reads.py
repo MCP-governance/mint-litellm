@@ -317,7 +317,9 @@ def ledger_filters(conn: psycopg.Connection, instance: str) -> dict[str, list[st
 # --- 개요 -----------------------------------------------------------------------------------
 
 
-def overview(conn: psycopg.Connection, instance: str) -> dict[str, Any]:
+def overview(
+    conn: psycopg.Connection, instance: str, handled: list[str] | None = None
+) -> dict[str, Any]:
     def one(sql: str, *params: Any) -> Any:
         row = fetchone(conn, sql, (instance, *params))
         return next(iter(row.values())) if row else None
@@ -350,7 +352,16 @@ def overview(conn: psycopg.Connection, instance: str) -> dict[str, Any]:
         " GROUP BY 1 ORDER BY 1",
         (instance,),
     )
+    unhandled = fetchone(
+        conn,
+        "SELECT count(*) AS n, max(EXTRACT(EPOCH FROM now() - created_at)) AS oldest"
+        " FROM mint.jobs WHERE instance_id = %s AND status = 'pending'"
+        " AND NOT (kind = ANY(%s))",
+        (instance, handled or []),
+    )
     return {
+        "unhandled_jobs": unhandled["n"],
+        "unhandled_oldest_seconds": unhandled["oldest"],
         "pending_servers": one(
             "SELECT count(*) FROM mint.servers WHERE instance_id = %s"
             " AND status = 'awaiting_approval'"

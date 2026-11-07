@@ -28,7 +28,18 @@ STATUS = {
     AdminCode.CONFLICT: 409,
     AdminCode.STALE_EVIDENCE: 409,
 }
-INVALID = "MINT-INVALID-INPUT"
+INVALID = "MINT-ADMIN-INVALID-INPUT"
+
+
+class ReadOnlyLiteLLM:
+    """제어 평면 키의 읽기 경로 전용 클라이언트. 쓰기 메서드가 없고 확인 읽기 다섯 가지만 낸다."""
+
+    def __init__(self, admin: LiteLLMAdmin) -> None:
+        self.get_key = admin.get_key
+        self.get_team = admin.get_team
+        self.get_user = admin.get_user
+        self.get_server = admin.get_server
+        self.list_servers = admin.list_servers
 
 
 class Unauthenticated(AdminError):
@@ -44,7 +55,7 @@ class ConsoleConfig:
     stage2: Stage2Settings
     litellm_url: str
     # 승인·운영자 등록처럼 LiteLLM 읽기가 필요한 변경에만 쓴다. 없으면 그 변경은 거부한다.
-    litellm_admin: LiteLLMAdmin | None
+    litellm_admin: ReadOnlyLiteLLM | None
     database_url: str
 
     @classmethod
@@ -53,7 +64,7 @@ class ConsoleConfig:
         stage2 = Stage2Settings.from_env(env)
         if not control.litellm_url:
             raise ControlError("MINT_LITELLM_URL이 설정되어 있지 않습니다.")
-        admin = control.litellm() if control.litellm_key else None
+        admin = ReadOnlyLiteLLM(control.litellm()) if control.litellm_key else None
         return cls(control, stage2, control.litellm_url, admin, control.require_database())
 
     @property
@@ -85,7 +96,7 @@ class Actor:
     def csrf(self) -> str:
         return console_sessions.csrf_token(self.session_id) if self.session_id else ""
 
-    def litellm(self) -> LiteLLMAdmin:
+    def litellm(self) -> ReadOnlyLiteLLM:
         if self.config.litellm_admin is None:
             raise AdminError(
                 AdminCode.FORBIDDEN,

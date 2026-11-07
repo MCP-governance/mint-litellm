@@ -67,7 +67,7 @@ def create_app(
         fields = ", ".join(".".join(str(p) for p in e["loc"][1:]) or "본문" for e in error.errors())
         return JSONResponse(
             {
-                "code": "MINT-INVALID-INPUT",
+                "code": "MINT-ADMIN-INVALID-INPUT",
                 "message": f"요청 값이 올바르지 않습니다: {fields}",
                 "reference": request.state.request_id,
             },
@@ -78,7 +78,7 @@ def create_app(
     async def database_error(request: Request, error: psycopg.Error):
         return JSONResponse(
             {
-                "code": "MINT-UNAVAILABLE",
+                "code": "MINT-ADMIN-UNAVAILABLE",
                 "message": "데이터베이스 요청을 처리하지 못했습니다.",
                 "reference": request.state.request_id,
             },

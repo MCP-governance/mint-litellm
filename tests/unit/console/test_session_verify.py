@@ -155,3 +155,30 @@ def test_revoking_a_users_sessions_ends_all_of_them(world):
             conn, INSTANCE, "human-2", actor="admin", reason="operator_changed")
     assert count == 2 and live(world) == []
 
+
+
+def test_an_unreachable_litellm_keeps_a_session_for_two_periods_then_revokes_it(world):
+    world.session_client("admin")
+    world.session_client("viewer")
+    world.query("UPDATE mint.console_sessions SET last_verified_at = now() - interval '9 minutes'"
+                " WHERE user_id = 'human-1'")
+    world.query("UPDATE mint.console_sessions SET last_verified_at = now() - interval '11 minutes'"
+                " WHERE user_id = 'human-3'")
+    conn = as_login(world.admin_url, "mint_worker")
+    conn.autocommit = True
+    broken = LiteLLMAdmin("http://localhost:9", CONTROL_KEY, timeout=1)
+    settings = Stage2Settings.from_env(
+        {"MINT_EXPORT_DIR": "/tmp/x", "MINT_EXPORT_HMAC_KEY": "A" * 43})
+    with pytest.raises(LiteLLMError):
+        session_verify.run(jobs.JobContext(conn, INSTANCE, {}, settings, broken))
+    conn.close()
+    assert live(world) == [("human-1",)]
+    assert end_reasons(world) == ["unverified"]
+
+
+def test_the_console_holds_the_control_key_only_through_a_read_only_client():
+    from mint_litellm.console.core import ReadOnlyLiteLLM
+
+    client = ReadOnlyLiteLLM(LiteLLMAdmin("http://localhost:9", CONTROL_KEY))
+    assert sorted(vars(client)) == [
+        "get_key", "get_server", "get_team", "get_user", "list_servers"]

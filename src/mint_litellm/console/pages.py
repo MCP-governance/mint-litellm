@@ -10,6 +10,7 @@ from fastapi.responses import RedirectResponse, Response
 from mint_litellm.console import api
 from mint_litellm.console.core import STATUS, Actor, page_actor, require_csrf
 from mint_litellm.console.templating import render
+from mint_litellm.control import jobs
 from mint_litellm.control import status as control_status
 from mint_litellm.control.errors import AdminCode, AdminError, ControlError
 from mint_litellm.control.services import allowlists as allowlist_service
@@ -54,7 +55,7 @@ def act(
 
 @router.get("/")
 def overview(request: Request, actor: Actor = Depends(page_actor)):
-    data = reads.overview(actor.conn, actor.instance)
+    data = reads.overview(actor.conn, actor.instance, sorted(jobs.HANDLERS))
     data["workers"] = control_status.enforcement_states(actor.ctx)
     chart = {
         "days": [d["day"] for d in data["decisions_by_day"]],
@@ -178,6 +179,10 @@ def grant_approval(
     requested_by: str = Form(...),
     valid_days: int | None = Form(None),
     second_approver_token: str = Form(""),
+    allowed_hosts: str = Form(""),
+    allowed_arg_keys: str = Form(""),
+    paths_mode: str = Form("unset"),
+    allowed_paths: str = Form(""),
     actor: Actor = Depends(page_actor),
 ):
     def action():
@@ -186,6 +191,8 @@ def grant_approval(
             scope_id=scope_id, tools=lines(tools), approval_class=approval_class,
             basis=basis.strip() or f"콘솔 승인(신청자 {requested_by})", requested_by=requested_by,
             valid_days=valid_days, second_approver_token=second_approver_token or None,
+            allowed_hosts=lines(allowed_hosts), allowed_arg_keys=lines(allowed_arg_keys),
+            paths_mode=paths_mode, allowed_paths=lines(allowed_paths),
         )
         api.grant_approval(body, actor)
 

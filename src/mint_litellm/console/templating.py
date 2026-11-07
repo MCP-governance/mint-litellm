@@ -40,6 +40,17 @@ def when(value: Any) -> str:
     return f"{local:%Y-%m-%d %H:%M} (UTC{offset[:3]}:{offset[3:]})"
 
 
+def span(seconds: Any) -> str:
+    """대기 시간을 한국어로(초·분·시간·일)."""
+    if seconds is None:
+        return "—"
+    seconds = int(seconds)
+    for limit, unit, size in ((60, "초", 1), (3600, "분", 60), (86400, "시간", 3600)):
+        if seconds < limit:
+            return f"{seconds // size}{unit}"
+    return f"{seconds // 86400}일"
+
+
 def blank(value: Any) -> Any:
     return "—" if value in (None, "", [], ()) else value
 
@@ -52,7 +63,7 @@ def to_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-templates.env.filters.update(when=when, blank=blank, join=join, to_json=to_json)
+templates.env.filters.update(span=span, when=when, blank=blank, join=join, to_json=to_json)
 templates.env.globals.update(L=labels, ICONS=ICONS, MENU=MENU)
 
 

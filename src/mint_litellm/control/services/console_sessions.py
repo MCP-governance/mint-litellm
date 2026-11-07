@@ -134,7 +134,9 @@ def revoke_user_sessions(
 def active_sessions(conn: psycopg.Connection, instance_id: str) -> list[dict]:
     return fetchall(
         conn,
-        "SELECT id_hash, user_id, key_token, role FROM mint.console_sessions"
+        "SELECT id_hash, user_id, key_token, role,"
+        " EXTRACT(EPOCH FROM now() - last_verified_at) AS unverified_seconds"
+        " FROM mint.console_sessions"
         " WHERE instance_id = %s AND revoked_at IS NULL AND absolute_expiry > now()"
         " AND idle_expiry > now() AND subject = 'admin'",
         (instance_id,),

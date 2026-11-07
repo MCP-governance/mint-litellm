@@ -183,6 +183,7 @@ SESSION_END_REASON = {
     "key_owner_changed": "키 소유자 변경",
     "user_not_human": "사람 사용자 아님",
     "operator_changed": "운영자 변경",
+    "unverified": "재확인 실패",
 }
 
 NOTICES = {

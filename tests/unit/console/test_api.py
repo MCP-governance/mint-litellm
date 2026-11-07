@@ -75,7 +75,7 @@ def test_unknown_resources_are_not_found_with_the_admin_code(world):
 def test_an_invalid_body_is_a_400_with_the_same_error_shape(world):
     response = world.client.post("/api/v1/servers/srv-ok/suspend", headers=bearer("admin"),
                                  json={"confirm_name": "srv-ok"})
-    body = assert_error(response, 400, "MINT-INVALID-INPUT")
+    body = assert_error(response, 400, "MINT-ADMIN-INVALID-INPUT")
     assert "state_version" in body["message"]
 
 
@@ -96,7 +96,7 @@ def test_suspending_needs_the_server_name_typed_exactly(world):
     response = world.client.post(
         "/api/v1/servers/srv-ok/suspend", headers=bearer("admin"),
         json={"state_version": version, "confirm_name": "srv"})
-    assert_error(response, 400, "MINT-INVALID-INPUT")
+    assert_error(response, 400, "MINT-ADMIN-INVALID-INPUT")
     assert server_row(world, "srv-ok")[0] == "approved"
 
 
@@ -265,7 +265,7 @@ def test_an_exception_approval_cannot_exceed_ninety_days(world):
     world.with_control_key()
     response = grant(world, relation_of(world, "srv-wait"), **{"class": "exception"},
                      valid_days=EXCEPTION_MAX_DAYS + 1)
-    assert_error(response, 400, "MINT-INVALID-INPUT")
+    assert_error(response, 400, "MINT-ADMIN-INVALID-INPUT")
 
 
 def test_granting_with_the_control_key_prefills_the_period_and_approves_the_server(world):
@@ -320,3 +320,38 @@ def test_the_ledger_exports_csv_and_json(world):
 
 def test_the_viewer_key_constant_is_a_registered_operator_key(world):
     assert world.client.post("/login", data={"key": Keys.viewer}).status_code == 303
+
+
+def approval_conditions_of(world, **overrides):
+    world.with_control_key()
+    world.query("UPDATE mint.settings SET default_org_id = 'acme'")
+    world.stub.routes[("/v1/mcp/server", "control-plane-key", None)] = (
+        200, [{"server_id": "srv-wait", "mcp_access_groups": []}])
+    world.stub.routes[("/key/info", "control-plane-key", "k-token")] = (200, {
+        "key": "k-token",
+        "info": {"user_id": "human-1", "team_id": None,
+                 "object_permission": {"mcp_servers": ["srv-wait"]}}})
+    response = grant(world, relation_of(world, "srv-wait"), **overrides)
+    return response, world.query("SELECT conditions FROM mint.approvals")
+
+
+def test_unset_paths_store_no_path_condition(world):
+    response, rows = approval_conditions_of(world, allowed_hosts=["example.org"])
+    assert response.status_code == 200
+    assert rows[0][0] == {"allowed_hosts": ["example.org"]}
+
+
+def test_listed_paths_are_stored_and_need_at_least_one(world):
+    response, rows = approval_conditions_of(world, paths_mode="listed", allowed_paths=["/data"])
+    assert response.status_code == 200 and rows[0][0] == {"allowed_paths": ["/data"]}
+
+
+def test_listed_paths_without_a_path_are_refused(world):
+    response, _ = approval_conditions_of(world, paths_mode="listed")
+    assert_error(response, 400, "MINT-ADMIN-INVALID-INPUT")
+
+
+def test_unrestricted_paths_are_an_explicit_choice(world):
+    response, rows = approval_conditions_of(world, paths_mode="unrestricted")
+    assert response.status_code == 200
+    assert rows[0][0] == {"allowed_paths_unrestricted": True}

@@ -26,6 +26,7 @@
   <dl class="detail">
     <dt>대기 작업</dt><dd>{{ o.jobs_pending }}</dd>
     <dt>실패 작업</dt><dd>{% if o.jobs_failed %}{{ m.badge(L.JOB, 'failed') }} {{ o.jobs_failed }}{% else %}0{% endif %}</dd>
+    <dt>처리기 없는 대기 작업</dt><dd>{{ o.unhandled_jobs }}{% if o.unhandled_jobs %} (최장 대기 {{ o.unhandled_oldest_seconds | span }}){% endif %}</dd>
     <dt>마지막 내보내기</dt><dd>{{ o.last_export | when }}</dd>
     <dt>마지막 봉인</dt><dd>{{ o.last_seal | when }}</dd>
     <dt>동기화 보류</dt><dd>{{ o.held_grants }}</dd>

@@ -125,3 +125,5 @@ pre.json { background: var(--bg-subtle); border: 1px solid var(--border); border
 .login h1 { font-size: 20px; }
 .login input { width: 100%; }
 h1 .badge { font-size: 14px; margin-left: var(--s2); vertical-align: middle; }
+fieldset.form { border: 1px solid var(--border); border-radius: 6px; padding: var(--s3); }
+label.radio { flex-direction: row; align-items: baseline; gap: var(--s2); color: var(--text); font-size: 14px; }

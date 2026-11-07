@@ -9,8 +9,12 @@ from datetime import UTC, datetime
 
 from mint_litellm.control import jobs
 from mint_litellm.control.errors import ControlError
+from mint_litellm.control.litellm_admin import LiteLLMError
 from mint_litellm.control.operators import HUMAN_ROLES
 from mint_litellm.control.services import console_sessions
+
+# LiteLLM에 닿지 못할 때 세션을 유지하는 주기 수. 그 뒤에는 확인하지 못한 세션을 폐기한다.
+UNVERIFIED_PERIODS = 2
 
 
 def _parse(value: object) -> datetime | None:
@@ -49,10 +53,20 @@ def run(job: jobs.JobContext) -> None:
             "session_verify에는 제어 평면 키(MINT_LITELLM_URL·MINT_LITELLM_KEY)가 필요합니다."
         )
     conn, instance = job.conn, job.instance_id
+    period = getattr(job.settings, "session_verify_seconds", 300)
+    unreachable: LiteLLMError | None = None
     for session in console_sessions.active_sessions(conn, instance):
         job.checkpoint()
-        key = job.litellm.get_key(session["key_token"])
-        user = job.litellm.get_user(session["user_id"])
+        try:
+            key = job.litellm.get_key(session["key_token"])
+            user = job.litellm.get_user(session["user_id"])
+        except LiteLLMError as error:
+            unreachable = unreachable or error
+            if session["unverified_seconds"] > UNVERIFIED_PERIODS * period:
+                console_sessions.revoke(
+                    conn, instance, session["id_hash"], actor="session_verify", reason="unverified"
+                )
+            continue
         operator = console_sessions.active_operator(conn, instance, session["user_id"])
         reason = verdict(session, key, user, operator)
         if reason is None:
@@ -61,3 +75,5 @@ def run(job: jobs.JobContext) -> None:
             console_sessions.revoke(
                 conn, instance, session["id_hash"], actor="session_verify", reason=reason
             )
+    if unreachable is not None:
+        raise unreachable

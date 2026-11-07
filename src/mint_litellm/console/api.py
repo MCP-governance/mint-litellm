@@ -76,6 +76,22 @@ def confirm(actual: str, typed: str, what: str) -> None:
         raise ControlError(f"{what} 이름을 정확히 입력해야 합니다.")
 
 
+def approval_conditions(body: "ApprovalBody") -> dict[str, Any]:
+    """승인 조건. 경로는 지정(listed)·제한 없음(unrestricted)·미지정(unset)을 구분해 담는다."""
+    conditions: dict[str, Any] = {}
+    if body.allowed_hosts:
+        conditions["allowed_hosts"] = body.allowed_hosts
+    if body.allowed_arg_keys:
+        conditions["allowed_arg_keys"] = body.allowed_arg_keys
+    if body.paths_mode == "listed":
+        if not body.allowed_paths:
+            raise ControlError("허용 경로를 하나 이상 입력하거나 다른 선택을 고르십시오.")
+        conditions["allowed_paths"] = body.allowed_paths
+    elif body.paths_mode == "unrestricted":
+        conditions["allowed_paths_unrestricted"] = True
+    return conditions
+
+
 def done(actor: Actor, **extra: Any) -> dict[str, Any]:
     return {"ok": True, **extra, "events": [e.source_key for e in actor.ctx.emitted]}
 
@@ -106,6 +122,11 @@ class ApprovalBody(Versioned):
     valid_days: int | None = None
     allowlist_ids: list[str] = []
     second_approver_token: str | None = None
+    allowed_hosts: list[str] = []
+    allowed_arg_keys: list[str] = []
+    # unset: 경로 이탈만 막음, listed: allowed_paths만 허용, unrestricted: 제한 없음(명시 선택)
+    paths_mode: Literal["unset", "listed", "unrestricted"] = "unset"
+    allowed_paths: list[str] = []
 
     model_config = {"populate_by_name": True}
 
@@ -373,6 +394,7 @@ def grant_approval(body: ApprovalBody, actor: Actor = Depends(api_actor)):
         requested_by=body.requested_by,
         allowlist_ids=body.allowlist_ids,
         second=second_approver(actor, body.second_approver_token),
+        conditions=approval_conditions(body),
         expected_version=body.state_version,
     )
     return done(actor, id=approval_id)
