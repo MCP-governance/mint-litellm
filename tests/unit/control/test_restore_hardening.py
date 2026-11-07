@@ -374,3 +374,68 @@ def test_terminal_state_machines_accept_forward_moves_and_refuse_a_forged_reopen
                          ({"usage_relations": "terminated", "allowlists": "lifted",
                            "orgs": "closed"}[table], str(key)))
             assert _verdicts(world["live"], world["settings"], 1)[0].state == judge.OK, table
+
+
+def test_an_old_request_cannot_resume_over_a_newer_unfinished_publication(world, monkeypatch):
+    """A 보관 뒤 중단 -> B가 새 latest.json을 쓰고 .done 전에 중단 -> DB가 A 대기 시점으로
+    되돌아가도 A는 B의 최신 파일을 덮지 못한다."""
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)  # A
+    settings = world["settings"]
+    real_write = exports.write_export
+
+    def dying(*args, **kwargs):
+        raise OSError("killed")
+
+    monkeypatch.setattr(exports, "write_export", dying)
+    run_worker(world)  # A: 보관만 끝났다
+    monkeypatch.setattr(exports, "write_export", real_write)
+    add_admins(world["restored"])
+    with psycopg.connect(world["restored"]) as conn:
+        restore.accept_stale(make_ctx(conn), settings, "B 복원", Operator("second", "admin", "u2"))
+        conn.commit()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        a_id, b_id = [str(r["id"]) for r in fetchall(
+            conn, "SELECT id FROM mint.restore_requests ORDER BY created_at")]
+        conn.execute("UPDATE mint.jobs SET run_after = now() + interval '1 hour'"
+                     " WHERE target_ref = %s", (a_id,))  # A는 아직 기다린다
+
+    real_latest = exports.write_latest_file
+
+    def latest_then_dies(*args, **kwargs):
+        real_latest(*args, **kwargs)
+        raise OSError("killed after latest.json")
+
+    monkeypatch.setattr(exports, "write_latest_file", latest_then_dies)
+    run_worker(world)  # B: latest.json까지 쓰고 .done 전에 중단
+    monkeypatch.setattr(exports, "write_latest_file", real_latest)
+    restored = settings.export_dir / INSTANCE / "restored"
+    latest = files.latest_path(settings.export_dir, INSTANCE)
+    assert latest.exists() and (restored / b_id / ".publishing").exists()
+    assert not (restored / b_id / ".done").exists()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        conn.execute("SET session_replication_role = replica")  # DB가 B 이전으로 돌아간다
+        conn.execute("DELETE FROM mint.jobs WHERE target_ref = %s", (b_id,))
+        conn.execute("DELETE FROM mint.restore_requests WHERE id::text = %s", (b_id,))
+        conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'"
+                     " WHERE target_ref = %s", (a_id,))
+    run_worker(world)
+    assert not (restored / a_id / ".done").exists()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "rejected"
+        assert fetchone(conn, "SELECT count(*) AS n FROM mint.alerts"
+                        " WHERE kind = 'restore_request_rejected'")["n"] == 1
+
+
+def test_a_request_resumes_when_latest_is_absent_or_equal_to_its_binding(world, monkeypatch):
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    monkeypatch.setattr(exports, "write_export", lambda *a, **k: (_ for _ in ()).throw(
+        OSError("killed")))
+    run_worker(world)  # 보관만 끝났다: 원래 위치에 파일이 없다
+    monkeypatch.undo()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'")
+    assert run_worker(world).state == judge.OK

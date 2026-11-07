@@ -28,6 +28,7 @@ from mint_litellm.types.events import EventKind
 
 _MARKER = ".archived"  # 보관을 시작했다(이동 전에 쓴다)
 _MOVED = ".moved"  # 이동을 끝냈다
+_PUBLISHING = ".publishing"  # 새 파일 게시를 시작했다(latest.json을 쓰기 전에 남긴다)
 _DONE = ".done"  # 게시와 검증을 모두 끝냈다(DB 확정 전에 죽어도 다시 게시하지 않는다)
 
 
@@ -52,42 +53,43 @@ def archive(settings, instance_id: str, request_id: str) -> None:
     (dest / _MOVED).write_text(files.now(), encoding="utf-8")
 
 
-def _done_at(path: Path) -> datetime | None:
+def _stamp() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _done_at(path: Path) -> datetime:
     try:
-        return datetime.strptime(path.read_text(encoding="utf-8").strip(), "%Y-%m-%dT%H:%M:%SZ"
-                                 ).replace(tzinfo=UTC)
+        return datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return datetime.max.replace(tzinfo=UTC)  # 읽을 수 없는 표지는 가장 나중으로 본다(거부)
 
 
-def _later_restore_done(settings, instance_id: str, request: dict[str, Any]) -> bool:
-    """이 요청이 만들어진 뒤에 다른 복원이 게시를 끝냈는가(``restored/*/.done``)."""
+def _other_restore_marker(settings, instance_id: str, request: dict[str, Any]) -> bool:
+    """이 요청이 만들어진 뒤에 다른 복원이 게시를 시작했거나 끝냈는가
+    (``restored/<다른 식별자>/.publishing``·``.done``)."""
     root = settings.export_dir / instance_id / "restored"
-    created = request["created_at"].astimezone(UTC).replace(microsecond=0)
+    created = request["created_at"].astimezone(UTC)
     mine = str(request["id"])
-    for done in root.glob(f"*/{_DONE}") if root.is_dir() else ():
-        if done.parent.name != mine and _done_at(done) >= created:
-            return True
+    if not root.is_dir():
+        return False
+    for name in (_PUBLISHING, _DONE):
+        for marker in root.glob(f"*/{name}"):
+            if marker.parent.name != mine and _done_at(marker) >= created:
+                return True
     return False
 
 
 def _bound_ok(settings, instance_id: str, request: dict[str, Any]) -> bool:
-    """게시 직전의 ``latest.json``이 요청에 결속한 해시와 같은가.
+    """게시(재개 포함) 직전에 원래 위치의 현재 ``latest.json``만 본다(보관본은 보지 않는다).
 
-    보관을 시작한 요청은 보관본이 결속값과 같아야 하고(파일이 없던 요청은 보관 뒤 새 파일이 생기는
-    것이 정상), 그 사이에 다른 복원이 끝났다면 거부한다(옛 요청이 최신 증거를 덮지 못한다).
+    파일이 없으면(이 요청이 옮겼거나 처음부터 없던 경우) 허용하고, 있으면 요청에 결속한 해시와
+    같을 때만 허용한다. 다른 복원이 게시를 시작했거나 끝냈다면 거부한다.
     """
-    if _later_restore_done(settings, instance_id, request):
+    if _other_restore_marker(settings, instance_id, request):
         return False
-    dest = _dest(settings, instance_id, str(request["id"]))
-    kept = dest / "latest.json"
-    if kept.exists():
-        current = files.file_sha256(kept)
-    elif (dest / _MOVED).exists():
-        current = "absent"
-    else:
-        current = files.file_sha256(files.latest_path(settings.export_dir, instance_id))
-    return current == request["bound_latest"]
+    path = files.latest_path(settings.export_dir, instance_id)
+    current = files.file_sha256(path)
+    return current in ("absent", request["bound_latest"])
 
 
 def _reject(job: JobContext, request: dict[str, Any]) -> None:
@@ -247,6 +249,9 @@ def publish(job: JobContext) -> None:
             _reject(job, request)
         validate(job, request)
         archive(settings, iid, str(request["id"]))
+        publishing = _dest(settings, iid, str(request["id"])) / _PUBLISHING
+        if not publishing.exists():  # 다른 요청이 이 시점 뒤에 재개하지 못하게 먼저 남긴다
+            publishing.write_text(_stamp(), encoding="utf-8")
         job.checkpoint()
         exports.write_export(
             conn, iid, settings, "negative_state", actor="worker", write_latest=False,
@@ -263,7 +268,7 @@ def publish(job: JobContext) -> None:
         if state.error is not None or state.latest is None:
             raise exports.ExportFailed("게시한 파일을 다시 읽어 검증하지 못했습니다.")
         done = _dest(settings, iid, str(request["id"])) / _DONE
-        done.write_text(files.now(), encoding="utf-8")  # 완료 표지는 DB 확정보다 먼저 남긴다
+        done.write_text(_stamp(), encoding="utf-8")  # 완료 표지는 DB 확정보다 먼저 남긴다
         conn.execute(
             "UPDATE mint.restore_requests SET status = 'published', published_at = now()"
             " WHERE id = %s AND status = 'pending'", (request["id"],),
