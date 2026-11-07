@@ -143,7 +143,7 @@ def _decide(
     open_states = ("pending", "confirmed") if target == "cancel" else ("pending",)
     if row["status"] not in open_states:
         raise conflict(
-            f"본인 확인 {confirmation_id}은(는) {row['status']} 상태라 처리할 수 없습니다."
+            f"본인 확인 {confirmation_id}은(는) 이미 처리되었거나 만료되어 처리할 수 없습니다."
         )
     if target != "cancel" and row["expired"]:
         raise stale_evidence(f"본인 확인 {confirmation_id}은(는) 만료되었습니다.")
@@ -237,7 +237,7 @@ def _check_consent_target(
             raise forbidden(f"조직 {org_id}의 이용 관계에 서버 {server_id}가 없습니다.")
         if server["status"] != "approved":
             raise ControlError(
-                f"서버 {server_id}가 {server['status']} 상태라 동의를 등록할 수 없습니다."
+                f"서버 {server_id}는 승인된 서버가 아니어서 동의를 등록할 수 없습니다."
             )
 
 
