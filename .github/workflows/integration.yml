@@ -30,7 +30,8 @@ permissions:
 
 concurrency:
   group: integration-${{ github.ref }}
-  cancel-in-progress: true
+  # main 푸시는 취소하지 않는다(병합 직후 실행이 연달아 취소되면 main의 통합 시험 결과가 비게 된다).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   integration:
