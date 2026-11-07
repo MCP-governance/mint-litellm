@@ -1,0 +1,187 @@
+"""LiteLLM 쓰기 클라이언트: 본문 제한, 경로 허용 목록, 응답 처리, 쓰기 직전 훅."""
+
+import socket
+
+import pytest
+from fake_litellm import CONTROL_KEY, FakeLiteLLM
+
+from mint_litellm.control.litellm_write import (
+    LiteLLMForbidden,
+    LiteLLMHttpError,
+    LiteLLMSync,
+    LiteLLMUnreachable,
+    WriteRefused,
+    check_write,
+)
+
+SRV = "srv-1"
+FULL = {"mcp_servers": [SRV], "mcp_tool_permissions": {SRV: ["a"]}}
+
+
+@pytest.fixture
+def fake():
+    server = FakeLiteLLM()
+    yield server
+    server._server.shutdown()
+    server._server.server_close()
+
+
+@pytest.fixture
+def client(fake):
+    return LiteLLMSync(fake.url, CONTROL_KEY)
+
+
+def test_a_key_update_sends_only_the_key_and_the_two_permission_fields(fake, client):
+    fake.add_key("k1")
+    client.update_key_permission("k1", [SRV], {SRV: ["a"]})
+    (method, path, body), = fake.writes()
+    assert (method, path) == ("POST", "/key/update")
+    assert body == {"key": "k1", "object_permission": FULL}
+
+
+def test_a_team_update_sends_only_the_team_and_the_two_permission_fields(fake, client):
+    fake.add_team("t1")
+    client.update_team_permission("t1", [SRV], {SRV: ["a"]})
+    (_, path, body), = fake.writes()
+    assert path == "/team/update"
+    assert body == {"team_id": "t1", "object_permission": FULL}
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/key/update", {"key": "k", "object_permission": FULL, "blocked": True}),
+        ("/key/update", {"key": "k", "object_permission": FULL, "models": []}),
+        ("/key/update", {"key": "k", "metadata": {}}),
+        ("/key/update", {"object_permission": FULL}),
+        ("/key/update", {"key": "k", "object_permission": {"mcp_servers": []}}),
+        ("/key/update", {"key": "k", "object_permission": {**FULL, "mcp_access_groups": []}}),
+        ("/key/update", {"key": "k", "object_permission": {**FULL, "vector_stores": []}}),
+        ("/key/update", {"key": "", "object_permission": FULL}),
+        ("/key/update", {"key": "k", "object_permission": {"mcp_servers": "srv",
+                                                           "mcp_tool_permissions": {}}}),
+        ("/key/update", {"key": "k", "object_permission": {"mcp_servers": [],
+                                                           "mcp_tool_permissions": {"s": "a"}}}),
+        ("/team/update", {"team_id": "t", "object_permission": FULL, "max_budget": 1}),
+        ("/team/update", {"key": "t", "object_permission": FULL}),
+        ("/team/update", None),
+    ],
+)
+def test_extra_missing_or_mistyped_body_fields_are_refused(path, body):
+    with pytest.raises(WriteRefused):
+        check_write("POST", path, body)
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/v1/mcp/server"),  # 서버 등록
+        ("PUT", "/v1/mcp/server"),  # 서버 수정
+        ("DELETE", "/v1/mcp/server/srv-1"),  # 서버 삭제
+        ("POST", "/v1/mcp/server/import"),
+        ("POST", "/v1/mcp/server/register"),
+        ("PUT", "/v1/mcp/server/srv-1"),
+        ("POST", "/v1/mcp/server/srv-1/user-credential"),
+        ("PUT", "/v1/mcp/server/a/b/approve"),
+        ("POST", "/key/generate"),
+        ("POST", "/key/delete"),
+        ("POST", "/team/delete"),
+        ("PUT", "/key/update"),
+        ("GET", "/key/update"),
+        ("POST", "/user/update"),
+    ],
+)
+def test_only_the_whitelisted_methods_and_paths_can_be_written(method, path):
+    with pytest.raises(WriteRefused):
+        check_write(method, path, None)
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("PUT", "/v1/mcp/server/srv-1/approve"),
+        ("PUT", "/v1/mcp/server/srv-1/reject"),
+        ("POST", "/v1/mcp/server/srv-1/pin"),
+        ("DELETE", "/v1/mcp/server/srv-1/pin"),
+    ],
+)
+def test_the_four_server_paths_are_allowed_without_a_body(method, path):
+    check_write(method, path, None)
+    with pytest.raises(WriteRefused):
+        check_write(method, path, {"x": 1})
+
+
+def test_a_refused_write_never_reaches_the_network_or_the_hook(fake):
+    called = []
+    client = LiteLLMSync(fake.url, CONTROL_KEY, before_write=lambda: called.append(1))
+    with pytest.raises(WriteRefused):
+        client._write("POST", "/v1/mcp/server", {"server_name": "x"})
+    assert fake.requests == [] and called == []
+
+
+def test_the_hook_runs_before_every_write_and_can_stop_it(fake):
+    fake.add_key("k1")
+    order = []
+    client = LiteLLMSync(
+        fake.url, CONTROL_KEY, before_write=lambda: order.append(len(fake.requests))
+    )
+    client.update_key_permission("k1", [], {})
+    assert order == [0]  # 요청이 나가기 전에 불렸다
+
+    def stop():
+        raise RuntimeError("restore")
+
+    blocked = client.with_hook(stop)
+    with pytest.raises(RuntimeError):
+        blocked.update_key_permission("k1", [SRV], {})
+    assert len(fake.writes()) == 1  # 막힌 쓰기는 나가지 않았다
+    assert client.before_write is not stop  # 사본만 훅이 바뀐다
+
+
+def test_reads_do_not_call_the_write_hook(fake):
+    fake.add_key("k1")
+    called = []
+    client = LiteLLMSync(fake.url, CONTROL_KEY, before_write=lambda: called.append(1))
+    assert client.get_key("k1")["key"] == "k1"
+    assert called == []
+
+
+def test_a_403_is_reported_as_forbidden_and_other_statuses_with_their_code(fake, client):
+    fake.add_team("t1")
+    fake.add_key("k1", team_id="t1")
+    with pytest.raises(LiteLLMForbidden) as forbidden:
+        client.update_key_permission("k1", [SRV], {})  # 팀이 서버를 허용하지 않는다
+    assert forbidden.value.status == 403
+    with pytest.raises(LiteLLMHttpError) as missing:
+        client.update_key_permission("nope", [], {})
+    assert (missing.value.status, missing.value.code) == (404, "litellm_http_404")
+    fake.fail_writes["/team/update"] = 500
+    with pytest.raises(LiteLLMHttpError) as broken:
+        client.update_team_permission("t1", [], {})
+    assert broken.value.status == 500
+
+
+def test_an_unreachable_server_is_its_own_error():
+    with socket.socket() as probe:  # 닫힌 포트
+        probe.bind(("localhost", 0))
+        port = probe.getsockname()[1]
+    client = LiteLLMSync(f"http://localhost:{port}", CONTROL_KEY, timeout=1)
+    with pytest.raises(LiteLLMUnreachable):
+        client.get_key("k1")
+    with pytest.raises(LiteLLMUnreachable):
+        client.update_key_permission("k1", [], {})
+
+
+def test_server_approval_calls_only_the_approve_path(fake, client):
+    fake.add_server("srv-p", "pending_review")
+    client.approve_server("srv-p")
+    assert fake.writes() == [("PUT", "/v1/mcp/server/srv-p/approve", None)]
+    assert fake.servers["srv-p"]["approval_status"] == "active"
+    with pytest.raises(LiteLLMHttpError) as again:
+        client.approve_server("srv-p")
+    assert again.value.status == 400
+
+
+def test_credential_columns_are_scrubbed_from_reads(fake, client):
+    fake.add_server("srv-c")
+    assert "credentials" not in client.get_server("srv-c")
