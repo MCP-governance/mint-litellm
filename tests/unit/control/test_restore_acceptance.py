@@ -554,3 +554,68 @@ def test_publish_recomputes_the_anchor_and_ignores_a_forged_null_cause(world):
     with psycopg.connect(world["live"], autocommit=True) as conn:
         assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "pending"
     assert file_epoch
+
+
+def test_the_second_approver_must_match_the_one_in_the_ledger_event(world):
+    revoke_and_export(world)
+    settings = world["settings"]
+    path = files.latest_path(settings.export_dir, INSTANCE)
+    doc = files.read_verified(path, exports.keys(settings))
+    doc.update(to_seal_seq=1, tail_hash="00" * 32)
+    files.atomic_write(path, files.sign(doc, settings.export_hmac_key))
+    add_admins(world["live"])
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        conn.execute("INSERT INTO mint.operators (instance_id, name, role, token_hash, user_id)"
+                     " VALUES (%s, 'third', 'admin', repeat('3', 64), 'u3')", (INSTANCE,))
+    with psycopg.connect(world["live"]) as conn:
+        restore.attest(make_ctx(conn), settings, "앵커", operator("second", "u2"))
+        conn.commit()
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        # 요청 행의 두 번째 승인자를 사건과 다른(그러나 유효한) admin으로 바꾼다
+        conn.execute("ALTER TABLE mint.restore_requests DISABLE TRIGGER restore_requests_2_frozen")
+        conn.execute("UPDATE mint.restore_requests SET second_approver = 'third'")
+        conn.execute("ALTER TABLE mint.restore_requests ENABLE TRIGGER restore_requests_2_frozen")
+    before = path.read_bytes()
+    run_worker(world, "live")
+    assert path.read_bytes() == before
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "pending"
+        event = fetchone(conn, "SELECT payload FROM mint.events WHERE kind = 'restore_attested'")
+        assert event["payload"]["second_approver"] == "second"
+
+
+def test_archive_writes_its_marker_before_moving_and_converges_after_a_crash(
+    tmp_path, monkeypatch
+):
+    import shutil
+
+    from mint_litellm.control import restore_publish
+
+    settings = Stage2Settings.from_env(
+        {"MINT_EXPORT_DIR": str(tmp_path / "ex"), "MINT_EXPORT_HMAC_KEY": KEY})
+    root = settings.export_dir / INSTANCE
+    (root / "negative").mkdir(parents=True)
+    (root / "negative" / "1.json").write_text("{}")
+    (root / "latest.json").write_text("{}")
+    dest = root / "restored" / "r1"
+    real = shutil.move
+    calls = []
+
+    def dying(src, dst):
+        calls.append(src)
+        if len(calls) == 2:
+            raise OSError("killed")  # latest.json은 옮겼고 negative/는 아직이다
+        return real(src, dst)
+
+    monkeypatch.setattr(shutil, "move", dying)
+    with pytest.raises(OSError):
+        restore_publish.archive(settings, INSTANCE, "r1")
+    assert (dest / ".archived").exists() and not (dest / ".moved").exists()
+    assert (dest / "latest.json").exists() and (root / "negative" / "1.json").exists()
+    monkeypatch.setattr(shutil, "move", real)
+    restore_publish.archive(settings, INSTANCE, "r1")  # 다음 실행이 이어서 옮긴다
+    assert (dest / ".moved").exists() and (dest / "negative" / "1.json").exists()
+    assert not (root / "latest.json").exists()
+    (root / "latest.json").write_text("new")  # 이동이 끝난 뒤의 새 파일은 건드리지 않는다
+    restore_publish.archive(settings, INSTANCE, "r1")
+    assert (root / "latest.json").read_text() == "new"

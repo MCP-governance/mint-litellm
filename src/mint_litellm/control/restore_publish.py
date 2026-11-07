@@ -21,7 +21,8 @@ from mint_litellm.control.services import restore as restore_service
 from mint_litellm.restore import files, judge
 from mint_litellm.types.events import EventKind
 
-_MARKER = ".archived"
+_MARKER = ".archived"  # 보관을 시작했다(이동 전에 쓴다)
+_MOVED = ".moved"  # 이동을 끝냈다
 
 
 def _dest(settings, instance_id: str, request_id: str) -> Path:
@@ -32,14 +33,17 @@ def archive(settings, instance_id: str, request_id: str) -> None:
     """기존 ``latest.json``과 ``negative/``를 지우지 않고 ``restored/<요청>/``로 옮긴다."""
     root = settings.export_dir / instance_id
     dest = _dest(settings, instance_id, request_id)
-    if (dest / _MARKER).exists():
-        return  # 이미 보관했다(재실행)
+    if (dest / _MOVED).exists():
+        return  # 이동까지 끝났다(재실행): 그 뒤에 쓴 새 파일은 건드리지 않는다
     dest.mkdir(parents=True, exist_ok=True)
+    marker = dest / _MARKER
+    if not marker.exists():  # 이동 전에 표식을 먼저 쓴다. 중간에 죽으면 다음 실행이 이어서 옮긴다.
+        marker.write_text(files.now(), encoding="utf-8")
     for name in ("latest.json", "negative"):
         source = root / name
-        if source.exists():
+        if source.exists() and not (dest / name).exists():
             shutil.move(str(source), str(dest / name))
-    (dest / _MARKER).write_text(files.now(), encoding="utf-8")
+    (dest / _MOVED).write_text(files.now(), encoding="utf-8")
 
 
 def _event(conn: psycopg.Connection, iid: str, kind: EventKind, request_id: str):
@@ -74,6 +78,8 @@ def _original_items(settings, iid: str, request_id: str, archived: bool) -> list
     keys = exports.keys(settings)
     if archived:
         folder = _dest(settings, iid, request_id) / "negative"
+        if not folder.is_dir():  # 아직 옮기기 전에 죽었다면 원래 자리에 있다
+            folder = settings.export_dir / iid / "negative"
         names = [p for p in folder.glob("*.json") if p.stem.isdigit()] if folder.is_dir() else []
         path = max(names, key=lambda p: int(p.stem), default=None)
     else:
@@ -85,11 +91,9 @@ def _original_items(settings, iid: str, request_id: str, archived: bool) -> list
 
 def _anchor_ok(conn, iid: str, settings, request_id: str, archived: bool) -> bool:
     """원본 ``latest.json``의 봉인 끝이 DB의 ``seal_batches``와 같은가. 읽지 못하면 거짓이다."""
-    path = (
-        _dest(settings, iid, request_id) / "latest.json"
-        if archived
-        else files.latest_path(settings.export_dir, iid)
-    )
+    path = files.latest_path(settings.export_dir, iid)
+    if archived and (_dest(settings, iid, request_id) / "latest.json").exists():
+        path = _dest(settings, iid, request_id) / "latest.json"
     try:
         latest = files.read_verified(path, exports.keys(settings))
     except (FileNotFoundError, files.ExportUnverified):
@@ -129,7 +133,10 @@ def validate(job: JobContext, request: dict[str, Any]) -> None:
             ok = not restore_service.compare(conn, iid, items)
         if ok and not _anchor_ok(conn, iid, settings, request_id, archived):
             # 요청의 cause 값을 믿지 않고 원본 latest.json 기준으로 다시 계산한 결과다
-            ok = _two_admins(conn, iid, request["requested_by"], request["second_approver"])
+            # 앵커 불일치: admin 2인이고 사건의 두 번째 승인자가 요청과 같아야 한다
+            ok = event["payload"].get("second_approver") == request["second_approver"] and (
+                _two_admins(conn, iid, request["requested_by"], request["second_approver"])
+            )
     else:
         event = _event(conn, iid, EventKind.RESTORE_STALE_ACCEPTED, request_id)
         ok = (

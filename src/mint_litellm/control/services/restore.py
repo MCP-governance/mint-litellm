@@ -172,7 +172,8 @@ def attest(
         ctx.emit(EventKind.RESTORE_ATTESTED, file_epoch,
                  _sequence(ctx.conn, ctx.instance_id, file_epoch, EventKind.RESTORE_ATTESTED),
                  {"reason": reason, "file_epoch": file_epoch, "db_epoch": current,
-                  "request_id": request_id, "reapplied": reapplied})
+                  "request_id": request_id, "reapplied": reapplied,
+                  "second_approver": second_name})
     return {"file_epoch": file_epoch, "db_epoch": current, "reapplied": reapplied,
             "request_id": request_id}
 
