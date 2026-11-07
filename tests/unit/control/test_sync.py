@@ -442,15 +442,22 @@ def test_three_failed_reaches_open_the_unreachable_alert_and_a_success_closes_it
     assert alerts(admin, "litellm_unreachable")[0]["status"] == "resolved"
 
 
-def test_a_restored_database_stops_the_write_before_it_leaves(admin, fake, make_worker):
+def test_a_restored_database_stops_the_write_before_it_leaves(
+    admin, fake, make_worker, monkeypatch
+):
+    from mint_litellm.control import sync_jobs
+    from mint_litellm.restore.judge import BLOCKED, Verdict
+
     key_world(admin, fake)
-    calls = []
+    worker = make_worker()
+    read = sync_jobs._read
 
-    def restore(conn, instance):  # 작업을 잡을 때는 정상, 쓰기 직전에는 되돌림
-        calls.append(1)
-        return len(calls) > 1
+    def read_then_restore(*args):  # 읽은 직후, 쓰기 전에 되돌림이 감지된다
+        result = read(*args)
+        worker.verdict = Verdict(BLOCKED, "restore_pending")
+        return result
 
-    worker = make_worker(restore_check=restore)
+    monkeypatch.setattr(sync_jobs, "_read", read_then_restore)
     enqueue(admin, "sync_target", "key:k1")
     drain(worker)
     assert fake.writes() == []
@@ -783,3 +790,115 @@ def test_a_team_key_cannot_be_approved_before_its_team_has_the_same_server(admin
     add_approval(admin, "team", "t1", status="pending")
     approval_id, _ = approve()
     assert approval_id
+
+
+# --- allow_all_keys, observed=false 행, 쓰기 전 기록 ---------------------------------------
+
+
+def test_a_controlled_server_opened_to_all_keys_is_closed_and_reported(admin, fake, worker):
+    add_server(admin)
+    fake.add_server("srv-1")
+    fake.servers["srv-1"]["allow_all_keys"] = True
+    add_approval(admin, "user", "u1")
+    reconcile(admin)
+    drain(worker)
+    assert fake.servers["srv-1"]["allow_all_keys"] is False
+    assert fake.writes() == [("PUT", "/v1/mcp/server",
+                              {"server_id": "srv-1", "allow_all_keys": False})]
+    [alert] = alerts(admin, "sync_foreign_change")
+    assert alert["subject"] == {"server_id": "srv-1", "fields": ["allow_all_keys"]}
+    assert alerts(admin, "sync_divergence") == []
+    reconcile(admin)  # 이미 닫혔으면 쓰지 않는다
+    drain(worker)
+    assert len(fake.writes()) == 1
+
+
+def test_an_allow_all_keys_that_cannot_be_closed_raises_a_divergence(admin, fake, worker):
+    add_server(admin)
+    fake.add_server("srv-1")
+    fake.servers["srv-1"]["allow_all_keys"] = True
+    add_approval(admin, "user", "u1")
+    fake.ignore_allow_all_keys = True
+    reconcile(admin)
+    drain(worker)
+    [alert] = alerts(admin, "sync_divergence")
+    assert alert["subject"]["reason"] == "allow_all_keys_still_enabled"
+    fake.ignore_allow_all_keys = False
+    fake.fail_writes["/v1/mcp/server"] = 403
+    reconcile(admin)
+    drain(worker)
+    assert alerts(admin, "sync_divergence")[0]["subject"]["reason"] == (
+        "allow_all_keys_still_enabled")  # 같은 경보에 횟수만 오른다
+    assert alerts(admin, "sync_divergence")[0]["count"] == 2
+    fake.fail_writes.clear()
+    reconcile(admin)
+    drain(worker)
+    assert fake.servers["srv-1"]["allow_all_keys"] is False
+    assert alerts(admin, "sync_divergence")[0]["status"] == "resolved"
+
+
+def test_an_uncontrolled_server_with_allow_all_keys_is_left_alone(admin, fake, worker):
+    add_server(admin)
+    fake.add_server("srv-1")
+    fake.servers["srv-1"]["allow_all_keys"] = True
+    reconcile(admin)  # 승인이 하나도 없는 서버는 재조회 대상이 아니다
+    drain(worker)
+    assert fake.writes() == []
+
+
+def test_a_row_left_unobserved_is_fixed_by_the_reconcile_and_the_approval_activates(
+    admin, fake, worker
+):
+    add_server(admin)
+    fake.add_server("srv-1")
+    fake.add_key("k1")
+    approval = add_approval(admin, "key", "k1", status="pending")
+    enqueue(admin, "sync_server", "srv-1")
+    enqueue(admin, "sync_target", "key:k1")
+    drain(worker)
+    assert fetchone(admin, "SELECT status FROM mint.approvals WHERE id = %s",
+                    (approval,))["status"] == "active"
+    # 쓰기는 됐는데 확인이 늦어 행이 observed=false로 남고 승인은 아직 대기인 상태를 만든다
+    admin.execute("SET session_replication_role = replica")
+    admin.execute("UPDATE mint.approvals SET status = 'pending' WHERE id = %s", (approval,))
+    admin.execute("SET session_replication_role = origin")
+    admin.execute("UPDATE mint.litellm_grants SET observed = false WHERE target_type = 'key'")
+    reconcile(admin)
+    drain(worker)
+    assert [g["observed"] for g in grants(admin) if g["target_type"] == "key"] == [True, True]
+    assert fetchone(admin, "SELECT status FROM mint.approvals WHERE id = %s",
+                    (approval,))["status"] == "active"
+    assert len(fake.writes()) == 1  # 이미 있는 항목은 다시 쓰지 않는다
+
+
+def test_an_unobserved_row_whose_item_is_missing_is_synced_again(admin, fake, worker):
+    synced_key(admin, fake, worker)
+    admin.execute("UPDATE mint.litellm_grants SET observed = false WHERE target_type = 'key'")
+    delete_server_from_key(fake)
+    reconcile(admin)
+    drain(worker)
+    assert fake.permission("key", "k1")[0] == ["srv-1"]
+    assert grant(admin, "mcp_server")["observed"] is True
+    assert grant(admin, "mcp_server")["missing_count"] == 0  # 이미 없다고 본 항목은 세지 않는다
+
+
+def test_rows_are_recorded_before_the_write_so_a_crash_keeps_mint_ownership(
+    admin, fake, worker, monkeypatch
+):
+    from mint_litellm.control import sync_jobs
+
+    key_world(admin, fake)
+    monkeypatch.setattr(sync_jobs, "_record", lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("crash after the write")))
+    enqueue(admin, "sync_target", "key:k1")
+    drain(worker)
+    assert fake.permission("key", "k1")[0] == ["srv-1"]  # 쓰기는 나갔다
+    row_ = grant(admin, "mcp_server")
+    assert (row_["observed"], row_["preexisting"]) == (False, False)
+    monkeypatch.undo()
+    past(admin)
+    drain(worker)
+    row_ = grant(admin, "mcp_server")
+    # 쓰기 전에 적어 둔 덕에 MINT가 넣은 항목을 원래 있던 것으로 오판하지 않는다
+    assert (row_["observed"], row_["preexisting"]) == (True, False)
+    assert grant(admin, "tool_permission")["tools"] == ["a", "b"]

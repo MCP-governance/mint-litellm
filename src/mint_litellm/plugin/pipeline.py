@@ -100,6 +100,8 @@ class PipelineDeps:
     recorder: EvidenceRecorder
     evaluate: PolicyEvaluate | None
     verified: Callable[[], bool]
+    # 호출을 막는 사유(되돌림 판정의 cause). 없으면 None. 메모리 값만 읽는다.
+    unverified_cause: Callable[[], str | None] = lambda: None
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
     secret_markers: Callable[..., Awaitable[tuple[str, ...] | None]] | None = None
 
@@ -155,9 +157,12 @@ class _Stages:
         return [r for _, r in self.items if isinstance(r, StageResult)]
 
 
-def context_result(req: CallRequest, verified: bool) -> StageResult | None:
+def context_result(
+    req: CallRequest, verified: bool, cause: str | None = None
+) -> StageResult | None:
     if not verified:
-        return StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED)
+        detail = None if cause is None else f"cause={cause}"
+        return StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED, detail=detail)
     if req.principal.principal_type is PrincipalType.MASTER_KEY:
         return StageResult.stop(Reason.MASTER_KEY_FORBIDDEN)
     if req.resolution_failure is not None:
@@ -745,7 +750,7 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
     req, stages, config = run.req, run.stages, deps.config
     hook, principal = req.hook, req.principal
     run.current = Stage.CONTEXT
-    early = context_result(req, deps.verified())
+    early = context_result(req, deps.verified(), deps.unverified_cause())
     if early is not None:
         stages.add(Stage.CONTEXT, early)
         return

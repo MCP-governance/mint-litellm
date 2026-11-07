@@ -25,6 +25,7 @@ _SERVER = r"/v1/mcp/server/[^/]+"
 WRITE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (method, re.compile(pattern))
     for method, pattern in (
+        ("PUT", r"/v1/mcp/server"),  # 본문은 allow_all_keys 끄기뿐이다(아래 check_write)
         ("POST", r"/key/update"),
         ("POST", r"/team/update"),
         ("PUT", _SERVER + r"/approve"),
@@ -67,6 +68,18 @@ def check_write(method: str, path: str, body: Any) -> None:
     """보내기 전에 경로와 본문이 허용 범위인지 확인한다. 아니면 ``WriteRefused``."""
     if not any(m == method and pattern.fullmatch(path) for m, pattern in WRITE_ROUTES):
         raise WriteRefused(f"허용되지 않은 LiteLLM 쓰기 경로입니다: {method} {path}")
+    if path == "/v1/mcp/server":
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"server_id", "allow_all_keys"}
+            or not isinstance(body["server_id"], str)
+            or not body["server_id"]
+            or body["allow_all_keys"] is not False
+        ):
+            raise WriteRefused(
+                "PUT /v1/mcp/server 본문은 {server_id, allow_all_keys: false}만 보낼 수 있습니다."
+            )
+        return
     id_field = _ID_FIELD.get(path)
     if id_field is None:
         if body is not None:
@@ -192,6 +205,12 @@ class LiteLLMSync(LiteLLMAdmin):
         )
 
     # --- 서버 ---------------------------------------------------------------
+
+    def disable_allow_all_keys(self, server_id: str) -> dict | None:
+        """모든 키에 열린 서버를 닫는다. 본문은 서버 식별자와 ``allow_all_keys: false``뿐이다."""
+        return self._write(
+            "PUT", "/v1/mcp/server", {"server_id": server_id, "allow_all_keys": False}
+        )
 
     def approve_server(self, server_id: str) -> dict | None:
         quoted = urllib.parse.quote(server_id, safe="")

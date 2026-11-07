@@ -188,13 +188,29 @@ def permission_of(record: dict | None) -> tuple[list[str], dict[str, list[str]]]
 
 
 def load_rows(
-    conn: psycopg.Connection, instance_id: str, target_type: str, target_id: str
+    conn: psycopg.Connection,
+    instance_id: str,
+    target_type: str,
+    target_id: str,
+    *,
+    lock: bool = False,
 ) -> list[dict]:
+    """대상의 행. ``lock``이면 행을 잠그고 읽는다(트랜잭션 안에서 갱신 직전에 다시 읽을 때)."""
     return fetchall(
         conn,
         "SELECT * FROM mint.litellm_grants WHERE instance_id = %s AND target_type = %s"
-        " AND target_id = %s",
+        " AND target_id = %s" + (" ORDER BY id FOR UPDATE" if lock else ""),
         (instance_id, target_type, target_id),
+    )
+
+
+def mark_observed(conn: psycopg.Connection, grant_id: Any) -> dict:
+    """원하는 항목이 이미 LiteLLM에 있음을 확인했다(쓰기 직후 확인이 늦어 남은 행을 바로잡는다)."""
+    return fetchone(
+        conn,
+        "UPDATE mint.litellm_grants SET observed = true, observed_at = now() WHERE id = %s"
+        " RETURNING id, state_version",
+        (grant_id,),
     )
 
 

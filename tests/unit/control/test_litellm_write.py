@@ -185,3 +185,29 @@ def test_server_approval_calls_only_the_approve_path(fake, client):
 def test_credential_columns_are_scrubbed_from_reads(fake, client):
     fake.add_server("srv-c")
     assert "credentials" not in client.get_server("srv-c")
+
+
+def test_the_only_server_update_allowed_closes_allow_all_keys(fake, client):
+    fake.add_server("srv-1")
+    fake.servers["srv-1"]["allow_all_keys"] = True
+    client.disable_allow_all_keys("srv-1")
+    assert fake.writes() == [("PUT", "/v1/mcp/server",
+                              {"server_id": "srv-1", "allow_all_keys": False})]
+    assert fake.servers["srv-1"]["allow_all_keys"] is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"server_id": "s", "allow_all_keys": True},
+        {"server_id": "s", "allow_all_keys": "false"},
+        {"server_id": "s", "allow_all_keys": False, "url": "http://x.test"},
+        {"server_id": "s", "url": "http://x.test"},
+        {"allow_all_keys": False},
+        {"server_id": "", "allow_all_keys": False},
+        None,
+    ],
+)
+def test_a_server_update_with_anything_else_is_refused(body):
+    with pytest.raises(WriteRefused):
+        check_write("PUT", "/v1/mcp/server", body)

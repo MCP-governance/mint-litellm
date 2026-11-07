@@ -189,3 +189,20 @@ def test_an_external_deletion_is_restored_once_and_held_the_second_time(admin, r
         assert row["held"] is expected_held
         assert (key_permission(token)[0] == []) is expected_held
     assert len(events(admin, "sync_held")) == 1
+
+
+def test_a_server_opened_to_all_keys_is_closed_with_the_minimal_body(admin, real_worker):
+    name = f"open_{tag()}"
+    status, body = call("POST", "/v1/mcp/server", {
+        "server_name": name, "alias": name, "url": "http://upstream.invalid/mcp",
+        "transport": "http", "allow_all_keys": True})
+    assert status == 201 and body["allow_all_keys"] is True, body
+    server_id = body["server_id"]
+    add_server(admin, server_id)
+    add_approval(admin, "user", f"u_{tag()}", server_id=server_id)
+    reconcile(admin)
+    drain(real_worker)
+    status, body = call("GET", f"/v1/mcp/server/{server_id}")
+    assert body["allow_all_keys"] is False
+    assert body["url"] == "http://upstream.invalid/mcp"  # 다른 필드는 그대로
+    assert [a["kind"] for a in alerts(admin)] == ["sync_foreign_change"]

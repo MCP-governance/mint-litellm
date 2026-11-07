@@ -11,18 +11,22 @@ import signal
 import socket
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
 import psycopg
+from psycopg.errors import UniqueViolation
 
-from mint_litellm.control import alerts, jobs
+from mint_litellm.control import alerts, exports, jobs, ledger
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.db.connection import connect, fetchone
 from mint_litellm.control.errors import ControlError
 from mint_litellm.control.litellm_write import LiteLLMSync
 from mint_litellm.control.stage2_config import Stage2Settings
+from mint_litellm.restore import judge as restore_judge
+from mint_litellm.types.events import EventKind
 
 log = logging.getLogger("mint_litellm.worker")
 
@@ -31,12 +35,32 @@ POLL_SECONDS = 1.0
 RESTORE_BLOCKED_RETRY_SECONDS = 10
 
 
-def no_restore_detected(conn: psycopg.Connection, instance_id: str) -> bool:
-    """되돌림 판정(후속 단계). 지금은 판정 자체가 없어 언제나 「정상」으로 본다.
+# 되돌림 판정 주기(초). 플러그인과 같다.
+RESTORE_INTERVAL_SECONDS = 60.0
 
-    후속 단계가 이 함수를 대신한다. 되돌림 상태이면 참을 돌려준다.
-    """
-    return False
+
+class RestoreCheck:
+    """내보내기 파일과 DB의 내용 대조(``restore.judge``). 주기 안에서는 직전 판정을 돌려준다."""
+
+    def __init__(self, settings: Stage2Settings, interval: float = RESTORE_INTERVAL_SECONDS):
+        self.settings = settings
+        self.interval = interval
+        self.judge = restore_judge.Judge()
+        self._at = -1e18
+        self._last = restore_judge.Verdict(restore_judge.SKIP)
+
+    def __call__(self, conn: psycopg.Connection, instance_id: str) -> restore_judge.Verdict:
+        if time.monotonic() - self._at >= self.interval:
+            self._last = self.judge.evaluate(
+                conn, self.settings.export_dir, instance_id, exports.keys(self.settings)
+            )
+            self._at = time.monotonic()
+        return self._last
+
+
+def no_restore_detected(conn: psycopg.Connection, instance_id: str) -> restore_judge.Verdict:
+    """판정을 하지 않는 검사기(시험용)."""
+    return restore_judge.Verdict(restore_judge.OK)
 
 
 class Worker:
@@ -47,7 +71,8 @@ class Worker:
         settings: Stage2Settings,
         *,
         lease_seconds: float | None = None,
-        restore_check: Callable[[psycopg.Connection, str], bool] = no_restore_detected,
+        restore_check: Callable[[psycopg.Connection, str], restore_judge.Verdict | bool]
+        | None = None,
         owner: str | None = None,
         litellm: Any = None,
     ) -> None:
@@ -55,7 +80,10 @@ class Worker:
         self.instance_id = instance_id
         self.settings = settings
         self.lease_seconds = lease_seconds or settings.worker_lease_seconds
-        self.restore_check = restore_check
+        self.restore_check = restore_check or RestoreCheck(settings)
+        self.verdict = restore_judge.Verdict(restore_judge.SKIP)
+        self._reported_blocks: set[int] = set()
+        self._alerted: set[tuple] = set()
         self.litellm = litellm
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.stop = threading.Event()
@@ -81,6 +109,16 @@ class Worker:
             )
         jobs.ensure_schedules(self.conn, self.instance_id, self.settings)
 
+    def enqueue_startup_checkpoint(self) -> None:
+        """기동 직후 체크포인트 한 번(첫 ``latest.json``). 기존 파일 검증은 판정이 먼저 한다."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT INTO mint.jobs (id, instance_id, kind, target_ref, idempotency_key)"
+            " VALUES (gen_random_uuid(), %s, 'export_checkpoint', 'startup', %s)"
+            " ON CONFLICT (instance_id, idempotency_key) DO NOTHING",
+            (self.instance_id, f"export_checkpoint:start:{uuid.uuid4().hex}"),
+        )
+
     def close(self) -> None:
         for conn in (self.conn, self._beat_conn):
             if conn is not None:
@@ -98,6 +136,7 @@ class Worker:
     def step(self) -> bool:
         """일정 등록, 만료 회수, 작업 하나 처리. 작업을 처리했으면 참이다."""
         assert self.conn is not None
+        self.verdict = self._judge()
         jobs.register_due_schedules(self.conn, self.instance_id)
         jobs.reclaim_expired(self.conn, self.instance_id)
         if self.settings.webhook_urls:
@@ -109,6 +148,49 @@ class Worker:
             return False
         self._run(job)
         return True
+
+    def _judge(self) -> restore_judge.Verdict:
+        assert self.conn is not None
+        result = self.restore_check(self.conn, self.instance_id)
+        if isinstance(result, bool):  # 시험용 훅: 참이면 되돌림
+            result = restore_judge.Verdict(restore_judge.BLOCKED if result else restore_judge.OK)
+        if (
+            result.blocked
+            and result.cause == restore_judge.RESTORE_PENDING
+            and result.file_epoch not in self._reported_blocks
+        ):
+            self._reported_blocks.add(result.file_epoch)
+            try:  # 같은 파일 세대에 한 건(다른 실행기가 먼저 남겼으면 건너뛴다)
+                with self.conn.transaction():
+                    ledger.record(
+                        self.conn, self.instance_id, EventKind.RESTORE_BLOCKED,
+                        entity_id=str(result.file_epoch), state_version=1, actor="worker",
+                        payload={"cause": result.cause, **result.detail},
+                    )
+            except UniqueViolation:
+                pass
+        if result.blocked:
+            self._alert_blocked(result)
+        return result
+
+    def _alert_blocked(self, result: restore_judge.Verdict) -> None:
+        """차단 상태가 시작될 때 경보를 연다(같은 원인·파일 세대는 한 번만 부른다)."""
+        assert self.conn is not None
+        key = (result.cause, result.file_epoch)
+        if key in self._alerted:
+            return
+        self._alerted.add(key)
+        subject = {"cause": result.cause, "file_epoch": result.file_epoch, **result.detail}
+        with self.conn.transaction():
+            alerts.raise_alert(
+                self.conn, self.instance_id, kind="enforcement_unverified", severity="critical",
+                dedup_key=f"enforcement_unverified:restore:{result.cause}", subject=subject,
+            )
+            if result.cause == restore_judge.RESTORE_PENDING:
+                alerts.raise_alert(
+                    self.conn, self.instance_id, kind="restore_blocked", severity="critical",
+                    dedup_key=f"restore_blocked:{result.file_epoch}", subject=subject,
+                )
 
     def run_forever(self, poll_seconds: float = POLL_SECONDS) -> None:
         while not self.stop.is_set():
@@ -130,25 +212,19 @@ class Worker:
                 ctx.cancel.set()
                 return
 
-    def _before_write(self, ctx: jobs.JobContext) -> Callable[[], None]:
-        """외부 쓰기 직전 확인: 취소·임대 상실, 되돌림 상태(공통 경계가 들어올 때까지의 자리)."""
-
-        def check() -> None:
-            ctx.checkpoint()
-            if self.restore_check(ctx.conn, self.instance_id):
-                raise jobs.RestoreBlocked
-
-        return check
-
     def _run(self, job: dict) -> None:
         assert self.conn is not None
         conn, job_id = self.conn, job["id"]
-        restored = self.restore_check(conn, self.instance_id)
-        if restored and jobs.KINDS[job["kind"]].external_write:
+        verdict, kind = self.verdict, job["kind"]
+        if (verdict.blocked and jobs.KINDS[kind].external_write) or (
+            verdict.held and kind in jobs.EVIDENCE_KINDS
+        ):
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
             return
-        ctx = jobs.JobContext(conn, self.instance_id, job, self.settings, litellm=self.litellm)
-        ctx.before_write = self._before_write(ctx)
+        ctx = jobs.JobContext(
+            conn, self.instance_id, job, self.settings, litellm=self.litellm,
+            verdict=lambda: self.verdict,
+        )
         self.current = ctx
         if self.stop.is_set():
             ctx.cancel.set()
@@ -160,10 +236,10 @@ class Worker:
             jobs.HANDLERS[job["kind"]](ctx)
         except jobs.PermanentFailure as error:
             outcome = ("permanent", error.code)
-        except jobs.RestoreBlocked:
-            outcome = "restore_blocked"
         except jobs.Cancelled:
             outcome = "cancelled"
+        except jobs.RestoreBlocked:
+            outcome = "restore_blocked"
         except Exception as error:  # 어떤 실패도 작업 실패로 센다(메시지는 저장하지 않는다)
             code = str(getattr(error, "code", None) or type(error).__name__)[:100]
             log.warning("작업 %s(%s) 실패: %s", job["kind"], job_id, code)
@@ -212,6 +288,7 @@ def main(environ: Mapping[str, str] | None = None) -> int:
         litellm = LiteLLMSync(config.litellm_url, config.litellm_key)
     worker = Worker(config.require_database(), config.instance_id, settings, litellm=litellm)
     worker.open()
+    worker.enqueue_startup_checkpoint()
     restore = install_signals(worker)
     print(f"작업 실행기 시작: {worker.owner}", file=sys.stderr, flush=True)
     try:

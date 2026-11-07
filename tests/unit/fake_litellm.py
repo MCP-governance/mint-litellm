@@ -30,6 +30,7 @@ class FakeLiteLLM:
         self.requests: list[tuple[str, str, object]] = []
         self.before_write = None  # 쓰기를 처리하기 전에 부르는 함수(동시 수정 흉내)
         self.after_write = None  # 쓰기를 처리한 뒤 부르는 함수(응답 직후 덮어쓰는 흉내)
+        self.ignore_allow_all_keys = False  # 서버 수정이 allow_all_keys 끄기를 무시하는 흉내
         self.fail_writes: dict[str, int] = {}  # 경로 -> 강제로 낼 상태 코드
         fake = self
 
@@ -81,7 +82,8 @@ class FakeLiteLLM:
 
     def add_server(self, server_id: str, status: str = "active") -> dict:
         server = {"server_id": server_id, "server_name": server_id, "approval_status": status,
-                  "url": None, "pinned_tools": None, "credentials": {"secret": "x"}}
+                  "url": None, "pinned_tools": None, "allow_all_keys": False,
+                  "credentials": {"secret": "x"}}
         self.servers[server_id] = server
         return server
 
@@ -111,6 +113,13 @@ class FakeLiteLLM:
         if method == "GET" and path == "/v1/mcp/server":
             return 200, [copy.deepcopy(s) for s in self.servers.values()
                          if s["approval_status"] == "active"]
+        if method == "PUT" and path == "/v1/mcp/server":
+            server = self.servers.get(body["server_id"])
+            if server is None:
+                return 404, {"detail": {"error": "not found"}}
+            if not self.ignore_allow_all_keys:
+                server.update({k: v for k, v in body.items() if k != "server_id"})
+            return 200, copy.deepcopy(server)
         if path.startswith("/v1/mcp/server/"):
             rest = path[len("/v1/mcp/server/"):]
             server_id, _, action = rest.partition("/")

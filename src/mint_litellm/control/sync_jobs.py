@@ -34,6 +34,7 @@ from mint_litellm.control.sync_state import (
     desired_for_target,
     load_rows,
     make_plan,
+    mark_observed,
     permission_of,
     pin_satisfied,
     present,
@@ -63,7 +64,7 @@ def _actor_context(ctx: JobContext) -> Context:
 def _client(ctx: JobContext) -> LiteLLMSync:
     if ctx.litellm is None:
         raise NotConfigured("MINT_LITELLM_URL과 MINT_LITELLM_KEY가 없어 동기화할 수 없습니다.")
-    return ctx.litellm.with_hook(ctx.before_write)
+    return ctx.litellm.with_hook(ctx.external_write)
 
 
 def _reachable(handler: Callable[[JobContext], None]) -> Callable[[JobContext], None]:
@@ -134,14 +135,19 @@ def _write(client: LiteLLMSync, kind: str, target_id: str, plan: Plan) -> dict:
 
 
 def _record(
-    ctx: JobContext, kind: str, target_id: str, plan: Plan, rows: list[dict],
+    ctx: JobContext, kind: str, target_id: str, plan: Plan,
     before: tuple[list[str], dict], after: tuple[list[str], dict], written: bool,
 ) -> list[dict]:
     """읽어 확인한 결과를 ``litellm_grants``에 적고 사건을 남긴다. 확인되지 않은 항목을 돌려준다."""
     conn, inst = ctx.conn, ctx.instance_id
-    old = {(r["item"], r["server_id"]): r for r in rows if r["observed"] is not None}
     unconfirmed: list[dict] = []
     with conn.transaction():
+        # 쓰는 사이 다른 작업이 바꿨을 수 있으므로 갱신 직전에 행을 잠그고 다시 읽는다
+        old = {
+            (r["item"], r["server_id"]): r
+            for r in load_rows(conn, inst, kind, target_id, lock=True)
+            if r["observed"] is not None
+        }
         for it in plan.items:
             confirmed = present(it, *after)
             tools = it.tools if it.item == "tool_permission" else None
@@ -158,6 +164,8 @@ def _record(
                     unconfirmed.append(_payload(kind, target_id, it, "grant"))
                 continue
             # 거두는 항목: 원래 있던 것은 그대로 두고 관리만 끝낸다
+            if (it.item, it.server_id) not in old:
+                continue  # 그 사이 다른 작업이 이미 거뒀다
             if it.preexisting or confirmed:
                 grant = withdraw_grant(conn, old[(it.item, it.server_id)]["id"])
                 if not it.preexisting and written:
@@ -172,6 +180,24 @@ def _payload(kind: str, target_id: str, it: Item, action: str) -> dict:
     return {"target_type": kind, "target_id": target_id, "item": it.item,
             "server_id": it.server_id, "tools": it.tools, "preexisting": it.preexisting,
             "action": action}
+
+
+def _pre_record(
+    ctx: JobContext, kind: str, target_id: str, plan: Plan, before: tuple[list[str], dict]
+) -> None:
+    """쓰기 전에 더할 항목의 행을 ``observed=false``로 먼저 적는다.
+
+    쓰고 나서 기록하기 전에 죽어도 다음 실행이 MINT가 넣은 항목을 원래 있던 것
+    (``preexisting``)으로 잘못 보지 않는다.
+    """
+    with ctx.conn.transaction():
+        for it in plan.items:
+            if it.want and not present(it, *before):
+                upsert_grant(
+                    ctx.conn, ctx.instance_id, kind, target_id, it.item, it.server_id,
+                    tools=it.tools if it.item == "tool_permission" else None,
+                    preexisting=it.preexisting, observed=False,
+                )
 
 
 @_reachable
@@ -194,6 +220,7 @@ def sync_target(ctx: JobContext) -> None:
     plan = make_plan(*before, desired, rows)
     response = None
     if plan.changed:
+        _pre_record(ctx, kind, target_id, plan, before)
         try:
             response = _write(client, kind, target_id, plan)
         except LiteLLMForbidden:
@@ -216,7 +243,7 @@ def sync_target(ctx: JobContext) -> None:
             resolve_alert(conn, inst, key)
     reread = _read(client, kind, target_id)
     after = permission_of(reread)
-    unconfirmed = _record(ctx, kind, target_id, plan, rows, before, after, response is not None)
+    unconfirmed = _record(ctx, kind, target_id, plan, before, after, response is not None)
     key = f"sync_divergence:readback:{ref}"
     if unconfirmed:
         raise_alert(conn, inst, kind="sync_divergence", severity="medium", dedup_key=key,
@@ -420,6 +447,12 @@ def _missing(row: dict, desired: Any, servers: list[str], tools: dict) -> bool:
     return bool(want) and not want <= set(tools.get(row["server_id"], ()))
 
 
+def _wanted(row: dict, desired: Any) -> bool:
+    if row["item"] == "mcp_server":
+        return row["server_id"] in desired.servers
+    return bool(desired.tools.get(row["server_id"]))
+
+
 def _count_missing(
     ctx: JobContext, kind: str, target_id: str, row: dict, window_seconds: int
 ) -> bool:
@@ -462,10 +495,51 @@ def _reconcile_target(
             continue
         if not _count_missing(ctx, kind, target_id, row, window_seconds):
             regrant = True
+    # 반영 직후 확인이 늦어 ``observed=false``로 남은 행: 항목이 이미 LiteLLM에 있으면 바로잡는다
+    fixed = False
+    for row in rows:
+        if (
+            row["observed"] is False
+            and not row["held"]
+            and _wanted(row, desired)
+            and not _missing(row, desired, servers, tools)
+        ):
+            with conn.transaction():
+                mark_observed(conn, row["id"])
+            fixed = True
     after = load_rows(conn, inst, kind, target_id)
     plan = make_plan(servers, tools, desired, after)
+    if fixed:
+        _request_finalize(ctx, _pending_approvals(conn, inst, desired.approvals))
     if plan.changed or regrant:
         enqueue_job(_actor_context(ctx), "sync_target", ref)
+
+
+def _close_allow_all_keys(
+    ctx: JobContext, client: LiteLLMSync, server_id: str, server: dict
+) -> None:
+    """통제하는 서버가 모든 키에 열려 있으면 외부 변경으로 보고 닫은 뒤 다시 읽어 확인한다."""
+    conn, inst = ctx.conn, ctx.instance_id
+    changed_key = f"sync_foreign_change:server:{server_id}"
+    failed_key = f"sync_divergence:allow_all_keys:{server_id}"
+    if server.get("allow_all_keys") is not True:
+        resolve_alert(conn, inst, failed_key)
+        return
+    reason = None
+    try:
+        client.disable_allow_all_keys(server_id)
+        reread = client.get_server(server_id) or {}
+        if reread.get("allow_all_keys") is True:
+            reason = "still_enabled"
+    except LiteLLMHttpError:  # 거부(403)도 같은 계열이다
+        reason = "write_failed"
+    raise_alert(conn, inst, kind="sync_foreign_change", severity="high", dedup_key=changed_key,
+                subject={"server_id": server_id, "fields": ["allow_all_keys"]})
+    if reason is None:
+        resolve_alert(conn, inst, failed_key)
+    else:
+        raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=failed_key,
+                    subject={"server_id": server_id, "reason": f"allow_all_keys_{reason}"})
 
 
 def _reconcile_server(ctx: JobContext, client: LiteLLMSync, server_id: str) -> None:
@@ -476,6 +550,7 @@ def _reconcile_server(ctx: JobContext, client: LiteLLMSync, server_id: str) -> N
         raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=key,
                     subject={"server_id": server_id, "reason": "registry_missing"})
         return
+    _close_allow_all_keys(ctx, client, server_id, server)
     status = server.get("approval_status")
     grant = fetchone(
         conn,
