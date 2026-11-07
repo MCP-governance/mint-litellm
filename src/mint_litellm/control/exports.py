@@ -11,7 +11,7 @@ from typing import Any
 
 import psycopg
 
-from mint_litellm.control import ledger
+from mint_litellm.control import alerts, ledger
 from mint_litellm.control.db.connection import fetchone
 from mint_litellm.control.errors import ControlError
 from mint_litellm.control.jobs import JobContext
@@ -188,6 +188,11 @@ def write_export(
         conn.execute("UPDATE mint.exports SET status = 'failed' WHERE id = %s", (row["id"],))
         _event(conn, instance_id, EventKind.EXPORT_FAILED, row,
                {"kind": kind, "state_epoch": epoch, "reason": type(error).__name__}, actor)
+        alerts.raise_alert(
+            conn, instance_id, kind="export_failed", severity="high",
+            dedup_key=f"export_failed:{kind}",
+            subject={"kind": kind, "state_epoch": epoch, "reason": type(error).__name__},
+        )
         raise ExportFailed(f"내보내기 파일을 쓰지 못했습니다: {type(error).__name__}") from None
     conn.execute(
         "UPDATE mint.exports SET status = 'written', written_at = now() WHERE id = %s",

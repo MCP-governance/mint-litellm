@@ -165,9 +165,7 @@ def test_a_kind_without_a_handler_cannot_be_registered(url):
     with psycopg.connect(url) as conn:
         ensure(conn, INSTANCE)
         ctx = make_ctx(conn)
-        for kind, key in (
-            ("sync_server", None), ("session_verify", "s:x"), ("alert_deliver", "a:1")
-        ):
+        for kind, key in (("sync_server", None), ("session_verify", "s:x")):
             with pytest.raises(ControlError, match="처리기가 없습니다"):
                 base.enqueue_job(ctx, kind, "x", key)
         assert base.enqueue_job(ctx, "approval_expiry_scan", "x", "approval_expiry_scan:t")
@@ -504,7 +502,8 @@ def test_a_restored_database_blocks_external_writes_but_not_the_rest(
         assert row["run_after"] > fetchone(admin, "SELECT now() AS n")["n"]
     assert job(admin, free)["status"] == "done"
     assert len(calls) >= 3  # 작업 전마다 판정한다
-    assert not alerts(admin)  # 시도 횟수와 경보를 쓰지 않는다
+    # 작업은 실패가 아니라 대기이므로 job_failed 경보는 없고, 차단 자체의 경보 하나만 열린다
+    assert [a["kind"] for a in alerts(admin)] == ["enforcement_unverified"]
 
 
 def test_the_default_check_never_blocks(make_worker, admin, all_handlers):
@@ -718,6 +717,9 @@ def test_the_first_mismatch_holds_evidence_jobs_only_and_the_second_blocks_all_w
     assert [k for k, _ in all_handlers] == ["sync_server", "sync_server"]
     events = fetchall(admin, "SELECT * FROM mint.events WHERE kind = 'restore_blocked'")
     assert len(events) == 1 and events[0]["source_key"].endswith(":1:restore_blocked")
+    raised = {a["kind"]: a for a in alerts(admin)}
+    assert raised["enforcement_unverified"]["subject"]["cause"] == "restore_pending"
+    assert raised["restore_blocked"]["count"] == 1  # 같은 차단은 한 번만 연다
     worker.step()
     assert fetchone(admin, "SELECT count(*) AS n FROM mint.events"
                     " WHERE kind = 'restore_blocked'")["n"] == 1  # 한 번만 남긴다

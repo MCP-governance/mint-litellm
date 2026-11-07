@@ -219,6 +219,8 @@ def test_a_failed_write_leaves_the_old_file_marks_failed_and_retries(
     row = fetchone(admin, "SELECT * FROM mint.exports WHERE kind = 'negative_state'")
     assert row["status"] == "failed" and row["attempts"] == 1
     assert "export_failed" in [r["kind"] for r in fetchall(admin, "SELECT kind FROM mint.events")]
+    alert = fetchone(admin, "SELECT * FROM mint.alerts WHERE kind = 'export_failed'")
+    assert alert["severity"] == "high" and alert["status"] == "open"
     monkeypatch.setattr(os, "replace", real)
     exports.write_export(worker_conn, INSTANCE, settings, "negative_state")
     row = fetchone(admin, "SELECT * FROM mint.exports WHERE kind = 'negative_state'")

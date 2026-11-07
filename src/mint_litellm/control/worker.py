@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping
 import psycopg
 from psycopg.errors import UniqueViolation
 
-from mint_litellm.control import exports, jobs, ledger
+from mint_litellm.control import alerts, exports, jobs, ledger
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.db.connection import connect, fetchone
 from mint_litellm.control.errors import ControlError
@@ -80,6 +80,7 @@ class Worker:
         self.restore_check = restore_check or RestoreCheck(settings)
         self.verdict = restore_judge.Verdict(restore_judge.SKIP)
         self._reported_blocks: set[int] = set()
+        self._alerted: set[tuple] = set()
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.stop = threading.Event()
         self.current: jobs.JobContext | None = None
@@ -134,6 +135,8 @@ class Worker:
         self.verdict = self._judge()
         jobs.register_due_schedules(self.conn, self.instance_id)
         jobs.reclaim_expired(self.conn, self.instance_id)
+        if self.settings.webhook_urls:
+            alerts.enqueue_deliveries(self.conn, self.instance_id, self.settings.webhook_urls)
         job = jobs.lease(
             self.conn, self.instance_id, self.owner, self.lease_seconds, sorted(jobs.HANDLERS)
         )
@@ -162,7 +165,28 @@ class Worker:
                     )
             except UniqueViolation:
                 pass
+        if result.blocked:
+            self._alert_blocked(result)
         return result
+
+    def _alert_blocked(self, result: restore_judge.Verdict) -> None:
+        """차단 상태가 시작될 때 경보를 연다(같은 원인·파일 세대는 한 번만 부른다)."""
+        assert self.conn is not None
+        key = (result.cause, result.file_epoch)
+        if key in self._alerted:
+            return
+        self._alerted.add(key)
+        subject = {"cause": result.cause, "file_epoch": result.file_epoch, **result.detail}
+        with self.conn.transaction():
+            alerts.raise_alert(
+                self.conn, self.instance_id, kind="enforcement_unverified", severity="critical",
+                dedup_key=f"enforcement_unverified:restore:{result.cause}", subject=subject,
+            )
+            if result.cause == restore_judge.RESTORE_PENDING:
+                alerts.raise_alert(
+                    self.conn, self.instance_id, kind="restore_blocked", severity="critical",
+                    dedup_key=f"restore_blocked:{result.file_epoch}", subject=subject,
+                )
 
     def run_forever(self, poll_seconds: float = POLL_SECONDS) -> None:
         while not self.stop.is_set():

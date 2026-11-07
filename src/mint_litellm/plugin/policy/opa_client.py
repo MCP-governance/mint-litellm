@@ -47,6 +47,8 @@ class OPAClient:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self._url = base_url.rstrip("/") + "/v1/data/mint/decision"
+        self._context_url = base_url.rstrip("/") + "/v1/data/mint/context"
+        self._markers: tuple[tuple[str, str], tuple[str, ...]] | None = None
         self._timeout = timeout_seconds
         self._client: httpx.AsyncClient | None = None
         self._owner: tuple[int, asyncio.AbstractEventLoop] | None = None
@@ -64,6 +66,29 @@ class OPAClient:
         elif self._owner != owner:
             raise RuntimeError("OPAClient is bound to the process and event loop that created it")
         return self._client
+
+    async def secret_markers(
+        self, *, policy_version_id: str, bundle_sha256: str, budget_seconds: float | None = None
+    ) -> tuple[str, ...] | None:
+        """활성 번들의 비밀 표지 목록. 판본마다 한 번만 읽고, 판본이 다르면 ``None``이다."""
+        version = (policy_version_id, bundle_sha256)
+        if self._markers is not None and self._markers[0] == version:
+            return self._markers[1]
+        budget = self._timeout if budget_seconds is None else budget_seconds
+        if budget <= 0:
+            return None
+        try:
+            response = await self._http().get(self._context_url, timeout=budget)
+            response.raise_for_status()
+            result = response.json()["result"]
+            meta = (result["bundle"]["policy_version_id"], result["bundle"]["bundle_sha256"])
+            markers = tuple(result["secret_markers"])
+        except (KeyError, TypeError, ValueError, httpx.HTTPError):
+            return None
+        if meta != version or not all(isinstance(m, str) and m for m in markers):
+            return None
+        self._markers = (version, markers)
+        return markers
 
     async def evaluate(
         self,
