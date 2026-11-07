@@ -529,3 +529,28 @@ def test_attest_that_only_accepts_a_seal_anchor_mismatch_needs_two_admins(world)
         conn.commit()
     assert out["reapplied"] == []
     assert run_worker(world, "live").state == judge.OK
+
+
+def test_publish_recomputes_the_anchor_and_ignores_a_forged_null_cause(world):
+    """cause를 NULL로 꾸미고 2인 없이 만든 요청은 앵커가 어긋났으면 거부된다."""
+    file_epoch = revoke_and_export(world)
+    settings = world["settings"]
+    path = files.latest_path(settings.export_dir, INSTANCE)
+    doc = files.read_verified(path, exports.keys(settings))
+    doc.update(to_seal_seq=1, tail_hash="00" * 32)  # 앵커만 어긋난 파일
+    files.atomic_write(path, files.sign(doc, settings.export_hmac_key))
+    add_admins(world["live"])
+    with psycopg.connect(world["live"]) as conn:
+        out = restore.attest(make_ctx(conn), settings, "앵커 인정", operator("second", "u2"))
+        conn.commit()
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        # 요청을 꾸민다: cause와 second_approver를 지운다(정상 요청은 둘 다 채워져 있다)
+        conn.execute("ALTER TABLE mint.restore_requests DISABLE TRIGGER restore_requests_2_frozen")
+        conn.execute("UPDATE mint.restore_requests SET cause = NULL, second_approver = NULL")
+        conn.execute("ALTER TABLE mint.restore_requests ENABLE TRIGGER restore_requests_2_frozen")
+    before = path.read_bytes()
+    run_worker(world, "live")
+    assert path.read_bytes() == before and out["request_id"]
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "pending"
+    assert file_epoch
