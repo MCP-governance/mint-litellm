@@ -24,3 +24,4 @@ export ACC_READY_URLS=http://127.0.0.1:4300,http://127.0.0.1:4301 ACC_RESTORE_SE
 export ACC_PLUGIN_SERVICES="litellm litellm2 worker" ACC_BUFFER_SERVICE=litellm ACC_BUFFER_CONTAINER_DIR=/var/lib/mint/buffer
 export MINT_POLICY_ROOT="$REPO" ACC_SITE="$REPO/tests/acceptance/stage2/.runtime/site.json"
 mkdir -p "$ACC_STATE_DIR"
+[ -f "$STATE/local.env" ] && . "$STATE/local.env"

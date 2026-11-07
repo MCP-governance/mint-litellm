@@ -17,7 +17,7 @@ C=(docker compose --env-file deploy/.env -f deploy/compose.yaml -f tests/accepta
 "${C[@]}" --profile worker --profile console up -d worker console
 "$PY" "$HERE/bootstrap.py" operators
 pkill -f counter_service.py || true
-setsid nohup "$PY" "$HERE/counter_service.py" http://127.0.0.1:4320/__log 4350 > "$ACC_HOME/counter.log" 2>&1 < /dev/null &
+setsid nohup "$PY" "$HERE/counter_service.py" http://127.0.0.1:4320/__log 4350 0.0.0.0 > "$ACC_HOME/counter.log" 2>&1 < /dev/null &
 source "$HERE/env.sh"
 mkdir -p tests/acceptance/stage2/.runtime
 "$PY" "$HERE/make_site.py" > tests/acceptance/stage2/.runtime/site.json
