@@ -1,0 +1,330 @@
+"""작업 표: 작업 종류, 임대, 연장, 회수, 재시도, 일정.
+
+작업 실행기(``worker.py``)와 서비스 계층의 작업 등록(``services/base.py``)이 같은 표를 쓴다.
+모든 상태 전이는 한 문장 또는 한 트랜잭션이며, 같은 대상의 수렴 작업이 실행 중이면 그 대상의
+대기 작업을 임대하지 않는다. 연결은 자동 커밋이어야 한다(문장마다 확정).
+"""
+
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
+
+import psycopg
+from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
+
+from mint_litellm.control.db.connection import fetchall, fetchone
+from mint_litellm.control.services import expiry
+from mint_litellm.types.ids import new_uuid7
+
+MAX_BACKOFF_SECONDS = 600
+
+
+@dataclass(frozen=True)
+class JobKind:
+    # 멱등 키 없이 대상당 대기 행 1개로 수렴하는 작업(실행 시점의 DB 상태를 읽는다)
+    convergent: bool = False
+    # 되돌림 상태에서 실행하지 않는 외부 쓰기 작업(되돌림 보호)
+    external_write: bool = False
+
+
+KINDS: dict[str, JobKind] = {
+    "submission_poll": JobKind(),
+    "intake_run": JobKind(),
+    "contract_observe": JobKind(convergent=True),
+    "sync_server": JobKind(convergent=True, external_write=True),
+    "sync_target": JobKind(convergent=True, external_write=True),
+    "sync_reconcile": JobKind(external_write=True),
+    "activation_finalize": JobKind(convergent=True, external_write=True),
+    "seal": JobKind(),
+    "export_negative_state": JobKind(external_write=True),
+    "export_checkpoint": JobKind(external_write=True),
+    "alert_deliver": JobKind(external_write=True),
+    "approval_expiry_scan": JobKind(),
+    "evidence_expiry_scan": JobKind(),
+    "session_verify": JobKind(),
+}
+
+# 우선순위: export_negative_state > sync_* > 나머지(같으면 run_after 순).
+PRIORITY_SQL = (
+    "CASE WHEN j.kind = 'export_negative_state' THEN 0"
+    " WHEN j.kind LIKE 'sync\\_%%' THEN 1 ELSE 2 END"
+)
+
+
+class Cancelled(Exception):
+    """작업 코드가 취소 신호를 보고 외부 호출을 멈추고 끝낼 때 낸다."""
+
+
+@dataclass
+class JobContext:
+    """처리기에 건네는 맥락. 처리기는 외부 호출 전에 ``checkpoint()``로 취소를 확인한다."""
+
+    conn: psycopg.Connection
+    instance_id: str
+    job: dict
+    settings: Any = None
+    cancel: threading.Event = field(default_factory=threading.Event)
+    lost: threading.Event = field(default_factory=threading.Event)
+
+    def checkpoint(self) -> None:
+        if self.cancel.is_set():
+            raise Cancelled
+
+
+def _approval_expiry_scan(job: JobContext) -> None:
+    expiry.expire_due(job.conn, job.instance_id)
+
+
+# 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
+HANDLERS: dict[str, Callable[[JobContext], None]] = {
+    "approval_expiry_scan": _approval_expiry_scan,
+}
+
+# 일정(주기 작업): 종류 -> 설정에서 주기(초)를 얻는 함수. 처리기가 있는 종류만 일정을 만든다.
+SCHEDULES: dict[str, Callable[[Any], int]] = {
+    "approval_expiry_scan": lambda s: 60,
+    "seal": lambda s: 60,
+    "submission_poll": lambda s: s.submission_poll_seconds,
+    "sync_reconcile": lambda s: s.reconcile_seconds,
+    "export_checkpoint": lambda s: s.checkpoint_seconds,
+    "session_verify": lambda s: s.session_verify_seconds,
+}
+
+
+def backoff_seconds(attempts: int) -> int:
+    return min(2**attempts * 5, MAX_BACKOFF_SECONDS)
+
+
+def period_key(kind: str, period_start: datetime) -> str:
+    """예약 작업의 멱등 키 ``<kind>:<주기 시작 시각>``. 시각은 UTC 초 단위 ISO 8601이다."""
+    return f"{kind}:{period_start.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+
+
+# --- 임대 --------------------------------------------------------------------
+
+
+def lease(
+    conn: psycopg.Connection, instance_id: str, owner: str, lease_seconds: float, kinds: list[str]
+) -> dict | None:
+    """실행할 대기 작업 하나를 잡는다. 같은 대상에 실행 중인 수렴 작업이 있으면 건너뛴다."""
+    with conn.transaction():
+        return fetchone(
+            conn,
+            "WITH picked AS ("
+            " SELECT j.id FROM mint.jobs j"
+            " WHERE j.instance_id = %(inst)s AND j.status = 'pending' AND j.run_after <= now()"
+            "  AND j.kind = ANY(%(kinds)s)"
+            "  AND NOT (j.idempotency_key IS NULL AND EXISTS ("
+            "   SELECT 1 FROM mint.jobs r WHERE r.instance_id = j.instance_id AND r.kind = j.kind"
+            "   AND r.target_ref = j.target_ref AND r.status = 'running'))"
+            f" ORDER BY {PRIORITY_SQL}, j.run_after LIMIT 1 FOR UPDATE SKIP LOCKED)"
+            " UPDATE mint.jobs SET status = 'running', lease_owner = %(owner)s,"
+            " lease_until = now() + make_interval(secs => %(secs)s), updated_at = now()"
+            " FROM picked WHERE jobs.id = picked.id RETURNING jobs.*",
+            {"inst": instance_id, "kinds": kinds, "owner": owner, "secs": lease_seconds},
+        )
+
+
+def extend(conn: psycopg.Connection, job_id: Any, owner: str, lease_seconds: float) -> bool:
+    """임대를 연장한다. 이미 만료됐거나 다른 소유자가 가졌으면 거짓이다(임대를 잃음)."""
+    return (
+        conn.execute(
+            "UPDATE mint.jobs SET lease_until = now() + make_interval(secs => %s),"
+            " updated_at = now() WHERE id = %s AND status = 'running' AND lease_owner = %s"
+            " AND lease_until > now()",
+            (lease_seconds, job_id, owner),
+        ).rowcount
+        == 1
+    )
+
+
+def complete(conn: psycopg.Connection, job_id: Any, owner: str) -> bool:
+    return (
+        conn.execute(
+            "UPDATE mint.jobs SET status = 'done', lease_owner = NULL, lease_until = NULL,"
+            " last_error_code = NULL, updated_at = now()"
+            " WHERE id = %s AND status = 'running' AND lease_owner = %s",
+            (job_id, owner),
+        ).rowcount
+        == 1
+    )
+
+
+# --- 재시도·실패·회수 -----------------------------------------------------------
+
+
+def _alert_failed(conn: psycopg.Connection, row: dict, error_code: str) -> None:
+    """같은 종류·대상의 미해결 경보가 있으면 횟수만 올린다."""
+    dedup = f"job_failed:{row['kind']}:{row['target_ref']}"[:512]
+    conn.execute(
+        "INSERT INTO mint.alerts (id, instance_id, kind, severity, dedup_key, subject)"
+        " VALUES (%s, %s, 'job_failed', 'high', %s, %s)"
+        " ON CONFLICT (instance_id, dedup_key) WHERE status <> 'resolved'"
+        " DO UPDATE SET count = mint.alerts.count + 1, last_at = now()",
+        (
+            new_uuid7(),
+            row["instance_id"],
+            dedup,
+            Jsonb(
+                {
+                    "job_kind": row["kind"],
+                    "target_ref": row["target_ref"],
+                    "job_id": str(row["id"]),
+                    "attempts": row["attempts"],
+                    "last_error_code": error_code,
+                }
+            ),
+        ),
+    )
+
+
+def _requeue(
+    conn: psycopg.Connection,
+    job_id: Any,
+    guard: str,
+    params: tuple,
+    code: str | None,
+    *,
+    count: bool,
+    delay: float | None = None,
+) -> str | None:
+    """실행 중 작업을 ``pending`` 또는 ``failed``로 돌린다. ``guard``를 만족하는 행이 없으면 None.
+
+    ``count``이면 시도 횟수를 올리고 한도에 닿으면 ``failed``와 경보 ``job_failed``이다.
+    ``delay``가 None이면 재시도 간격 공식을 쓴다.
+    """
+    with conn.transaction():
+        row = fetchone(
+            conn,
+            "SELECT * FROM mint.jobs WHERE id = %s AND status = 'running' AND "
+            + guard
+            + " FOR UPDATE",
+            (job_id, *params),
+        )
+        if row is None:
+            return None
+        attempts = row["attempts"] + (1 if count else 0)
+        if count and attempts >= row["max_attempts"]:
+            conn.execute(
+                "UPDATE mint.jobs SET status = 'failed', attempts = %s, last_error_code = %s,"
+                " lease_owner = NULL, lease_until = NULL, updated_at = now() WHERE id = %s",
+                (attempts, code, job_id),
+            )
+            _alert_failed(conn, {**row, "attempts": attempts}, code or "")
+            return "failed"
+        wait = backoff_seconds(attempts) if delay is None else delay
+        try:
+            with conn.transaction():  # 세이브포인트: 같은 대상의 대기 행이 따로 있으면 실패한다
+                conn.execute(
+                    "UPDATE mint.jobs SET status = 'pending', attempts = %s, last_error_code = %s,"
+                    " run_after = now() + make_interval(secs => %s), lease_owner = NULL,"
+                    " lease_until = NULL, updated_at = now() WHERE id = %s",
+                    (attempts, code, wait, job_id),
+                )
+        except UniqueViolation:
+            # 대기 행이 실행 시점 상태를 읽으므로(수렴) 그 행에 합치고 이 행은 끝낸다.
+            conn.execute(
+                "UPDATE mint.jobs SET attempts = GREATEST(attempts, %s),"
+                " run_after = GREATEST(run_after, now() + make_interval(secs => %s)),"
+                " last_error_code = %s, updated_at = now()"
+                " WHERE instance_id = %s AND kind = %s AND target_ref = %s"
+                " AND status = 'pending' AND idempotency_key IS NULL",
+                (attempts, wait, code, row["instance_id"], row["kind"], row["target_ref"]),
+            )
+            conn.execute(
+                "UPDATE mint.jobs SET status = 'done', last_error_code = 'superseded',"
+                " lease_owner = NULL, lease_until = NULL, updated_at = now() WHERE id = %s",
+                (job_id,),
+            )
+            return "done"
+        return "pending"
+
+
+def fail(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> str | None:
+    """처리기가 실패했다. ``pending``(재시도), ``failed``, 임대를 잃었으면 None을 돌려준다."""
+    return _requeue(conn, job_id, "lease_owner = %s", (owner,), code, count=True)
+
+
+def release(
+    conn: psycopg.Connection, job_id: Any, owner: str, code: str | None, delay: float = 0
+) -> str | None:
+    """시도 횟수를 올리지 않고 임대를 놓는다(종료 신호, 되돌림 차단)."""
+    return _requeue(conn, job_id, "lease_owner = %s", (owner,), code, count=False, delay=delay)
+
+
+def reclaim_expired(conn: psycopg.Connection, instance_id: str) -> int:
+    """임대가 만료된 ``running`` 작업을 되돌린다(작업 실행기가 죽은 경우). 시도 한 번으로 센다."""
+    ids = fetchall(
+        conn,
+        "SELECT id FROM mint.jobs WHERE instance_id = %s AND status = 'running'"
+        " AND lease_until <= now()",
+        (instance_id,),
+    )
+    reclaimed = 0
+    for row in ids:
+        # 그 사이 연장·완료됐거나 다른 실행기가 먼저 회수했으면 건너뛴다
+        if _requeue(
+            conn, row["id"], "lease_until <= now()", (), "lease_expired", count=True
+        ):
+            reclaimed += 1
+    return reclaimed
+
+
+# --- 일정 --------------------------------------------------------------------
+
+
+def ensure_schedules(conn: psycopg.Connection, instance_id: str, settings: Any) -> None:
+    """처리기가 있는 주기 작업의 일정 행을 만든다. 주기가 설정과 다르면 맞춘다."""
+    with conn.transaction():
+        for kind, interval in SCHEDULES.items():
+            if kind not in HANDLERS:
+                continue
+            conn.execute(
+                "INSERT INTO mint.schedules (instance_id, kind, interval_seconds, next_run_at)"
+                " VALUES (%s, %s, %s, date_trunc('second', now()))"
+                " ON CONFLICT (instance_id, kind) DO UPDATE"
+                " SET interval_seconds = EXCLUDED.interval_seconds"
+                " WHERE mint.schedules.interval_seconds <> EXCLUDED.interval_seconds",
+                (instance_id, kind, interval(settings)),
+            )
+
+
+def register_due_schedules(conn: psycopg.Connection, instance_id: str) -> int:
+    """주기가 된 일정마다 작업을 한 번 등록한다.
+
+    일정 행을 ``FOR UPDATE SKIP LOCKED``로 잡고 멱등 키 ``<kind>:<주기 시작 시각>``으로 넣으므로
+    실행기가 여럿이어도 한 주기에 한 번이다. 실행기가 멈춰 있던 동안 놓친 주기는 건너뛰고
+    현재 주기 하나만 등록한다.
+    """
+    with conn.transaction():
+        due = fetchall(
+            conn,
+            "WITH due AS ("
+            " SELECT kind, interval_seconds, next_run_at + make_interval(secs => interval_seconds"
+            "  * floor(extract(epoch FROM now() - next_run_at) / interval_seconds)) AS period_start"
+            " FROM mint.schedules WHERE instance_id = %s AND enabled AND next_run_at <= now()"
+            " FOR UPDATE SKIP LOCKED)"
+            " UPDATE mint.schedules s SET next_run_at ="
+            " due.period_start + make_interval(secs => s.interval_seconds)"
+            " FROM due WHERE s.instance_id = %s AND s.kind = due.kind"
+            " RETURNING due.kind, due.period_start",
+            (instance_id, instance_id),
+        )
+        registered = 0
+        for row in due:
+            registered += conn.execute(
+                "INSERT INTO mint.jobs (id, instance_id, kind, target_ref, idempotency_key)"
+                " VALUES (%s, %s, %s, %s, %s)"
+                " ON CONFLICT (instance_id, idempotency_key) DO NOTHING",
+                (
+                    new_uuid7(),
+                    instance_id,
+                    row["kind"],
+                    row["kind"],
+                    period_key(row["kind"], row["period_start"]),
+                ),
+            ).rowcount
+        return registered

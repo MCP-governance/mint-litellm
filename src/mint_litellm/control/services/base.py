@@ -11,9 +11,10 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, TypeVar
 
+from mint_litellm.control import jobs
 from mint_litellm.control.context import Context
 from mint_litellm.control.db.connection import fetchone
-from mint_litellm.control.errors import conflict, forbidden, not_found
+from mint_litellm.control.errors import ControlError, conflict, forbidden, not_found
 from mint_litellm.types.cli_commands import COMMANDS, OperatorRole
 from mint_litellm.types.ids import new_uuid7
 
@@ -133,9 +134,20 @@ def enqueue_job(
 ) -> str:
     """후속 작업을 같은 트랜잭션에 등록한다. 이미 있으면 그 작업을 쓴다(수렴).
 
-    멱등 키가 있으면 같은 키의 작업 하나, 없으면 같은 종류·대상의 대기 작업 하나로 수렴한다.
-    작업 식별자를 돌려준다.
+    수렴 작업(``jobs.KINDS``의 ``convergent``)은 멱등 키 없이 같은 종류·대상의 대기 행 하나로,
+    나머지는 멱등 키 하나로 수렴한다. 처리기가 없는 종류는 등록할 수 없다(해당 단계에서 붙인다).
+    같은 대상에 실행 중인 행만 있으면 새 대기 행을 만든다. 작업 식별자를 돌려준다.
     """
+    spec = jobs.KINDS.get(kind)
+    if spec is None:
+        raise ValueError(f"알 수 없는 작업 종류: {kind}")
+    if spec.convergent != (idempotency_key is None):
+        raise ValueError(
+            f"{kind}은(는) 멱등 키를 "
+            + ("쓰지 않습니다(수렴 작업)." if spec.convergent else "써야 합니다.")
+        )
+    if kind not in jobs.HANDLERS:
+        raise ControlError(f"작업 종류 {kind}의 처리기가 없습니다.")
     if idempotency_key is None:
         conflict_target = (
             "(instance_id, kind, target_ref) WHERE status = 'pending' AND idempotency_key IS NULL"

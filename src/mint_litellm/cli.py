@@ -29,6 +29,7 @@ from mint_litellm.control import (
     policy_versions,
     secrets_file,
     status,
+    worker,
 )
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.context import Context, Operator
@@ -738,6 +739,9 @@ def build_parser() -> argparse.ArgumentParser:
         leaf.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                           help="결과를 JSON 한 개로 출력")
         _add_arguments(leaf, command.name)
+    # 작업 실행기는 운영자 명령이 아니라 상주 프로세스라 명령 표(COMMANDS)에 없다.
+    tree[()].add_parser("worker", help="작업 실행기를 기동한다").set_defaults(
+        process="worker")
     return root
 
 
@@ -806,6 +810,8 @@ def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = Non
     environ = dict(os.environ) if environ is None else environ
     args = build_parser().parse_args(argv)
     try:
+        if getattr(args, "process", None) == "worker":
+            return worker.main(environ)
         run_command(args, environ)
     except ControlError as error:
         print(str(error), file=sys.stderr)

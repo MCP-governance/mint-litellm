@@ -61,6 +61,16 @@
 
 승인을 모두 철회해도 서버 상태는 바뀌지 않는다. 서버 전체를 막으려면 `server suspend`를 쓴다. 특정 주체를 더 넓은 승인까지 포함해 막으려면 `revoke --deny`를 쓴다.
 
+## 작업 실행기 `mint-litellm worker`
+
+`mint-litellm worker`는 운영자 명령이 아니라 상주 프로세스다(토큰·사건 없음). 같은 이미지를 `mint_worker_app` 로그인(제어·작업·봉인 그룹)으로 접속해 띄우며, 복제본을 여럿 띄워도 안전하다. `MINT_DATABASE_URL`은 이 로그인의 주소여야 하고, 다른 로그인이면 기동을 거부한다. `MINT_EXPORT_DIR`·`MINT_EXPORT_HMAC_KEY`가 없거나 `MINT_WEBHOOK_URLS`가 있는데 `MINT_WEBHOOK_HMAC_KEY`가 없으면 기동을 거부한다.
+
+- 주기가 된 일정(`schedules`)을 한 주기에 한 번 작업으로 등록하고, 임대가 만료된 `running` 작업을 `pending`으로 되돌리고(시도 한 번으로 센다), 대기 작업을 하나씩 임대해 실행한다. 실행 중에는 임대(`MINT_WORKER_LEASE_SECONDS`, 기본 60초)를 1/3마다 연장하고, 연장에 실패하면 그 작업의 외부 호출을 멈춘다.
+- 실패한 작업은 `min(2^시도 횟수 × 5초, 10분)` 뒤에 다시 시도하고, 시도 8번째 실패에서 `failed`가 되며 경보 `job_failed`(같은 종류·대상은 한 건으로 묶고 횟수만 올린다)를 남긴다. 오류 메시지는 저장하지 않고 오류 코드만 남긴다.
+- 이 판본에서 처리기가 있는 작업은 `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시)뿐이다. 나머지 종류(동기화·관측·봉인·내보내기·경보 전송 등)는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
+- 되돌림 판정은 아직 없어 언제나 정상으로 본다. 판정이 들어오면 되돌림 상태에서 외부 쓰기 작업은 실행되지 않고 `restore_blocked`로 대기한다.
+- SIGTERM·SIGINT를 받으면 실행 중인 작업에 취소를 알린다. 작업이 그대로 끝나면 완료로 기록하고, 취소를 받아 멈추면 시도 횟수를 올리지 않고 임대를 놓은 뒤 종료한다.
+
 ## 서버를 LiteLLM에서 삭제하는 순서
 
 승인된 서버가 LiteLLM 레지스트리에 없으면 플러그인 자가 점검 5번이 실패해 프록시가 기동하지 않는다. 그래서 서버를 지울 때는 먼저 MINT에서 `server suspend <server_id>`로 서버를 중지하고, 그다음 LiteLLM에서 삭제한다. 삭제하기 전에 그 서버를 가리키는 팀·키의 MCP 권한(`object_permission`)도 지운다. 남아 있으면 `check`가 없는 서버를 가리키는 권한으로 실패를 알린다. 중지된 서버는 호출이 계속 차단되고, 레지스트리에 없어도 기동을 막지 않는다. 플러그인은 이 서버에 대해 `server_identity_mismatch_observed` 사건(`fields`에 `registry_missing`)을 남기고, `check`는 같은 서버를 정보 행으로 알린다. 등록을 해제하는 명령은 아직 없다. 중지한 서버는 통제 상태로 남는다.
@@ -80,6 +90,7 @@
 | `MINT_SECRETS_FILE` | `init`이 인자 지문 키를 쓰는 비밀 파일. `--secrets-file`로 대신할 수 있다. | `~/.config/mint/secrets.env` |
 | `MINT_PLUGIN_DB_PASSWORD`, `MINT_CONTROL_DB_PASSWORD` | `init`이 판정 프로세스용·제어 평면용 로그인 역할(`mint_plugin_app`, `mint_control_app`)을 만들 때 쓰는 비밀번호 | 없음(역할을 만들지 않음) |
 | `MINT_WORKER_DB_PASSWORD`, `MINT_STAFF_DB_PASSWORD` | `init`이 작업 실행기용(`mint_worker_app`: 제어·작업·봉인 그룹)·콘솔 직원 화면 연결 풀용(`mint_staff_app`: 직원 그룹) 로그인 역할을 만들 때 쓰는 비밀번호 | 없음(역할을 만들지 않음) |
+| `MINT_EXPORT_DIR`, `MINT_EXPORT_HMAC_KEY`, `MINT_WORKER_LEASE_SECONDS` 등 | `worker`가 읽는 2단계 설정(`MINT_EXPORT_HMAC_KEY`는 디코딩하면 32바이트 이상인 base64url). | `MINT_EXPORT_DIR`·`MINT_EXPORT_HMAC_KEY`는 필수, 임대 길이 60초 |
 | `MINT_OPA_URL`, `MINT_POLICY_ROOT`, `MINT_OPA_BUNDLE_PATH` | `policy activate`의 정책 엔진 주소, `policy/`를 담은 루트, 정책 엔진이 감시하는 번들 파일. 각 옵션(`--opa-url`, `--policy-root`, `--bundle-path`)으로 대신할 수 있다. | `/opt/mint`, `/bundles/mint.tar.gz` |
 
 ## 설정 조각
