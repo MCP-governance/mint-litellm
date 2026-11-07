@@ -67,4 +67,28 @@ def main():
     print("bootstrap-ok", sorted(out))
 
 
-main()
+def operators():
+    """운영자 토큰 발급(제어 평면 키가 .env에 들어간 뒤). admin 둘·approver 하나는 서로 다른 LiteLLM 사용자에 결속한다."""
+    state = json.loads((STATE / "acc.json").read_text())
+
+    def cli(*args):
+        done = subprocess.run(["./mint.sh", "cli", *args, "--json"], cwd=REPO / "deploy",
+                              capture_output=True, text=True, timeout=180)
+        if done.returncode:
+            sys.exit(f"{args[:2]} rc={done.returncode} {done.stderr[-300:]}")
+        return json.loads(done.stdout)
+
+    state["ACC_ADMIN_TOKEN"] = cli("operator", "bootstrap", "--name", "admin1", "--user-id", "acc-admin")["token"]
+    env = {**os.environ, "MINT_OPERATOR_TOKEN": state["ACC_ADMIN_TOKEN"]}
+    for key, name, role, uid in (("ACC_APPROVER_TOKEN", "approver1", "approver", "acc-approver"),
+                                 ("ACC_ADMIN2_TOKEN", "admin2", "admin", "acc-admin2")):
+        done = subprocess.run(["./mint.sh", "cli", "operator", "add", name, "--role", role, "--user-id", uid, "--json"],
+                              cwd=REPO / "deploy", capture_output=True, text=True, timeout=180, env=env)
+        if done.returncode:
+            sys.exit(f"operator add {name} rc={done.returncode} {done.stderr[-300:]}")
+        state[key] = json.loads(done.stdout)["token"]
+    (STATE / "acc.json").write_text(json.dumps(state))
+    print("operators-ok")
+
+
+main() if len(sys.argv) < 2 else operators()
