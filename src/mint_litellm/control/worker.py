@@ -47,7 +47,11 @@ class Worker:
         lease_seconds: float | None = None,
         restore_check: Callable[[psycopg.Connection, str], bool] = no_restore_detected,
         owner: str | None = None,
+        litellm: object | None = None,
+        policy_root: object | None = None,
     ) -> None:
+        self.litellm = litellm
+        self.policy_root = policy_root
         self.database_url = database_url
         self.instance_id = instance_id
         self.settings = settings
@@ -131,7 +135,10 @@ class Worker:
         if restored and jobs.KINDS[job["kind"]].external_write:
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
             return
-        ctx = jobs.JobContext(conn, self.instance_id, job, self.settings)
+        ctx = jobs.JobContext(
+            conn, self.instance_id, job, self.settings, litellm=self.litellm,
+            restore_check=self.restore_check, policy_root=self.policy_root,
+        )
         self.current = ctx
         if self.stop.is_set():
             ctx.cancel.set()
@@ -143,6 +150,8 @@ class Worker:
             jobs.HANDLERS[job["kind"]](ctx)
         except jobs.Cancelled:
             outcome = "cancelled"
+        except jobs.RestoreBlocked:
+            outcome = "blocked"
         except Exception as error:  # 어떤 실패도 작업 실패로 센다(메시지는 저장하지 않는다)
             code = str(getattr(error, "code", None) or type(error).__name__)[:100]
             log.warning("작업 %s(%s) 실패: %s", job["kind"], job_id, code)
@@ -159,6 +168,8 @@ class Worker:
             jobs.complete(conn, job_id, self.owner)
         elif outcome == "cancelled":
             jobs.release(conn, job_id, self.owner, "shutdown")
+        elif outcome == "blocked":
+            jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
         else:
             jobs.fail(conn, job_id, self.owner, outcome[1])
 

@@ -58,6 +58,10 @@ class Cancelled(Exception):
     """작업 코드가 취소 신호를 보고 외부 호출을 멈추고 끝낼 때 낸다."""
 
 
+class RestoreBlocked(Exception):
+    """되돌림 상태라 외부 쓰기를 하지 않는다. 실행기는 시도 횟수 없이 작업을 대기로 돌린다."""
+
+
 @dataclass
 class JobContext:
     """처리기에 건네는 맥락. 처리기는 외부 호출 전에 ``checkpoint()``로 취소를 확인한다."""
@@ -68,10 +72,29 @@ class JobContext:
     settings: Any = None
     cancel: threading.Event = field(default_factory=threading.Event)
     lost: threading.Event = field(default_factory=threading.Event)
+    # LiteLLM 제어 평면 클라이언트(없으면 LiteLLM이 필요한 작업은 실패한다)
+    litellm: Any = None
+    # 되돌림 판정(참이면 되돌림). 외부 쓰기 직전 경계가 쓴다.
+    restore_check: Callable[[psycopg.Connection, str], bool] | None = None
+    # 정책 번들 데이터를 담은 루트(``policy/bundle/mint/data/data.json``의 상위 ``policy`` 위치)
+    policy_root: Any = None
 
     def checkpoint(self) -> None:
         if self.cancel.is_set():
             raise Cancelled
+
+
+def guard_external_write(ctx: "JobContext") -> None:
+    """LiteLLM 쓰기 직전에 부르는 경계. 임대를 잃었거나 종료 중이거나 되돌림 상태면 쓰지 않는다.
+
+    임시 구현이다. 공용 경계(임대 유효성과 되돌림 상태 확인)는 되돌림 보호 단계가 만들고
+    그때 이 함수를 대신한다. LiteLLM 쓰기는 클라이언트의 쓰기 메서드 한 곳만 이 함수를 부른다.
+    """
+    ctx.checkpoint()
+    if ctx.lost.is_set():
+        raise Cancelled
+    if ctx.restore_check is not None and ctx.restore_check(ctx.conn, ctx.instance_id):
+        raise RestoreBlocked
 
 
 def _approval_expiry_scan(job: JobContext) -> None:
