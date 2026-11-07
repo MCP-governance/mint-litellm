@@ -275,8 +275,12 @@ def sync_server(ctx: JobContext) -> None:
     ):
         return
     client = None
-    if _has_pending_plan(conn, inst, server_id):
+    if _unpin_pending(conn, inst, server_id):
+        # 승인이 모두 사라졌어도 풀지 못한 고정은 풀어야 한다
         client = _client(ctx)
+        _unpin(ctx, client, server_id)
+    if _has_pending_plan(conn, inst, server_id):
+        client = client or _client(ctx)
         _finalize_plan(ctx, client, server_id)
     wanted = fetchall(
         conn,
@@ -345,10 +349,16 @@ def _finalize_plan(ctx: JobContext, client: LiteLLMSync, server_id: str) -> None
     except AdminError as error:
         if "진행 중" in error.message:
             raise  # 다른 실행기가 같은 서버를 확정하는 중이다. 재시도로 푼다.
+        # 확정할 수 없는 계획은 취소한다. 차단 표지는 그대로 두고 운영자가 재승인을 다시 요청한다.
+        ctx.conn.execute(
+            "UPDATE mint.contract_reapproval_plans SET status = 'cancelled'"
+            " WHERE instance_id = %s AND server_id = %s AND status = 'pending'",
+            (ctx.instance_id, server_id),
+        )
         raise_alert(ctx.conn, ctx.instance_id, kind="sync_divergence", severity="high",
                     dedup_key=key,
                     subject={"server_id": server_id, "reason": "reapproval_conflict",
-                             "message": error.message})
+                             "message": error.message, "plan": "cancelled"})
         raise PermanentFailure("reapproval_conflict") from None
     resolve_alert(ctx.conn, ctx.instance_id, key)
 
@@ -379,23 +389,21 @@ def _unpin(ctx: JobContext, client: LiteLLMSync, server_id: str) -> None:
     resolve_alert(ctx.conn, ctx.instance_id, key)
 
 
-def _retry_unpin(ctx: JobContext, client: LiteLLMSync, server_id: str) -> bool:
-    """이전 실행에서 풀지 못한 고정이 있으면 먼저 다시 푼다(드리프트 표지는 그대로 둔다)."""
-    open_alert = fetchone(
-        ctx.conn,
+def _unpin_pending(conn: psycopg.Connection, instance_id: str, server_id: str) -> bool:
+    """이전 실행에서 풀지 못한 고정이 있는가(열린 경보 ``unpin_failed``)."""
+    return fetchone(
+        conn,
         "SELECT 1 AS x FROM mint.alerts WHERE instance_id = %s AND dedup_key = %s"
         " AND status <> 'resolved'",
-        (ctx.instance_id, f"sync_divergence:unpin:{server_id}"),
-    )
-    if open_alert is None:
-        return False
-    _unpin(ctx, client, server_id)
-    return True
+        (instance_id, f"sync_divergence:unpin:{server_id}"),
+    ) is not None
 
 
-def _drift_kind(approved: dict, observed: dict | None) -> str:
+def _drift_kind(approved: dict, observed: Any) -> str:
     if observed is None:
         return "removed"
+    if not isinstance(observed, dict):
+        return "input_schema"  # 정의가 아닌 값은 입력 정의가 바뀐 것과 같이 막는다
     if approved.get("input_schema") != observed.get("input_schema"):
         return "input_schema"
     return "description"
@@ -479,8 +487,6 @@ def _pin_step(ctx: JobContext, client: LiteLLMSync, server_id: str) -> bool:
     다시 고정하지 않는다(업스트림의 현재 값으로 승인본을 덮지 않는다).
     """
     conn, inst = ctx.conn, ctx.instance_id
-    if _retry_unpin(ctx, client, server_id):
-        return False
     expected = expected_pin(conn, inst, server_id)
     if not expected:  # 관리 서버가 아니거나 승인 계약이 없다(없으면 조건이 거짓이다)
         return False
@@ -570,7 +576,7 @@ def activation_finalize(ctx: JobContext) -> None:
     """대기 승인을 활성으로 바꾼다. 조건이 안 되면 아무것도 하지 않는다.
 
     조건: 서버의 LiteLLM 승인 상태가 확인되었고, 키·팀 범위면 대상의 서버와 도구가 LiteLLM에
-    있다. 고정 조건은 ``pin_satisfied``가 들어올 자리다.
+    있다. 고정(pin)이 승인 계약과 맞아야 하며, 활성화 트랜잭션 안에서 행을 잠그고 한 번 더 확인한다.
     """
     conn, inst = ctx.conn, ctx.instance_id
     approval = fetchone(
@@ -608,6 +614,9 @@ def activation_finalize(ctx: JobContext) -> None:
     if approval["scope_type"] in SYNC_SCOPES and not _target_ready(client, approval):
         return
     with conn.transaction():
+        # 고정이 바뀌었을 수 있으므로 활성화 트랜잭션 안에서 행을 잠그고 다시 확인한다
+        if not pin_satisfied(conn, inst, server_id, lock=True):
+            return
         activated = fetchone(
             conn,
             "UPDATE mint.approvals SET status = 'active',"

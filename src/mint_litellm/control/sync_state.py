@@ -59,7 +59,7 @@ def server_scope(conn: psycopg.Connection, instance_id: str, server_id: str) -> 
 
 
 def expected_pin(
-    conn: psycopg.Connection, instance_id: str, server_id: str
+    conn: psycopg.Connection, instance_id: str, server_id: str, *, lock: bool = False
 ) -> dict[str, str] | None:
     """계약을 관리하는 서버의 승인 계약 ``{도구: pin 해시}``(그 서버의 자격 범위 하나만).
 
@@ -71,19 +71,23 @@ def expected_pin(
     rows = fetchall(
         conn,
         "SELECT tool, pin_sha256 FROM mint.tool_contracts WHERE instance_id = %s"
-        " AND server_id = %s AND credential_scope = %s AND status = 'approved' ORDER BY tool",
+        " AND server_id = %s AND credential_scope = %s AND status = 'approved' ORDER BY tool"
+        + (" FOR SHARE" if lock else ""),
         (instance_id, server_id, scope),
     )
     return {r["tool"]: r["pin_sha256"] for r in rows}
 
 
-def pin_satisfied(conn: psycopg.Connection, instance_id: str, server_id: str) -> bool:
+def pin_satisfied(
+    conn: psycopg.Connection, instance_id: str, server_id: str, *, lock: bool = False
+) -> bool:
     """서버의 고정(pin)이 승인 계약과 맞는가. 계약을 관리하지 않는 서버는 언제나 참이다.
 
     맞다는 것은 ``observed``이고 ``applied_sha256``이 승인 계약의 해시 맵과 같다는 뜻이다.
-    승인 계약이 하나도 없는 관리 서버는 거짓이다(활성화하지 않는다).
+    승인 계약이 하나도 없는 관리 서버는 거짓이다(활성화하지 않는다). ``lock``이면 승인 계약 행을
+    공유 잠금, 고정 행을 갱신 잠금으로 읽는다(활성화 트랜잭션 안에서 다시 확인할 때).
     """
-    expected = expected_pin(conn, instance_id, server_id)
+    expected = expected_pin(conn, instance_id, server_id, lock=lock)
     if expected is None:
         return True
     if not expected:
@@ -91,7 +95,8 @@ def pin_satisfied(conn: psycopg.Connection, instance_id: str, server_id: str) ->
     row = fetchone(
         conn,
         "SELECT observed, applied_sha256 FROM mint.litellm_grants WHERE instance_id = %s"
-        " AND target_type = 'server' AND target_id = %s AND item = 'pin' AND server_id = %s",
+        " AND target_type = 'server' AND target_id = %s AND item = 'pin' AND server_id = %s"
+        + (" FOR UPDATE" if lock else ""),
         (instance_id, server_id, server_id),
     )
     return bool(row and row["observed"] is True and row["applied_sha256"] == sha256(expected))

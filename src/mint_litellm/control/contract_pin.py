@@ -208,6 +208,8 @@ def finalize_reapproval(conn, instance_id: str, server_id: str, pin_client) -> d
                 raise conflict("재승인 계획이 없습니다.")
             if saved["status"] == "completed":
                 return saved["result"]
+            if saved["status"] == "cancelled":
+                raise conflict("재승인 계획이 취소되었습니다. 재승인을 다시 요청하십시오.")
             ctx = Context(
                 conn,
                 instance_id,

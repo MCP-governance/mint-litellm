@@ -202,6 +202,39 @@ def test_a_failed_unpin_is_alerted_retried_and_keeps_the_drift_marker(admin, fak
     assert len(pin_calls(fake)) == 1  # 풀기 재시도는 다시 고정하지 않는다
 
 
+def test_a_response_value_that_is_not_a_definition_is_a_mismatch_not_a_crash(
+    admin, fake, worker
+):
+    managed_world(admin, fake, tools={"read": "not a definition"})
+    enqueue(admin, "sync_server", "srv-1")
+    drain(worker)
+    [job] = job_rows(admin, "sync_server")
+    assert job["status"] == "done"
+    assert alerts(admin, "sync_divergence")[0]["subject"]["tools"] == ["read"]
+    rows = admin.execute("SELECT status, source, drift FROM mint.tool_contracts").fetchall()
+    assert rows == [("approved", "intake", "input_schema")]  # 후보는 만들지 않는다
+    assert fetchone(admin, "SELECT deployment_drift FROM mint.servers")["deployment_drift"] is True
+
+
+def test_a_pin_that_could_not_be_removed_is_removed_after_every_approval_is_gone(
+    admin, fake, worker
+):
+    approval = managed_world(admin, fake, tools={"read": NEW}, status="active")
+    fake.fail_writes["DELETE /v1/mcp/server/srv-1/pin"] = 500
+    enqueue(admin, "sync_server", "srv-1")
+    drain(worker)
+    assert fake.servers["srv-1"]["pinned"] is True
+    admin.execute("UPDATE mint.approvals SET status = 'revoked', revoked_at = now(),"
+                  " revoke_reason = 'r' WHERE id = %s", (approval,))
+    fake.fail_writes.clear()
+    past(admin)
+    drain(worker)  # 승인이 하나도 없어도 남은 고정을 푼다
+    assert fake.servers["srv-1"]["pinned"] is False
+    failed = [a for a in alerts(admin, "sync_divergence")
+              if a["subject"]["reason"] == "unpin_failed"]
+    assert failed[0]["status"] == "resolved"
+
+
 def test_a_mismatch_also_holds_back_key_permissions(admin, fake, worker):
     approval = managed_world(admin, fake, tools={"read": NEW}, approval_scope="key")
     enqueue(admin, "sync_server", "srv-1")
@@ -298,6 +331,27 @@ def test_a_blocked_or_restored_database_never_pins(admin, fake, make_worker, mon
     assert (job["status"], job["last_error_code"]) == ("pending", "restore_blocked")
 
 
+def test_the_activation_rechecks_the_pin_inside_its_transaction(
+    admin, fake, worker, monkeypatch
+):
+    approval = managed_world(admin, fake, tools={"read": NEW})
+    enqueue(admin, "sync_server", "srv-1")
+    drain(worker)  # 서버 승인은 확인됐고 고정은 맞지 않다
+    assert grant(admin, "pin", "server", "srv-1", "srv-1")["observed"] is False
+    real = sync_jobs.pin_satisfied
+    calls = []
+
+    def stale_then_real(conn, inst, server_id, **kwargs):  # 바깥 확인은 오래된 값(참)을 본 경우
+        calls.append(kwargs.get("lock", False))
+        return True if len(calls) == 1 else real(conn, inst, server_id, **kwargs)
+
+    monkeypatch.setattr(sync_jobs, "pin_satisfied", stale_then_real)
+    enqueue(admin, "activation_finalize", approval)
+    drain(worker)
+    assert calls == [False, True]  # 두 번째는 행을 잠그고 확인했다
+    assert approval_status(admin, approval) == "pending"
+
+
 # --- 재승인 확정과 배포 후보(실제 로그인 역할) -------------------------------------------
 
 
@@ -375,12 +429,23 @@ def test_a_reapproval_whose_pin_differs_fails_for_good_keeps_the_block_and_alert
     assert job["attempts"] == 0  # 재시도하지 않는다
     [alert] = alerts(admin, "sync_divergence")
     assert alert["subject"]["reason"] == "reapproval_conflict"
-    assert fetchone(admin, "SELECT status FROM mint.contract_reapproval_plans")[
-        "status"] == "pending"
+    plan = "SELECT status FROM mint.contract_reapproval_plans"
+    assert fetchone(admin, plan)["status"] == "cancelled"  # 같은 실패를 되풀이하지 않는다
+    assert alerts(admin, "sync_divergence")[0]["subject"]["plan"] == "cancelled"
     assert fetchone(admin, "SELECT status FROM mint.tool_contracts WHERE id = %s",
                     (old,))["status"] == "approved"
     assert fetchone(admin, "SELECT deployment_drift FROM mint.servers")["deployment_drift"] is True
     assert len(pin_calls(fake, "DELETE")) == 1
+    pins = len(pin_calls(fake))
+    enqueue(admin, "sync_server", "srv-1")
+    drain(worker)
+    assert len(pin_calls(fake)) == pins  # 취소된 계획으로는 다시 고정하지 않는다
+    fake.servers["srv-1"]["tools"] = {"read": NEW}  # 운영자가 재승인을 다시 요청한다
+    request_reapproval(url, candidate, iid)
+    assert fetchone(admin, plan)["status"] == "pending"
+    drain(worker)
+    assert fetchone(admin, plan)["status"] == "completed"
+    assert fetchone(admin, "SELECT deployment_drift FROM mint.servers")["deployment_drift"] is False
 
 
 def test_the_deployment_candidate_is_recorded_through_the_worker_login(url, admin, fake):
