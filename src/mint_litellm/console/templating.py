@@ -25,7 +25,7 @@ MENU = (
     ("/admin", "운영자·조직"),
 )
 STAFF_MENU = (
-    ("/staff", "쓸 수 있는 서버·도구"),
+    ("/staff", "사용 가능한 서버·도구"),
     ("/staff/confirmations", "본인 확인 요청"),
     ("/staff/consents", "동의 관리·내 기록"),
 )

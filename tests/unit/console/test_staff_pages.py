@@ -218,7 +218,7 @@ def run_verify(world):
 
 
 
-# --- 11 쓸 수 있는 서버·도구 -------------------------------------------------------------------
+# --- 11 사용 가능한 서버·도구 -------------------------------------------------------------------
 
 
 def add_approval(world, scope_type, scope_id, tools=("echo", "ping"), server_id="srv-ok",
@@ -262,7 +262,7 @@ def test_the_server_screen_lists_servers_with_the_tools_approved_for_this_user(s
     add_approval(sworld, "org", "acme", tools=("ping",))
     page = logged_in(sworld).get("/staff")
     assert page.status_code == 200
-    assert "쓸 수 있는 서버·도구" in page.text and "srv-ok" in page.text
+    assert "사용 가능한 서버·도구" in page.text and "srv-ok" in page.text
     assert "echo, ping" in page.text and "secret_tool" not in page.text
     assert "srv-wait" not in page.text
     assert "HTTP" in page.text and "없음" in page.text
