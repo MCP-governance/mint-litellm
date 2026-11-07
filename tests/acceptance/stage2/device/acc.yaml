@@ -1,0 +1,75 @@
+# 장비 합격 시험 보조 서비스(제품 저장소 밖 구성). deploy/compose.yaml 위에 덧붙인다.
+# 프로젝트 이름은 COMPOSE_PROJECT_NAME으로 정한다. 경로는 deploy/ 기준이다.
+x-acc-env: &acc-env
+  MINT_OBSERVE_SECONDS: "60"
+  MINT_RECONCILE_SECONDS: "300"
+  MINT_CHECKPOINT_SECONDS: "600"
+  MINT_INTAKE_ALLOWED_PORTS: "8080"
+  MINT_SESSION_VERIFY_SECONDS: "300"
+
+services:
+  litellm:
+    environment:
+      <<: *acc-env
+      MINT_LOG_LEVEL: DEBUG
+  worker:
+    environment:
+      <<: *acc-env
+  console:
+    environment:
+      <<: *acc-env
+  litellm2:
+    extends:
+      file: compose.yaml
+      service: litellm
+    ports: !override
+      - "127.0.0.1:4301:4000"
+    volumes: !override
+      - ./config:/app/config:ro
+      - buffer2:/var/lib/mint/buffer
+      - export:/var/lib/mint/export:ro
+    pull_policy: never
+    environment:
+      <<: *acc-env
+      MINT_LOG_LEVEL: DEBUG
+  litellm-plain:
+    image: ghcr.io/berriai/litellm-database@sha256:7ef0e78fe00ad5ea7ea45666cc1d1f02cb7076aee69091543bf397de52db33ce
+    command: ["--config", "/app/config/plain.yaml", "--port", "4000"]
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/litellm_plain
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      STORE_MODEL_IN_DB: "True"
+    ports:
+      - "127.0.0.1:4310:4000"
+    volumes:
+      - ../tests/acceptance/stage2/device/litellm.plain.yaml:/app/config/plain.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+  fixture:
+    image: python:3.13-slim
+    command: ["python", "/app/fixture_server.py", "--bind", "0.0.0.0", "--port", "8940"]
+    volumes:
+      - ../tests/acceptance/stage2/fixture_server.py:/app/fixture_server.py:ro
+    ports:
+      - "127.0.0.1:4340:8940"
+    restart: unless-stopped
+  cnt:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    volumes:
+      - ../tests/acceptance/stage2/device/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../tests/acceptance/stage2/device/proxy.inc:/etc/nginx/proxy.inc:ro
+    ports:
+      - "127.0.0.1:4320:8080"
+    networks: [default, mcp]
+    depends_on: [fixture]
+    restart: unless-stopped
+
+networks:
+  mcp:
+    name: mint-g10_mcp
+    external: true
+
+volumes:
+  buffer2:
