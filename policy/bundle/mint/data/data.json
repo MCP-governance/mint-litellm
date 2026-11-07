@@ -1,1 +1,1 @@
-{"business_hours":{"tz":"Asia/Seoul","days":[1,2,3,4,5],"start":"09:00","end":"18:00"}}
+{"business_hours":{"tz":"Asia/Seoul","days":[1,2,3,4,5],"start":"09:00","end":"18:00"},"secret_markers":["AKIA","ASIA","ghp_","gho_","github_pat_","glpat-","xoxb-","xoxp-","sk-ant-","-----BEGIN"]}

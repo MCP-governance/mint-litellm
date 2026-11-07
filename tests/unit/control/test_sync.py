@@ -82,14 +82,14 @@ def worker(make_worker):
     return make_worker()
 
 
-def add_server(admin, server_id="srv-1", status="awaiting_approval") -> None:
+def add_server(admin, server_id="srv-1", status="awaiting_approval", team=None) -> None:
     admin.execute(
         "INSERT INTO mint.servers (id, instance_id, server_id, status, url_sha256, transport,"
         " auth_type, registered_by) VALUES (gen_random_uuid(), %s, %s, 'awaiting_approval', %s,"
         " 'http', 'none', 't')", (INSTANCE, server_id, HEX))
     admin.execute(
-        "INSERT INTO mint.usage_relations (id, instance_id, org_id, purpose, server_id)"
-        " VALUES (gen_random_uuid(), %s, 'acme', 'ops', %s)", (INSTANCE, server_id))
+        "INSERT INTO mint.usage_relations (id, instance_id, org_id, purpose, server_id, team_id)"
+        " VALUES (gen_random_uuid(), %s, 'acme', 'ops', %s, %s)", (INSTANCE, server_id, team))
     if status != "awaiting_approval":
         admin.execute("UPDATE mint.servers SET status = %s WHERE server_id = %s",
                       (status, server_id))
@@ -258,7 +258,9 @@ def test_resending_is_idempotent_and_a_converged_target_is_not_written_again(
     assert len(events(admin, "sync_applied")) == 2  # 두 번째부터는 바뀐 것이 없다
 
 
-def test_a_team_is_written_before_its_member_key(admin, fake, worker):
+def test_a_team_key_that_gets_403_is_failed_with_an_alert_and_the_team_is_synced(
+    admin, fake, worker
+):
     add_server(admin)
     fake.add_server("srv-1")
     fake.add_team("t1")
@@ -267,29 +269,31 @@ def test_a_team_is_written_before_its_member_key(admin, fake, worker):
     add_approval(admin, "key", "k1")
     enqueue(admin, "sync_target", "key:k1")
     drain(worker)
-    # 키는 403을 받고 대기로 돌아갔으며, 그 사이 팀 작업이 등록되어 먼저 끝났다
+    # 키는 403을 받아 재시도 없이 실패로 끝났고, 팀 작업이 등록되어 먼저 끝났다
     assert [p for _, p, _ in fake.writes()] == ["/key/update", "/team/update"]
     assert fake.permission("team", "t1")[0] == ["srv-1"]
-    assert fake.permission("key", "k1")[0] == []
     [key_job] = [j for j in job_rows(admin, "sync_target") if j["target_ref"] == "key:k1"]
     assert (key_job["status"], key_job["attempts"], key_job["last_error_code"]) == (
-        "pending", 1, "team_not_ready")
-    past(admin)
+        "failed", 0, "litellm_forbidden")
+    [alert] = alerts(admin, "sync_divergence")
+    assert alert["subject"]["reason"] == "forbidden" and alert["subject"]["team_id"] == "t1"
+    assert alerts(admin, "job_failed") == []
+    reconcile(admin)  # 재조회가 키를 다시 맞춘다
     drain(worker)
-    assert [p for _, p, _ in fake.writes()] == ["/key/update", "/team/update", "/key/update"]
     assert fake.permission("key", "k1") == (["srv-1"], {"srv-1": ["a"]})
-    assert all(j["status"] == "done" for j in job_rows(admin, "sync_target"))
+    assert alerts(admin, "sync_divergence")[0]["status"] == "resolved"
 
 
-def test_a_403_for_a_key_without_a_team_is_a_retried_failure(admin, fake, worker):
+def test_a_403_for_a_key_without_a_team_fails_at_once(admin, fake, worker):
     key_world(admin, fake)
     fake.fail_writes["/key/update"] = 403
     enqueue(admin, "sync_target", "key:k1")
     drain(worker)
     [job] = job_rows(admin, "sync_target")
     assert (job["status"], job["attempts"], job["last_error_code"]) == (
-        "pending", 1, "litellm_http_403")
+        "failed", 0, "litellm_forbidden")
     assert job_rows(admin) == [job]  # 팀 작업은 만들지 않았다
+    assert alerts(admin, "sync_divergence")[0]["subject"]["reason"] == "forbidden"
 
 
 def test_items_that_were_already_there_are_kept_when_the_approval_goes_away(
@@ -751,3 +755,31 @@ def test_every_sync_kind_has_a_handler_and_the_reconcile_has_a_schedule():
     for kind in ("sync_server", "sync_target", "sync_reconcile", "activation_finalize"):
         assert kind in jobs.HANDLERS
     assert "sync_reconcile" in jobs.SCHEDULES
+
+
+# --- 승인 서비스: 팀 소속 키 ---------------------------------------------------------
+
+
+def test_a_team_key_cannot_be_approved_before_its_team_has_the_same_server(admin, fake):
+    from mint_litellm.control.litellm_admin import LiteLLMAdmin
+
+    add_server(admin, team="t1")
+    fake.add_server("srv-1")
+    fake.add_team("t1", servers=["srv-1"])
+    fake.add_key("k1", team_id="t1", servers=["srv-1"])
+    litellm = LiteLLMAdmin(fake.url, CONTROL_KEY)
+    relation = fetchone(admin, "SELECT id FROM mint.usage_relations")["id"]
+    from datetime import UTC, datetime, timedelta
+
+    def approve():
+        return approvals_domain.approve(
+            make_ctx(admin), litellm, relation_id=str(relation), scope_type="key",
+            scope_id="k1", tools=["a"], valid_from=datetime.now(UTC),
+            valid_until=datetime.now(UTC) + timedelta(days=1), approval_class="standard",
+            basis_text="b", requested_by="req", allowlist_ids=[], second=None)
+
+    with pytest.raises(ControlError, match="팀 범위 승인"):
+        approve()
+    add_approval(admin, "team", "t1", status="pending")
+    approval_id, _ = approve()
+    assert approval_id

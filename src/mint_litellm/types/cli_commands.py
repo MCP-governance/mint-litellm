@@ -26,6 +26,8 @@ CONTROL_PLANE_ALLOWED_ROUTES: tuple[str, ...] = (
     "/key/list",
     "/team/list",
     "/guardrails/list",
+    "/key/update",
+    "/team/update",
 )
 
 # 관리 API 응답에서 수신 즉시 버리고 저장·기록·표시하지 않는 자격 열.
@@ -266,6 +268,23 @@ COMMANDS: tuple[CliCommand, ...] = (
         summary="반복 외부 삭제로 보류된 항목을 풀고 다시 부여한다.",
         roles=ADMIN_ONLY,
         events=(EventKind.SYNC_APPLIED,),
+    ),
+    CliCommand(
+        path=("alert", "list"),
+        summary="경보를 상태별로 조회한다.",
+        roles=ALL_ROLES,
+    ),
+    CliCommand(
+        path=("alert", "ack"),
+        summary="열린 경보를 확인 처리한다. 확인한 운영자와 함께 사건을 남긴다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.ALERT_ACKNOWLEDGED,),
+    ),
+    CliCommand(
+        path=("alert", "resolve"),
+        summary="경보를 해결됨으로 닫는다. 같은 원인이 다시 생기면 새 경보가 열린다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.ALERT_RESOLVED,),
     ),
     CliCommand(
         path=("ledger", "list"),

@@ -13,10 +13,12 @@ from typing import Any
 import psycopg
 
 from mint_litellm.control import ledger
+from mint_litellm.control.alerts import raise_alert
+from mint_litellm.control.alerts import resolve as resolve_alert
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.errors import ControlError
-from mint_litellm.control.jobs import JobContext
+from mint_litellm.control.jobs import JobContext, PermanentFailure
 from mint_litellm.control.litellm_write import (
     LiteLLMForbidden,
     LiteLLMHttpError,
@@ -35,8 +37,6 @@ from mint_litellm.control.sync_state import (
     permission_of,
     pin_satisfied,
     present,
-    raise_alert,
-    resolve_alert,
     split_ref,
     target_ref,
     upsert_grant,
@@ -50,12 +50,6 @@ FOREIGN_FIELDS = ("blocked", "models", "max_budget", "user_id", "team_id", "allo
 UNREACHABLE_ALERT_AFTER = 3
 # 관리 API 연속 실패 횟수(작업 실행기 프로세스 안, 실행기 복제본마다 따로 센다).
 _failures: dict[str, int] = {}
-
-
-class SyncRetry(ControlError):
-    """이 작업은 다른 작업이 먼저 끝나야 한다. 재시도 규칙으로 대기에 되돌린다."""
-
-    code = "team_not_ready"
 
 
 class NotConfigured(ControlError):
@@ -204,11 +198,13 @@ def sync_target(ctx: JobContext) -> None:
             response = _write(client, kind, target_id, plan)
         except LiteLLMForbidden:
             team = current.get("team_id") if kind == "key" else None
-            if not team:
-                raise
-            # 팀 소속 키의 서버는 팀 허용 서버의 부분집합이어야 한다. 팀을 먼저 맞춘다.
-            enqueue_job(_actor_context(ctx), "sync_target", target_ref("team", team))
-            raise SyncRetry(f"팀 {team}이(가) 먼저 맞춰져야 합니다.") from None
+            if team:  # 팀을 먼저 맞춰 두면 다음 재조회가 이 키를 다시 맞춘다
+                enqueue_job(_actor_context(ctx), "sync_target", target_ref("team", team))
+            raise_alert(conn, inst, kind="sync_divergence", severity="high",
+                        dedup_key=f"sync_divergence:forbidden:{ref}",
+                        subject={"target": ref, "reason": "forbidden", "team_id": team})
+            raise PermanentFailure("litellm_forbidden") from None
+        resolve_alert(conn, inst, f"sync_divergence:forbidden:{ref}")
         changed_fields = _foreign_changes(
             current, response if kind == "key" else (response or {}).get("data")
         )

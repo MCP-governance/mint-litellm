@@ -25,7 +25,6 @@ from .test_sync import (
     grant,
     job_rows,
     login_url,
-    past,
     reconcile,
     revoke,
 )
@@ -137,13 +136,13 @@ def test_a_team_key_gets_403_until_the_team_allows_the_server(admin, real_worker
     enqueue(admin, "sync_target", f"key:{token}")
     drain(real_worker)
     [key_job] = [j for j in job_rows(admin, "sync_target") if j["target_ref"].startswith("key:")]
-    assert (key_job["status"], key_job["last_error_code"]) == ("pending", "team_not_ready")
+    assert (key_job["status"], key_job["last_error_code"]) == ("failed", "litellm_forbidden")
     status, body = call("GET", f"/team/info?team_id={team}")
     assert body["team_info"]["object_permission"]["mcp_servers"] == [server_id]
-    past(admin)
+    reconcile(admin)
     drain(real_worker)
     assert key_permission(token) == ([server_id], {server_id: ["t1"]})
-    assert alerts(admin) == []
+    assert [a["status"] for a in alerts(admin)] == ["resolved"]  # 403 때 연 경보가 닫혔다
 
 
 def test_a_submitted_server_is_approved_and_the_approval_activates_on_real_litellm(

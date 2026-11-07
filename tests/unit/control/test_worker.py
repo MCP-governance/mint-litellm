@@ -160,8 +160,7 @@ def test_a_kind_without_a_handler_cannot_be_registered(url):
     with psycopg.connect(url) as conn:
         ensure(conn, INSTANCE)
         ctx = make_ctx(conn)
-        for kind, key in (("export_checkpoint", "export_checkpoint:x"), ("seal", "seal:x"),
-                          ("alert_deliver", "a:1")):
+        for kind, key in (("export_checkpoint", "export_checkpoint:x"), ("seal", "seal:x")):
             with pytest.raises(ControlError, match="처리기가 없습니다"):
                 base.enqueue_job(ctx, kind, "x", key)
         assert base.enqueue_job(ctx, "approval_expiry_scan", "x", "approval_expiry_scan:t")

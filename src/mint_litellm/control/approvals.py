@@ -1,5 +1,6 @@
 """승인, 거부, 철회, 호출별 승인."""
 
+import ipaddress
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -56,6 +57,9 @@ def build_conditions(
     business_hours_only: bool,
     business_hours: str | None,
     require_consent: str | None,
+    allowed_hosts: list[str] | None = None,
+    allowed_paths: list[str] | None = None,
+    allowed_arg_keys: list[str] | None = None,
 ) -> dict:
     """정책이 읽는 승인 조건. 지정하지 않은 조건은 키를 넣지 않는다."""
     conditions: dict = {}
@@ -71,7 +75,40 @@ def build_conditions(
         if not 1 <= len(require_consent.strip()) <= 128:
             raise ControlError("--require-consent의 목적은 1자 이상 128자 이하여야 합니다.")
         conditions["require_consent"] = require_consent.strip()
+    for name, values, check in (
+        ("allowed_hosts", allowed_hosts, _host_ok),
+        ("allowed_paths", allowed_paths, _path_ok),
+        ("allowed_arg_keys", allowed_arg_keys, bool),
+    ):
+        if values:
+            cleaned = {v.strip() for v in values}
+            for value in cleaned:
+                if not check(value):
+                    flag = name.replace("_", "-")[:-1]
+                    raise ControlError(f"--{flag} 값이 올바르지 않습니다: {value[:64]!r}")
+            conditions[name] = sorted(cleaned)
     return conditions
+
+
+def _host_ok(value: str) -> bool:
+    """점이 하나 이상인 호스트 이름(앞의 ``*.`` 허용) 또는 리터럴 주소."""
+    value = value.lower().removeprefix("*.").strip("[]")
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    labels = value.split(".")
+    return len(labels) >= 2 and all(
+        label and not label.startswith("-") and all(c.isalnum() or c in "-_" for c in label)
+        for label in labels
+    )
+
+
+def _path_ok(value: str) -> bool:
+    flat = value.replace("\\", "/")
+    absolute = flat.startswith("/") or (len(flat) > 2 and flat[1] == ":" and flat[2] == "/")
+    return absolute and ".." not in flat.split("/")
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +201,19 @@ def check_scope_and_permission(
     if target is None:
         raise ControlError(f"LiteLLM에서 {label} {scope_id}을(를) 찾을 수 없습니다.")
     _require_scope_in_relation(ctx, relation, scope_type, scope_id, target)
+    if scope_type == "key" and target.get("team_id"):
+        # 팀 소속 키의 서버 권한은 팀이 허용한 서버의 부분집합이어야 한다(LiteLLM이 아니면 403).
+        if not fetchone(
+            ctx.conn,
+            "SELECT 1 AS x FROM mint.approvals WHERE instance_id = %s AND scope_type = 'team'"
+            " AND scope_id = %s AND server_id = %s AND status IN ('active', 'pending')",
+            (ctx.instance_id, target["team_id"], server_id),
+        ):
+            raise ControlError(
+                f"키 {scope_id}가 속한 팀 {target['team_id']}에 서버 {server_id}의 승인이 없어 "
+                "승인할 수 없습니다. LiteLLM은 팀이 허용하지 않은 서버를 "
+                "팀 소속 키에 주지 않으므로 팀 범위 승인(--scope team)을 먼저 하십시오."
+            )
     registry = {s["server_id"]: s for s in litellm.list_servers()}
     permission = target.get("object_permission") or {}
     granted = list(permission.get("mcp_servers") or [])

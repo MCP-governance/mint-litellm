@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import psycopg
-from psycopg.types.json import Jsonb
 
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.types.ids import new_uuid7
@@ -261,37 +260,4 @@ def reset_counters(
         " AND target_id = %s AND (%s::text IS NULL OR server_id = %s)"
         " AND (missing_count > 0 OR held OR missing_window_start IS NOT NULL)",
         (instance_id, target_type, target_id, server_id, server_id),
-    ).rowcount
-
-
-# --- 경보 ------------------------------------------------------------------------
-# 경보 생성·해결의 공용 함수가 병합되면 이 두 함수를 그쪽으로 바꾼다(호출 형식은 같다).
-
-
-def raise_alert(
-    conn: psycopg.Connection,
-    instance_id: str,
-    *,
-    kind: str,
-    severity: str,
-    dedup_key: str,
-    subject: dict[str, Any],
-) -> bool:
-    """같은 키의 미해결 경보가 있으면 횟수만 올린다. 새로 만들었으면 참."""
-    row = conn.execute(
-        "INSERT INTO mint.alerts (id, instance_id, kind, severity, dedup_key, subject)"
-        " VALUES (%s, %s, %s, %s, %s, %s)"
-        " ON CONFLICT (instance_id, dedup_key) WHERE status <> 'resolved'"
-        " DO UPDATE SET count = mint.alerts.count + 1, last_at = now()"
-        " RETURNING (xmax = 0)",
-        (new_uuid7(), instance_id, kind, severity, dedup_key[:512], Jsonb(subject)),
-    ).fetchone()
-    return bool(row[0])
-
-
-def resolve_alert(conn: psycopg.Connection, instance_id: str, dedup_key: str) -> int:
-    return conn.execute(
-        "UPDATE mint.alerts SET status = 'resolved', resolved_at = now()"
-        " WHERE instance_id = %s AND dedup_key = %s AND status <> 'resolved'",
-        (instance_id, dedup_key[:512]),
     ).rowcount

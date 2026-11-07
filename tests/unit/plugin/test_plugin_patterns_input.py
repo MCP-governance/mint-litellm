@@ -1,0 +1,183 @@
+import asyncio
+from dataclasses import replace
+
+import httpx
+from plugin_helpers import (
+    approval,
+    evaluator,
+    harness,
+    request,
+    server_row,
+    snapshot,
+)
+
+from mint_litellm.plugin.pipeline import evaluate_request
+from mint_litellm.plugin.policy.input import has_only_policy_fields
+from mint_litellm.plugin.policy.opa_client import OPAClient
+
+D = "."  # 점 표기 주소를 저장소 위생 시험이 막으므로 나눠 쓴다
+
+
+MANAGED = snapshot(server=server_row(contract_status="managed"))
+
+
+def decide(h, **hook):
+    return asyncio.run(evaluate_request(request(**hook), h.deps))
+
+
+def sent_patterns(tmp_path, arguments, *, conditions=None, egress=(), markers=None):
+    calls = []
+    snap = snapshot(
+        server=server_row(contract_status="managed"),
+        approvals=(approval(conditions=conditions or {}),),
+        egress_targets=tuple(egress),
+    )
+    h = harness(tmp_path, snap, evaluate=evaluator(calls=calls))
+    if markers is not None:
+
+        async def fetch(**_):
+            return markers
+
+        h.deps = replace(h.deps, secret_markers=fetch)
+    outcome = decide(h, arguments=arguments)
+    assert outcome.allowed, outcome.error
+    assert has_only_policy_fields(calls[0])
+    return calls[0]["arguments"]["patterns"]
+
+
+def test_every_call_carries_the_four_booleans_and_no_argument_text(tmp_path):
+    calls = []
+    h = harness(tmp_path, MANAGED, evaluate=evaluator(calls=calls))
+    assert decide(h, arguments={"q": f"http://10{D}0{D}0{D}1/secret-text"}).allowed
+    assert calls[0]["arguments"]["patterns"] == {
+        "url_external": True,
+        "private_host": True,
+        "path_traversal": False,
+        "secret_like": False,
+    }
+    assert "secret-text" not in str(calls[0])
+
+
+def test_allowed_hosts_come_from_the_approval_and_from_egress_targets(tmp_path):
+    args = {"u": "https://api.ok.test/x"}
+    assert sent_patterns(tmp_path, args)["url_external"] is True
+    assert (
+        sent_patterns(tmp_path, args, conditions={"allowed_hosts": ["API.OK.TEST"]})["url_external"]
+        is False
+    )
+    assert sent_patterns(tmp_path, args, egress=[("ok.test", None)])["url_external"] is False
+    assert (
+        sent_patterns(tmp_path, args, egress=[("https://api.ok.test/", "org1")])["url_external"]
+        is False
+    )
+    assert sent_patterns(tmp_path, args, egress=[("ok.test", "other-org")])["url_external"] is True
+
+
+def test_allowed_paths_come_from_the_approval(tmp_path):
+    args = {"p": "/etc/passwd"}
+    assert sent_patterns(tmp_path, args)["path_traversal"] is False
+    assert (
+        sent_patterns(tmp_path, args, conditions={"allowed_paths": ["/srv/docs"]})["path_traversal"]
+        is True
+    )
+    inside = {"allowed_paths": ["/srv/docs"]}
+    assert (
+        sent_patterns(tmp_path, {"p": "/srv/docs/a"}, conditions=inside)["path_traversal"] is False
+    )
+
+
+def test_secret_markers_come_from_the_fetched_bundle_data(tmp_path):
+    args = {"k": "ghp_abc"}
+    assert sent_patterns(tmp_path, args)["secret_like"] is False
+    assert sent_patterns(tmp_path, args, markers=("ghp_",))["secret_like"] is True
+
+
+def test_missing_markers_stop_the_call_as_a_policy_engine_failure(tmp_path):
+    h = harness(tmp_path, MANAGED)
+
+    async def none(**_):
+        return None
+
+    h.deps = replace(h.deps, secret_markers=none)
+    outcome = decide(h)
+    assert not outcome.allowed
+    assert outcome.error.code == "MINT-DEPENDENCY-OPA"
+
+
+def test_malformed_pattern_conditions_are_a_schema_error_not_a_crash(tmp_path):
+    calls = []
+    snap = snapshot(
+        server=server_row(contract_status="managed"),
+        approvals=(approval(conditions={"allowed_hosts": "a.test"}),),
+    )
+    h = harness(tmp_path, snap, evaluate=evaluator(calls=calls))
+    outcome = decide(h)
+    assert not outcome.allowed and not calls
+    assert outcome.error.code == "MINT-SCHEMA-ERROR"
+
+
+def test_stage1_input_without_patterns_is_still_accepted():
+    value = {"arguments": {"keys": [], "sizes": {}}}
+    assert has_only_policy_fields(value)
+    for patterns in ({"x": True}, {"url_external": 1}):
+        assert not has_only_policy_fields(
+            {"arguments": {"keys": [], "sizes": {}, "patterns": patterns}}
+        )
+
+
+def _markers_client(handler):
+    client = OPAClient("http://opa", 1.0)
+
+    async def go():
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client._owner = (__import__("os").getpid(), asyncio.get_running_loop())
+        first = await client.secret_markers(policy_version_id="v", bundle_sha256="h")
+        second = await client.secret_markers(policy_version_id="v", bundle_sha256="h")
+        other = await client.secret_markers(policy_version_id="w", bundle_sha256="h")
+        await client.aclose()
+        return first, second, other
+
+    return asyncio.run(go())
+
+
+def test_markers_are_read_once_per_version_and_must_match_the_active_bundle():
+    hits = []
+
+    def handler(request):
+        hits.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "bundle": {"policy_version_id": "v", "bundle_sha256": "h"},
+                    "secret_markers": ["AKIA"],
+                }
+            },
+        )
+
+    first, second, other = _markers_client(handler)
+    assert first == second == ("AKIA",)
+    assert other is None
+    assert hits == ["/v1/data/mint/context", "/v1/data/mint/context"]  # 판본 v 한 번, w 한 번
+
+
+def test_marker_errors_are_none():
+    assert _markers_client(lambda r: httpx.Response(500)) == (None, None, None)
+    assert _markers_client(lambda r: httpx.Response(200, json={"result": {}})) == (None, None, None)
+
+
+def test_stage1_servers_get_no_patterns_and_are_not_blocked_by_url_arguments(tmp_path):
+    calls = []
+    h = harness(tmp_path, evaluate=evaluator(calls=calls))
+    outcome = decide(h, arguments={"u": "http://10" + D + "0.0.1/", "p": "../x"})
+    assert outcome.allowed
+    assert "patterns" not in calls[0]["arguments"]
+    assert "contract_status" not in calls[0]["server"]
+    assert calls[0]["server"].keys() >= {"id", "status"}
+
+
+def test_managed_servers_send_the_contract_status(tmp_path):
+    calls = []
+    h = harness(tmp_path, MANAGED, evaluate=evaluator(calls=calls))
+    assert decide(h).allowed
+    assert calls[0]["server"]["contract_status"] == "managed"

@@ -10,11 +10,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import psycopg
 from psycopg.errors import UniqueViolation
-from psycopg.types.json import Jsonb
 
+from mint_litellm.control import alerts, webhook
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.services import expiry
 from mint_litellm.types.ids import new_uuid7
@@ -58,6 +59,14 @@ class Cancelled(Exception):
     """작업 코드가 취소 신호를 보고 외부 호출을 멈추고 끝낼 때 낸다."""
 
 
+class PermanentFailure(Exception):
+    """재시도해도 소용없는 실패. 작업을 바로 ``failed``로 끝낸다(경보는 낸 쪽이 이미 열었다)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class RestoreBlocked(Cancelled):
     """외부 쓰기 직전에 되돌림 상태로 판정되어 멈출 때 낸다(실패가 아니라 대기)."""
 
@@ -84,6 +93,41 @@ class JobContext:
 
 def _approval_expiry_scan(job: JobContext) -> None:
     expiry.expire_due(job.conn, job.instance_id)
+    expiry.warn_expiring(job.conn, job.instance_id)
+
+
+def _alert_deliver(job: JobContext) -> None:
+    """경보 전송 한 건(주소 하나). 응답 본문은 읽어 버리고 상태와 보낸 횟수만 남긴다."""
+    row = fetchone(
+        job.conn,
+        "SELECT d.id, d.status, d.channel, d.alert_count AS count, a.kind, a.severity,"
+        " a.subject,"
+        " a.first_at, a.last_at FROM mint.alert_deliveries d JOIN mint.alerts a"
+        " ON a.instance_id = d.instance_id AND a.id = d.alert_id"
+        " WHERE d.instance_id = %s AND d.delivery_id = %s::uuid",
+        (job.instance_id, job.job["target_ref"]),
+    )
+    if row is None or row["status"] != "pending":
+        return
+    settings = job.settings
+    url = next((u for u in settings.webhook_urls if alerts.channel_for(u) == row["channel"]), None)
+    sent, attempts = False, 0
+    if url is not None:
+        hosts = [urlsplit(u).hostname for u in settings.webhook_urls]
+        webhook.check_url(url, hosts)
+        with webhook.client() as http:
+            sent, attempts = webhook.post(
+                http,
+                url,
+                settings.webhook_hmac_key,
+                job.job["target_ref"],
+                webhook.build_body(row, settings.console_url),
+            )
+    job.conn.execute(
+        "UPDATE mint.alert_deliveries SET status = %s, attempts = %s,"
+        " sent_at = CASE WHEN %s THEN now() END WHERE id = %s",
+        ("sent" if sent else "failed", attempts, sent, row["id"]),
+    )
 
 
 def _sync(name: str) -> Callable[[JobContext], None]:
@@ -104,6 +148,7 @@ HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "sync_target": _sync("sync_target"),
     "sync_reconcile": _sync("sync_reconcile"),
     "activation_finalize": _sync("activation_finalize"),
+    "alert_deliver": _alert_deliver,
 }
 
 # 일정(주기 작업): 종류 -> 설정에서 주기(초)를 얻는 함수. 처리기가 있는 종류만 일정을 만든다.
@@ -165,42 +210,41 @@ def extend(conn: psycopg.Connection, job_id: Any, owner: str, lease_seconds: flo
 
 
 def complete(conn: psycopg.Connection, job_id: Any, owner: str) -> bool:
-    return (
-        conn.execute(
-            "UPDATE mint.jobs SET status = 'done', lease_owner = NULL, lease_until = NULL,"
-            " last_error_code = NULL, updated_at = now()"
-            " WHERE id = %s AND status = 'running' AND lease_owner = %s",
-            (job_id, owner),
-        ).rowcount
-        == 1
+    """작업을 끝낸다. 같은 종류·대상의 「작업 실패」 경보는 이 성공으로 해결된다."""
+    row = fetchone(
+        conn,
+        "UPDATE mint.jobs SET status = 'done', lease_owner = NULL, lease_until = NULL,"
+        " last_error_code = NULL, updated_at = now()"
+        " WHERE id = %s AND status = 'running' AND lease_owner = %s"
+        " RETURNING instance_id, kind, target_ref",
+        (job_id, owner),
     )
+    if row is None:
+        return False
+    alerts.resolve(
+        conn, row["instance_id"], alerts.job_failed_key(row["kind"], row["target_ref"])
+    )
+    return True
 
 
 # --- 재시도·실패·회수 -----------------------------------------------------------
 
 
 def _alert_failed(conn: psycopg.Connection, row: dict, error_code: str) -> None:
-    """같은 종류·대상의 미해결 경보가 있으면 횟수만 올린다."""
-    dedup = f"job_failed:{row['kind']}:{row['target_ref']}"[:512]
-    conn.execute(
-        "INSERT INTO mint.alerts (id, instance_id, kind, severity, dedup_key, subject)"
-        " VALUES (%s, %s, 'job_failed', 'high', %s, %s)"
-        " ON CONFLICT (instance_id, dedup_key) WHERE status <> 'resolved'"
-        " DO UPDATE SET count = mint.alerts.count + 1, last_at = now()",
-        (
-            new_uuid7(),
-            row["instance_id"],
-            dedup,
-            Jsonb(
-                {
-                    "job_kind": row["kind"],
-                    "target_ref": row["target_ref"],
-                    "job_id": str(row["id"]),
-                    "attempts": row["attempts"],
-                    "last_error_code": error_code,
-                }
-            ),
-        ),
+    """같은 종류·대상의 미해결 경보가 있으면 횟수만 올린다(경보 함수가 묶는다)."""
+    alerts.raise_alert(
+        conn,
+        row["instance_id"],
+        kind="job_failed",
+        severity="high",
+        dedup_key=alerts.job_failed_key(row["kind"], row["target_ref"]),
+        subject={
+            "job_kind": row["kind"],
+            "target_ref": row["target_ref"],
+            "job_id": str(row["id"]),
+            "attempts": row["attempts"],
+            "last_error_code": error_code,
+        },
     )
 
 
@@ -269,6 +313,19 @@ def _requeue(
 def fail(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> str | None:
     """처리기가 실패했다. ``pending``(재시도), ``failed``, 임대를 잃었으면 None을 돌려준다."""
     return _requeue(conn, job_id, "lease_owner = %s", (owner,), code, count=True)
+
+
+def fail_permanently(conn: psycopg.Connection, job_id: Any, owner: str, code: str) -> bool:
+    """재시도 없이 ``failed``로 끝낸다. 임대를 잃었으면 거짓이다."""
+    return (
+        conn.execute(
+            "UPDATE mint.jobs SET status = 'failed', last_error_code = %s, lease_owner = NULL,"
+            " lease_until = NULL, updated_at = now()"
+            " WHERE id = %s AND status = 'running' AND lease_owner = %s",
+            (code, job_id, owner),
+        ).rowcount
+        == 1
+    )
 
 
 def release(

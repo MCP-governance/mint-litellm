@@ -17,7 +17,7 @@ from typing import Any
 
 import psycopg
 
-from mint_litellm.control import jobs
+from mint_litellm.control import alerts, jobs
 from mint_litellm.control.config import ControlConfig
 from mint_litellm.control.db.connection import connect, fetchone
 from mint_litellm.control.errors import ControlError
@@ -100,6 +100,8 @@ class Worker:
         assert self.conn is not None
         jobs.register_due_schedules(self.conn, self.instance_id)
         jobs.reclaim_expired(self.conn, self.instance_id)
+        if self.settings.webhook_urls:
+            alerts.enqueue_deliveries(self.conn, self.instance_id, self.settings.webhook_urls)
         job = jobs.lease(
             self.conn, self.instance_id, self.owner, self.lease_seconds, sorted(jobs.HANDLERS)
         )
@@ -156,6 +158,8 @@ class Worker:
         outcome: str | tuple[str, str] = "ok"
         try:
             jobs.HANDLERS[job["kind"]](ctx)
+        except jobs.PermanentFailure as error:
+            outcome = ("permanent", error.code)
         except jobs.RestoreBlocked:
             outcome = "restore_blocked"
         except jobs.Cancelled:
@@ -178,6 +182,8 @@ class Worker:
             jobs.release(conn, job_id, self.owner, "shutdown")
         elif outcome == "restore_blocked":
             jobs.release(conn, job_id, self.owner, "restore_blocked", RESTORE_BLOCKED_RETRY_SECONDS)
+        elif outcome[0] == "permanent":
+            jobs.fail_permanently(conn, job_id, self.owner, outcome[1])
         else:
             jobs.fail(conn, job_id, self.owner, outcome[1])
 
