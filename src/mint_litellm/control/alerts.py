@@ -12,8 +12,13 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
+from mint_litellm.control import ledger
 from mint_litellm.control.db.connection import fetchall
+from mint_litellm.types.events import EventKind
 from mint_litellm.types.ids import new_uuid7
+
+# 자동으로 일어난 경보 전이의 행위자(운영자 토큰이 없는 작업 실행기)
+AUTO_ACTOR = "mint-worker"
 
 # 한 번의 등록 호출이 다루는 경보 수 상한(작업 실행기 반복 한 번 안에서 끝난다)
 DELIVERY_BATCH = 100
@@ -32,25 +37,56 @@ def raise_alert(
     dedup_key: str,
     subject: dict[str, Any],
 ) -> bool:
-    """미해결 경보가 있으면 횟수와 마지막 시각만 올리고, 없으면 새로 만든다. 새로 만들었으면 참."""
+    """미해결 경보가 있으면 횟수와 마지막 시각만 올리고, 없으면 새로 만든다. 새로 만들었으면 참.
+
+    새로 만든 행마다 ``alert_opened``(순번 0)를 같은 트랜잭션에 남긴다.
+    """
     row = conn.execute(
         "INSERT INTO mint.alerts (id, instance_id, kind, severity, dedup_key, subject)"
         " VALUES (%s, %s, %s, %s, %s, %s)"
         " ON CONFLICT (instance_id, dedup_key) WHERE status <> 'resolved'"
         " DO UPDATE SET count = mint.alerts.count + 1, last_at = now()"
-        " RETURNING (xmax = 0) AS created",
+        " RETURNING id, (xmax = 0) AS created",
         (new_uuid7(), instance_id, kind, severity, dedup_key, Jsonb(subject)),
     ).fetchone()
-    return bool(row[0])
+    created = bool(row[1])
+    if created:
+        ledger.record(
+            conn,
+            instance_id,
+            EventKind.ALERT_OPENED,
+            entity_id=str(row[0]),
+            state_version=0,
+            actor=AUTO_ACTOR,
+            payload={"kind": kind, "severity": severity},
+        )
+    return created
 
 
 def resolve(conn: psycopg.Connection, instance_id: str, dedup_key: str) -> int:
-    """같은 키의 미해결 경보를 해결됨으로 닫는다. 닫은 행 수를 돌려준다."""
-    return conn.execute(
+    """같은 키의 미해결 경보를 닫고 ``alert_resolved``(순번 2)를 남긴다. 닫은 수를 돌려준다."""
+    rows = conn.execute(
         "UPDATE mint.alerts SET status = 'resolved', resolved_at = now()"
-        " WHERE instance_id = %s AND dedup_key = %s AND status <> 'resolved'",
+        " WHERE instance_id = %s AND dedup_key = %s AND status <> 'resolved' RETURNING id, kind",
         (instance_id, dedup_key),
-    ).rowcount
+    ).fetchall()
+    for alert_id, kind in rows:
+        record_resolved(conn, instance_id, str(alert_id), kind, AUTO_ACTOR)
+    return len(rows)
+
+
+def record_resolved(
+    conn: psycopg.Connection, instance_id: str, alert_id: str, kind: str, actor: str
+) -> None:
+    ledger.record(
+        conn,
+        instance_id,
+        EventKind.ALERT_RESOLVED,
+        entity_id=alert_id,
+        state_version=2,
+        actor=actor,
+        payload={"kind": kind},
+    )
 
 
 def channel_for(url: str) -> str:

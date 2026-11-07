@@ -49,7 +49,7 @@ def test_ack_and_resolve_write_the_events_once(mint):
     assert code == 0
     assert f"alert:{alert_id}:1:alert_acknowledged" in out
     code, out, _ = mint.run("--json", "alert", "resolve", alert_id, token=token)
-    assert f"alert:{alert_id}:1:alert_resolved" in out
+    assert f"alert:{alert_id}:2:alert_resolved" in out
 
 
 def test_only_admins_acknowledge_and_resolve(mint):

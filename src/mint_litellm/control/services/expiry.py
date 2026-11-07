@@ -66,12 +66,17 @@ def warn_expiring(conn: psycopg.Connection, instance_id: str) -> int:
                     },
                 )
         for source, table, statuses in _SOURCES:
-            conn.execute(
+            closed = conn.execute(
                 "UPDATE mint.alerts a SET status = 'resolved', resolved_at = now()"
                 " WHERE a.instance_id = %s AND a.kind = 'approval_expiring'"
                 " AND a.status <> 'resolved' AND a.subject->>'source' = %s"
                 f" AND NOT EXISTS (SELECT 1 FROM mint.{table} t WHERE t.instance_id = a.instance_id"
-                "  AND t.id::text = a.subject->>'id' AND t.status = ANY(%s))",
+                "  AND t.id::text = a.subject->>'id' AND t.status = ANY(%s))"
+                " RETURNING a.id",
                 (instance_id, source, list(statuses)),
-            )
+            ).fetchall()
+            for (alert_id,) in closed:
+                alerts.record_resolved(
+                    conn, instance_id, str(alert_id), "approval_expiring", alerts.AUTO_ACTOR
+                )
     return opened

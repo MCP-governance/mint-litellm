@@ -160,10 +160,12 @@ def test_the_body_has_the_documented_fields_and_no_console_address():
         "first_at": _ts(),
         "last_at": _ts(),
     }
-    body = json.loads(webhook.build_body(row))
+    body = json.loads(webhook.build_body(row, None))
     assert set(body) == {"kind", "severity", "subject", "count", "first_at", "last_at",
                          "console_url"}
     assert body["count"] == 2 and body["console_url"] is None
+    given = json.loads(webhook.build_body(row, "https://console.example.com"))
+    assert given["console_url"] == "https://console.example.com"
 
 
 def _ts():
@@ -292,3 +294,17 @@ def test_an_expiry_alert_closes_when_its_approval_is_no_longer_waiting(admin):
     )
     assert expiry.warn_expiring(admin, INSTANCE) == 0
     assert [row[1] for row in alert_rows(admin)] == ["resolved"]
+
+
+def test_opening_and_auto_resolving_write_their_events_in_the_same_transaction(admin):
+    raise_one(admin)
+    alert_id = str(admin.execute("SELECT id FROM mint.alerts").fetchone()[0])
+    assert admin.execute(
+        "SELECT source_key FROM mint.events WHERE source_key = %s",
+        (f"alert:{alert_id}:0:alert_opened",),
+    ).fetchone()
+    alerts.resolve(admin, INSTANCE, "job_failed:x:y")
+    assert admin.execute(
+        "SELECT source_key FROM mint.events WHERE source_key = %s",
+        (f"alert:{alert_id}:2:alert_resolved",),
+    ).fetchone()

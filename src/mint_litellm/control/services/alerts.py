@@ -65,7 +65,7 @@ def acknowledge(ctx: Context, alert_id: str) -> None:
         " WHERE instance_id = %s AND id = %s",
         (ctx.operator.name, ctx.instance_id, alert_id),
     )
-    # 경보에는 상태 버전 열이 없어 종류별로 한 번만 일어나는 전이의 순번 1을 쓴다
+    # 경보에는 상태 버전 열이 없다. 열림 0, 확인 1, 해결 2의 순번을 경보마다 한 번씩 쓴다
     ctx.emit(EventKind.ALERT_ACKNOWLEDGED, alert_id, 1, {"kind": row["kind"]})
 
 
@@ -80,7 +80,7 @@ def resolve(ctx: Context, alert_id: str) -> None:
         " WHERE instance_id = %s AND id = %s",
         (ctx.instance_id, alert_id),
     )
-    ctx.emit(EventKind.ALERT_RESOLVED, alert_id, 1, {"kind": row["kind"]})
+    ctx.emit(EventKind.ALERT_RESOLVED, alert_id, 2, {"kind": row["kind"]})
 
 
 def send_test(ctx: Context, settings: Stage2Settings) -> list[dict[str, Any]]:
@@ -96,7 +96,8 @@ def send_test(ctx: Context, settings: Stage2Settings) -> list[dict[str, Any]]:
             "count": 1,
             "first_at": now,
             "last_at": now,
-        }
+        },
+        settings.console_url,
     )
     hosts = [urlsplit(u).hostname for u in settings.webhook_urls]
     results = []

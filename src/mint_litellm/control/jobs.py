@@ -104,7 +104,7 @@ def _alert_deliver(job: JobContext) -> None:
                 url,
                 settings.webhook_hmac_key,
                 job.job["target_ref"],
-                webhook.build_body(row),
+                webhook.build_body(row, settings.console_url),
             )
     job.conn.execute(
         "UPDATE mint.alert_deliveries SET status = %s, attempts = %s,"

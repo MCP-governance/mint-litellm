@@ -81,6 +81,7 @@ class Stage2Settings:
     session_absolute_seconds: int = 28800
     session_verify_seconds: int = 300
     staff_consent_max_days: int = 90
+    console_url: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Stage2Settings":
@@ -105,6 +106,7 @@ class Stage2Settings:
             session_absolute_seconds=_seconds(env, "MINT_SESSION_ABSOLUTE_SECONDS", 28800),
             session_verify_seconds=_seconds(env, "MINT_SESSION_VERIFY_SECONDS", 300),
             staff_consent_max_days=_days(env, "MINT_STAFF_CONSENT_MAX_DAYS", 90),
+            console_url=(env.get("MINT_CONSOLE_URL") or "").strip() or None,
         )
         if settings.session_idle_seconds > settings.session_absolute_seconds:
             raise ControlError(

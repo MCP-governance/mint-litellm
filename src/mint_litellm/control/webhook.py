@@ -62,7 +62,7 @@ def verify(
     return hmac.compare_digest(expected, fields.get("v1", ""))
 
 
-def build_body(row: Mapping[str, Any]) -> bytes:
+def build_body(row: Mapping[str, Any], console_url: str | None) -> bytes:
     payload = {
         "kind": row["kind"],
         "severity": row["severity"],
@@ -70,7 +70,7 @@ def build_body(row: Mapping[str, Any]) -> bytes:
         "count": row["count"],
         "first_at": row["first_at"].isoformat(),
         "last_at": row["last_at"].isoformat(),
-        "console_url": None,
+        "console_url": console_url,
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
