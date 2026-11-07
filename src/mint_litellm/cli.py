@@ -613,6 +613,10 @@ HANDLERS: dict[str, Handler] = {
     "status": _status,
     "operator add": _operator_add,
     "operator bootstrap": _operator_bootstrap,
+    "operator remove": _done(operator_service.remove, "name"),
+    "operator set-role": lambda r: operator_service.set_role(
+        r.context(), r.args.name, OperatorRole(r.args.role)
+    ),
     "server register": _server_register,
     "alert list": _alert_list,
     "alert ack": _done(alert_service.acknowledge, "alert_id"),
@@ -729,6 +733,10 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--expires-in-days", type=int),
     ],
     "operator bootstrap": [_a("--name", required=True), _a("--user-id", required=True)],
+    "operator remove": [_a("name")],
+    "operator set-role": [
+        _a("name"), _a("--role", required=True, choices=[r.value for r in OperatorRole])
+    ],
     "server register": [
         _SERVER_ID,
         _a("--url", help="계약 값에 쓸 서버 URL(제어 평면 키는 레지스트리 URL을 읽을 수 없다)"),

@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import RedirectResponse, Response
 
-from mint_litellm.console import api
+from mint_litellm.console import api, compare
 from mint_litellm.console.core import STATUS, Actor, page_actor, require_csrf
 from mint_litellm.console.templating import render
 from mint_litellm.control import jobs
@@ -16,11 +16,15 @@ from mint_litellm.control.errors import AdminCode, AdminError, ControlError
 from mint_litellm.control.services import allowlists as allowlist_service
 from mint_litellm.control.services import approvals as approval_service
 from mint_litellm.control.services import call_approvals as call_approval_service
+from mint_litellm.control.services import contracts as contract_service
 from mint_litellm.control.services import denials as denial_service
+from mint_litellm.control.services import intakes as intake_service
+from mint_litellm.control.services import operators as operator_service
 from mint_litellm.control.services import orgs as org_service
 from mint_litellm.control.services import reads
 from mint_litellm.control.services import servers as server_service
 from mint_litellm.control.services import settings as settings_service
+from mint_litellm.types.cli_commands import OperatorRole
 from mint_litellm.types.settings import Mode
 
 router = APIRouter(dependencies=[Depends(require_csrf)])
@@ -410,6 +414,39 @@ def admin(request: Request, actor: Actor = Depends(page_actor)):
     return admin_page(request, actor)
 
 
+@router.post("/operators/{name}/role")
+def set_operator_role(
+    name: str,
+    request: Request,
+    role: str = Form(...),
+    state_version: int = Form(...),
+    actor: Actor = Depends(page_actor),
+):
+    return act(
+        actor,
+        lambda: operator_service.set_role(
+            actor.ctx, name, OperatorRole(role), expected_version=state_version
+        ),
+        "operator_role", "/admin", lambda **kw: admin_page(request, actor, **kw),
+    )
+
+
+@router.post("/operators/{name}/remove")
+def remove_operator(
+    name: str,
+    request: Request,
+    state_version: int = Form(...),
+    confirm_name: str = Form(""),
+    actor: Actor = Depends(page_actor),
+):
+    def action():
+        api.confirm(name, confirm_name, "운영자")
+        operator_service.remove(actor.ctx, name, expected_version=state_version)
+
+    return act(actor, action, "operator_removed", "/admin",
+               lambda **kw: admin_page(request, actor, **kw))
+
+
 @router.post("/orgs")
 def add_org(
     request: Request,
@@ -466,4 +503,160 @@ def lift_allowlist(
         actor,
         lambda: allowlist_service.lift(actor.ctx, allowlist_id, expected_version=state_version),
         "lifted", "/admin", lambda **kw: admin_page(request, actor, **kw),
+    )
+
+
+# --- 신청·수용검증 ----------------------------------------------------------------------------
+
+
+def intakes_page(request: Request, actor: Actor, error=None, status=200):
+    wanted = request.query_params.get("status") or None
+    rows = intake_service.list_intakes(actor.ctx, wanted)
+    rows.sort(key=lambda r: (r["created_at"], str(r["id"])))  # 오래된 것 먼저
+    ctx = {"rows": rows, "wanted": wanted or "", "error": error}
+    return render(request, "intakes.html", ctx, actor=actor, status=status)
+
+
+@router.get("/intakes")
+def intakes(request: Request, actor: Actor = Depends(page_actor)):
+    return intakes_page(request, actor)
+
+
+def intake_page(request: Request, actor: Actor, intake_id: str, error=None, status=200):
+    info = intake_service.show(actor.ctx, intake_id)
+    now = datetime.now(UTC)
+    checks = info["checks"]
+    stale = any(
+        c["check"] in ("connection", "definitions")
+        and now - c["ran_at"] > intake_service.EVIDENCE_MAX_AGE
+        for c in checks
+    )
+    expiries = [c["evidence_valid_until"] for c in checks if c["evidence_valid_until"]]
+    strict = any(t["risk_grade"] in ("high", "critical") for t in info["tool_contracts"])
+    ctx = {
+        "i": info["intake"], "checks": checks, "tools": info["tool_contracts"], "stale": stale,
+        "expires": min(expiries) if expiries else None,
+        "days": api.STRICT_DAYS if strict else api.STANDARD_DAYS,
+        "strict_days": api.STRICT_DAYS, "max_exception_days": api.EXCEPTION_MAX_DAYS,
+        "can_assign": actor.config.litellm_admin is not None, "error": error,
+    }
+    return render(request, "intake_detail.html", ctx, actor=actor, status=status)
+
+
+@router.get("/intakes/{intake_id}")
+def intake_detail(intake_id: str, request: Request, actor: Actor = Depends(page_actor)):
+    return intake_page(request, actor, intake_id)
+
+
+@router.post("/intakes/{intake_id}/requester")
+def assign_requester(
+    intake_id: str,
+    request: Request,
+    user_id: str = Form(...),
+    state_version: int = Form(...),
+    actor: Actor = Depends(page_actor),
+):
+    return act(
+        actor,
+        lambda: intake_service.assign_requester(
+            actor.ctx, actor.litellm(), intake_id, user_id, expected_version=state_version
+        ),
+        "requester_assigned", f"/intakes/{intake_id}",
+        lambda **kw: intake_page(request, actor, intake_id, **kw),
+    )
+
+
+@router.post("/intakes/{intake_id}/recheck")
+def recheck_intake(
+    intake_id: str,
+    request: Request,
+    state_version: int = Form(...),
+    actor: Actor = Depends(page_actor),
+):
+    return act(
+        actor,
+        lambda: intake_service.recheck(actor.ctx, intake_id, expected_version=state_version),
+        "rechecked", f"/intakes/{intake_id}",
+        lambda **kw: intake_page(request, actor, intake_id, **kw),
+    )
+
+
+@router.post("/intakes/{intake_id}/decision")
+def decide_intake(
+    intake_id: str,
+    request: Request,
+    decision: str = Form(...),
+    state_version: int = Form(...),
+    reason: str = Form(""),
+    valid_days: int | None = Form(None),
+    scope_type: str = Form("user"),
+    scope_id: str = Form(""),
+    second_approver_token: str = Form(""),
+    actor: Actor = Depends(page_actor),
+):
+    def action():
+        body = api.IntakeDecisionBody(
+            state_version=state_version, decision=decision, reason=reason or None,
+            valid_days=valid_days, scope_type=scope_type, scope_id=scope_id or None,
+            second_approver_token=second_approver_token or None,
+        )
+        api.decide_intake(actor, intake_id, body)
+
+    ok = "intake_rejected" if decision == "reject" else "intake_approved"
+    return act(actor, action, ok, f"/intakes/{intake_id}",
+               lambda **kw: intake_page(request, actor, intake_id, **kw))
+
+
+# --- 계약 드리프트 비교·재승인 -------------------------------------------------------------------
+
+
+@router.get("/contracts")
+def contracts(request: Request, actor: Actor = Depends(page_actor)):
+    rows = reads.drifted_servers(actor.conn, actor.instance)
+    return render(request, "contracts.html", {"rows": rows}, actor=actor)
+
+
+def contract_page(
+    request: Request, actor: Actor, server_id: str, error=None, status=200
+):
+    info = contract_service.diff(actor.ctx, server_id)
+    rows = compare.changes(info)
+    wanted = (request.query_params.get("scope", ""), request.query_params.get("name", ""))
+    chosen = next((r for r in rows if (r["scope"], r["name"]) == wanted), None)
+    ctx = {
+        "server_id": server_id,
+        "server": info["server"],
+        "rows": rows,
+        "chosen": chosen,
+        "sides": compare.side_by_side(chosen["approved"], chosen["observed"]) if chosen else None,
+        "plan": reads.reapproval_plan(actor.conn, actor.instance, server_id),
+        "cand": reads.candidates(actor.conn, actor.instance, server_id),
+        "error": error,
+    }
+    return render(request, "contract_detail.html", ctx, actor=actor, status=status)
+
+
+@router.get("/contracts/{server_id}")
+def contract_detail(server_id: str, request: Request, actor: Actor = Depends(page_actor)):
+    return contract_page(request, actor, server_id)
+
+
+@router.post("/contracts/{server_id}/reapprove")
+def reapprove_contracts(
+    server_id: str,
+    request: Request,
+    intake_id: str = Form(...),
+    state_version: int = Form(...),
+    tool_contract_ids: list[str] = Form([]),
+    deployment_contract_id: str = Form(""),
+    actor: Actor = Depends(page_actor),
+):
+    return act(
+        actor,
+        lambda: contract_service.reapprove(
+            actor.ctx, server_id, intake_id, tool_contract_ids,
+            deployment_id=deployment_contract_id or None, expected_version=state_version,
+        ),
+        "reapproval_planned", f"/contracts/{server_id}",
+        lambda **kw: contract_page(request, actor, server_id, **kw),
     )

@@ -34,6 +34,7 @@ _VERSIONED = {
     "allowlists": ("id", "state_version"),
     "orgs": ("org_id", "state_version"),
     "settings": ("instance_id", "settings_version"),
+    "operators": ("name", "state_version"),
 }
 
 

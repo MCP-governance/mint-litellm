@@ -85,6 +85,55 @@ ENFORCEMENT = {
     "enforcement_unverified": Status("확인 불가", "error"),
 }
 
+INTAKE = {
+    "received": Status("접수", "wait"),
+    "checking": Status("검사 중", "wait"),
+    "passed": Status("검사 통과", "ok"),
+    "failed": Status("검사 실패", "error"),
+    "indeterminate": Status("판별 불가", "wait"),
+    "decided": Status("결정됨", "off"),
+}
+DECISION = {
+    "approved": Status("승인됨", "ok"),
+    "rejected": Status("거절됨", "block"),
+    "exception": Status("예외 승인됨", "wait"),
+}
+CHECK_RESULT = {
+    "pass": Status("통과", "ok"),
+    "fail": Status("실패", "error"),
+    "indeterminate": Status("판별 불가", "wait"),
+}
+CHECK = {
+    "url_guard": "주소 검사",
+    "oauth_issuer_allowlist": "인증 서버 허용 목록",
+    "connection": "연결",
+    "definitions": "도구 정의",
+    "description_scan": "설명 검사",
+    "risk_grade": "위험 등급",
+    "termination_readiness": "종료 준비",
+    "supply_chain": "공급망",
+}
+SOURCE = {"submission": "제출", "operator": "운영자 등록"}
+DATA_GRADE = {"public": "공개", "internal": "내부", "confidential": "기밀", "restricted": "제한"}
+RISK = {"low": "낮음", "medium": "보통", "high": "높음", "critical": "심각"}
+ACTION = {
+    "read": "읽기",
+    "write": "쓰기",
+    "delete": "삭제",
+    "external_send": "외부 전송",
+    "credential_access": "자격 접근",
+}
+PLAN = {
+    "pending": Status("반영 대기", "wait"),
+    "completed": Status("반영 완료", "ok"),
+    "cancelled": Status("취소됨", "off"),
+}
+CHANGE = {
+    "added": Status("추가", "wait"),
+    "removed": Status("삭제", "block"),
+    "changed": Status("변경", "error"),
+}
+
 ROLE = {"admin": "관리자", "approver": "승인자", "viewer": "조회자", "staff": "직원"}
 MODE = {"enforce": "집행", "observe": "관측"}
 SCOPE = {"key": "키", "user": "사용자", "team": "팀", "org": "조직", "server": "서버"}
@@ -163,6 +212,8 @@ EVENT_KIND = {
     "policy_activated": "정책 적용",
     "settings_changed": "설정 변경",
     "operator_added": "운영자 등록",
+    "operator_removed": "운영자 삭제",
+    "operator_role_changed": "운영자 역할 변경",
     "intake_received": "신청 접수",
     "intake_requester_assigned": "신청자 지정",
     "intake_checked": "수용검증",
@@ -230,6 +281,13 @@ NOTICES = {
     "org_closed": "조직을 닫았습니다.",
     "allowlist_added": "허용 목록에 추가했습니다.",
     "mode_set": "모드를 변경했습니다.",
+    "operator_role": "운영자의 역할을 변경했습니다.",
+    "requester_assigned": "신청자를 지정했습니다.",
+    "rechecked": "재검사를 등록했습니다.",
+    "intake_approved": "신청을 승인했습니다.",
+    "intake_rejected": "신청을 거절했습니다.",
+    "reapproval_planned": "재승인 계획을 등록했습니다. 반영은 작업 실행기가 진행합니다.",
+    "operator_removed": "운영자를 삭제했습니다.",
     "staff_confirmed": "확인했습니다.",
     "staff_rejected": "거절했습니다.",
     "staff_cancelled": "취소했습니다.",

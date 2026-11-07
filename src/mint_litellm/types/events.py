@@ -60,6 +60,8 @@ class EventKind(StrEnum):
     POLICY_ACTIVATED = "policy_activated"
     SETTINGS_CHANGED = "settings_changed"
     OPERATOR_ADDED = "operator_added"
+    OPERATOR_REMOVED = "operator_removed"
+    OPERATOR_ROLE_CHANGED = "operator_role_changed"
     # 2단계 제어 사건
     INTAKE_RECEIVED = "intake_received"
     INTAKE_REQUESTER_ASSIGNED = "intake_requester_assigned"
@@ -137,6 +139,8 @@ CONTROL_ENTITY: dict[EventKind, str] = {
     EventKind.POLICY_ACTIVATED: "policy_version",
     EventKind.SETTINGS_CHANGED: "settings",
     EventKind.OPERATOR_ADDED: "operator",
+    EventKind.OPERATOR_REMOVED: "operator",
+    EventKind.OPERATOR_ROLE_CHANGED: "operator",
     EventKind.INTAKE_RECEIVED: "intake",
     EventKind.INTAKE_REQUESTER_ASSIGNED: "intake",
     EventKind.INTAKE_CHECKED: "intake_check",

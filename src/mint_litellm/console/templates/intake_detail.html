@@ -1,0 +1,79 @@
+{% extends "base.html" %}{% import "macros.html" as m %}
+{% block title %}신청 상세 · MINT{% endblock %}
+{% block body %}
+<h1>신청: {{ i.server_id }} {{ m.badge(L.INTAKE, i.status) }}</h1>
+{% if stale and i.status in ('passed', 'indeterminate') %}<div class="banner error" role="alert">연결·도구 정의 증거가 24시간을 넘었습니다. 재검사한 뒤 결정하십시오.</div>{% endif %}
+<dl class="detail">
+  <dt>대상 서버</dt><dd><a href="/servers/{{ i.server_id | urlencode }}">{{ i.server_id }}</a></dd>
+  <dt>출처</dt><dd>{{ L.pick(L.SOURCE, i.source) }}</dd>
+  <dt>신청자</dt><dd>{{ i.requested_by | blank }}</dd>
+  <dt>담당 사용자</dt><dd>{{ i.owner_user_id | blank }}</dd>
+  <dt>목적</dt><dd>{{ i.purpose | blank }}</dd>
+  <dt>데이터 등급</dt><dd>{{ L.pick(L.DATA_GRADE, i.data_grade) }}</dd>
+  <dt>허용 범위</dt><dd>{{ i.allowed_resources | to_json if i.allowed_resources else '—' }}</dd>
+  <dt>제공자</dt><dd>{{ i.provider | blank }}</dd>
+  <dt>종료 준비</dt><dd>{% if i.readiness %}자격 증명 고지 {{ i.readiness.credential_notice | blank }} · 철회 기록 {{ i.readiness.revocation_record | blank }} · 감사 로그 열람 {{ i.readiness.audit_access_days | blank }}일{% else %}—{% endif %}</dd>
+  <dt>데이터 반환 조건</dt><dd>{{ i.data_return_terms | blank }}</dd>
+  <dt>증거 만료</dt><dd>{{ expires | when }}</dd>
+  <dt>접수 시각</dt><dd>{{ i.created_at | when }}</dd>
+  {% if i.decision %}<dt>결정</dt><dd>{{ m.badge(L.DECISION, i.decision) }} · {{ i.decided_by | blank }} · {{ i.decided_at | when }}</dd>
+  <dt>결정 사유</dt><dd>{{ i.decision_reason | blank }}</dd>{% endif %}
+  <dt>코드</dt><dd><code>{{ i.status }}</code></dd>
+</dl>
+<h2>검사 결과</h2>
+{% if checks %}
+<table><thead><tr><th>단계</th><th>결과</th><th>실행 시각</th><th>증거 만료</th><th>코드</th></tr></thead><tbody>
+{% for c in checks %}<tr><td>{{ L.pick(L.CHECK, c.check) }}</td><td>{{ m.badge(L.CHECK_RESULT, c.result) }}</td><td>{{ c.ran_at | when }}</td><td>{{ c.evidence_valid_until | when }}</td><td><code>{{ c.reason_code | blank }}</code></td></tr>{% endfor %}
+</tbody></table>
+{% else %}<p class="muted">아직 검사 결과가 없습니다.</p>{% endif %}
+<h2>도구와 위험 등급</h2>
+{% if tools %}
+<table><thead><tr><th>도구</th><th>위험 등급</th><th>동작 유형</th><th>상태</th></tr></thead><tbody>
+{% for t in tools %}<tr><td>{{ t.tool }}</td><td>{{ L.pick(L.RISK, t.risk_grade) }}</td><td>{{ L.pick(L.ACTION, t.action_type) }}</td><td>{{ '승인됨' if t.status == 'approved' else '후보' }}</td></tr>{% endfor %}
+</tbody></table>
+{% else %}<p class="muted">산정된 도구가 없습니다.</p>{% endif %}
+
+{% if actor.role == 'admin' and i.status == 'received' and not i.requested_by %}
+<h2>신청자 지정</h2>
+{% if can_assign %}
+<form method="post" action="/intakes/{{ i.id }}/requester" class="filters">
+  {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ i.state_version }}">
+  <label>신청자(사용자 식별자)<input name="user_id" required></label>
+  <button type="submit" class="primary">지정</button>
+</form>
+{% else %}<p class="muted">이 콘솔에는 제어 평면 키가 없어 지정할 수 없습니다. 명령줄에서 지정하십시오.</p>{% endif %}
+{% endif %}
+
+{% if actor.role == 'admin' and i.status in ('received', 'passed', 'indeterminate') and i.requested_by %}
+<form method="post" action="/intakes/{{ i.id }}/recheck" class="filters">
+  {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ i.state_version }}">
+  <button type="submit" class="{{ 'primary' if stale else '' }}">재검사</button>
+</form>
+{% endif %}
+
+{% if actor.role != 'viewer' and i.status in ('passed', 'indeterminate') %}
+<h2>결정</h2>
+<form method="post" action="/intakes/{{ i.id }}/decision" class="form">
+  {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ i.state_version }}">
+  {% if i.status == 'passed' %}<input type="hidden" name="decision" value="approve">{% else %}<input type="hidden" name="decision" value="except">{% endif %}
+  <div class="row">
+    <label>대상 구분<select name="scope_type"><option value="user">사용자</option><option value="key">키</option><option value="team">팀</option></select></label>
+    <label>대상 식별자<input name="scope_id" value="{{ i.owner_user_id or '' }}"></label>
+    <label>유효 기간(일, 기본값은 위험 등급에 따름)<input type="number" name="valid_days" value="{{ strict_days if i.status == 'indeterminate' else days }}" min="1" max="{{ max_exception_days if i.status == 'indeterminate' else 365 }}"></label>
+  </div>
+  {% if i.status == 'indeterminate' %}
+  <label>예외 사유(필수)<textarea name="reason" required></textarea></label>
+  <label>두 번째 승인자 토큰(신청자·결정자와 다른 사용자)<input type="password" name="second_approver_token" autocomplete="off" required></label>
+  {% else %}
+  <label>승인 사유(선택)<textarea name="reason"></textarea></label>
+  {% endif %}
+  <div class="actions"><button type="submit" class="primary">{{ '예외 승인' if i.status == 'indeterminate' else '승인' }}</button></div>
+</form>
+<form method="post" action="/intakes/{{ i.id }}/decision" class="form danger-zone">
+  <h3>거절</h3>
+  {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ i.state_version }}"><input type="hidden" name="decision" value="reject">
+  <label>거절 사유(필수)<input name="reason" required></label>
+  <div class="actions"><button type="submit" class="danger">거절</button></div>
+</form>
+{% endif %}
+{% endblock %}
