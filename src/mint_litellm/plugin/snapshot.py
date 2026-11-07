@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import math
+import re
 import socket
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -25,7 +26,7 @@ from mint_litellm.types.identity import OrgStatus, SubjectType
 from mint_litellm.types.reason_codes import OBSERVATION_CANDIDATES, Reason
 from mint_litellm.types.settings import Mode
 
-SNAPSHOT_SQL = """
+STAGE2_SNAPSHOT_SQL = """
 WITH
 s AS (SELECT * FROM mint.settings WHERE instance_id = %(iid)s),
 srv AS (
@@ -58,6 +59,14 @@ SELECT jsonb_build_object(
     'bindings', (SELECT coalesce(jsonb_agg(to_jsonb(b)), '[]'::jsonb) FROM b),
     'orgs', (SELECT coalesce(jsonb_agg(to_jsonb(o)), '[]'::jsonb) FROM o),
     'server', (SELECT to_jsonb(srv) FROM srv),
+    'tool_contracts', (
+        SELECT coalesce(jsonb_agg(jsonb_build_object(
+            'id', t.id, 'credential_scope', t.credential_scope, 'tool', t.tool,
+            'drift', t.drift, 'version', t.version)), '[]'::jsonb) FROM mint.tool_contracts t
+        WHERE t.instance_id = %(iid)s AND t.server_id = %(server_id)s
+          AND t.tool = %(tool)s AND t.status = 'approved'
+          AND EXISTS (SELECT 1 FROM srv WHERE contract_status = 'managed')
+    ),
     'allowlists', (
         SELECT coalesce(jsonb_agg(to_jsonb(a)), '[]'::jsonb) FROM mint.allowlists a
         WHERE a.instance_id = %(iid)s AND a.id = ANY (SELECT unnest(basis_allowlist_ids) FROM srv)
@@ -72,6 +81,17 @@ SELECT jsonb_build_object(
     'relations', (
         SELECT coalesce(jsonb_agg(to_jsonb(r)), '[]'::jsonb) FROM mint.usage_relations r
         WHERE r.instance_id = %(iid)s AND r.id IN (SELECT relation_id FROM ap)
+    ),
+    'negative_relation', EXISTS (
+        SELECT 1 FROM mint.usage_relations r
+        WHERE r.instance_id = %(iid)s AND r.server_id = %(server_id)s
+          AND r.status IN ('terminating', 'terminated')
+          AND r.id IN (SELECT a.relation_id FROM mint.approvals a
+              WHERE a.instance_id = %(iid)s AND a.server_id = %(server_id)s
+                AND ((a.scope_type = 'key' AND a.scope_id = %(key_id)s)
+                  OR (a.scope_type = 'user' AND a.scope_id = %(user_id)s)
+                  OR (a.scope_type = 'team' AND a.scope_id = %(team_id)s)
+                  OR (a.scope_type = 'org' AND a.scope_id IN (SELECT org_id FROM o))))
     ),
     'approvals', (SELECT coalesce(jsonb_agg(to_jsonb(ap)), '[]'::jsonb) FROM ap),
     'denials', (
@@ -102,7 +122,16 @@ SELECT jsonb_build_object(
 ) AS doc
 """
 
-CONFIRMATION_SNAPSHOT_SQL = SNAPSHOT_SQL.replace(
+# v001 데이터베이스에는 계약 표가 없다. 같은 질의에서 계약 부분만 빈 목록으로 바꾼다.
+SNAPSHOT_SQL = re.sub(
+    r"'tool_contracts', \(.*?\),\s+'allowlists'",
+    "'tool_contracts', '[]'::jsonb,\n    'allowlists'",
+    STAGE2_SNAPSHOT_SQL,
+    count=1,
+    flags=re.S,
+)
+
+CONFIRMATION_SNAPSHOT_SQL = STAGE2_SNAPSHOT_SQL.replace(
     "'consents', (",
     """'self_confirmations', (
         SELECT coalesce(jsonb_agg(to_jsonb(c) - 'display'), '[]'::jsonb)
@@ -185,6 +214,7 @@ class SettingsRow:
     observable_policy_ids: frozenset[str] = frozenset()
     default_org_id: str | None = None
     settings_version: int | None = None
+    control_key_token: str | None = None
     require_separate_confirm_key: bool = True
 
 
@@ -198,6 +228,9 @@ class ServerRow:
     auth_type: str
     basis_allowlist_ids: tuple[str, ...]
     contract_status: str = "none"
+    issuer: str | None = None
+    last_observed_at: datetime | None = None
+    deployment_drift: bool = False
 
 
 @dataclass(frozen=True)
@@ -291,6 +324,15 @@ class PolicyVersionRow:
 
 
 @dataclass(frozen=True)
+class ToolContractRow:
+    id: str
+    credential_scope: str
+    tool: str
+    drift: str
+    version: int
+
+
+@dataclass(frozen=True)
 class Snapshot:
     now: datetime
     epoch: int | None
@@ -305,6 +347,8 @@ class Snapshot:
     call_approvals: tuple[CallApprovalRow, ...]
     consents: tuple[ConsentRow, ...]
     policy_version: PolicyVersionRow | None
+    tool_contracts: tuple[ToolContractRow, ...] = ()
+    negative_relation: bool = False
     self_confirmations: tuple[ConfirmationRow, ...] = ()
     # (값, 조직 또는 None): 지금 유효한 허용 목적지 목록. 패턴 계산의 허용 호스트에 쓴다.
     egress_targets: tuple[tuple[str, str | None], ...] = ()
@@ -326,6 +370,7 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
             observable_policy_ids=frozenset(settings["observable_policy_ids"]),
             default_org_id=settings.get("default_org_id"),
             settings_version=settings["settings_version"],
+            control_key_token=settings.get("control_key_token"),
             require_separate_confirm_key=settings.get("require_separate_confirm_key", True),
         ),
         bindings={
@@ -343,6 +388,9 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
             auth_type=server["auth_type"],
             basis_allowlist_ids=tuple(server["basis_allowlist_ids"]),
             contract_status=server.get("contract_status", "none"),
+            issuer=server.get("issuer"),
+            last_observed_at=_maybe_time(server.get("last_observed_at")),
+            deployment_drift=server.get("deployment_drift", False),
         ),
         allowlists={
             a["id"]: AllowlistRow(
@@ -414,6 +462,11 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
         policy_version=None
         if policy is None
         else PolicyVersionRow(id=policy["id"], bundle_sha256=policy["bundle_sha256"]),
+        tool_contracts=tuple(
+            ToolContractRow(c["id"], c["credential_scope"], c["tool"], c["drift"], c["version"])
+            for c in doc.get("tool_contracts", ())
+        ),
+        negative_relation=bool(doc.get("negative_relation", False)),
         self_confirmations=tuple(
             ConfirmationRow(**{
                 **{k: c[k] for k in ConfirmationRow.__dataclass_fields__},
@@ -455,6 +508,8 @@ class RegisteredServer:
     url_sha256: str
     transport: str
     auth_type: str
+    issuer: str | None = None
+    contract_status: str = "none"
 
 
 # 이 시간(초) 넘게 쓰지 않은 연결은 쓰기 전에 확인한다. 풀의 확인 기능은 실패마다 1초 넘게
@@ -743,8 +798,11 @@ class PluginDatabase:
 
     async def registered_servers(self, instance_id: str) -> Sequence[RegisteredServer]:
         async def read(conn: Any) -> Any:
+            probe = await conn.execute("SELECT to_regclass('mint.tool_contracts')")
+            stage2 = (await probe.fetchone())[0] is not None
+            columns = "issuer, contract_status" if stage2 else "NULL, 'none'"
             cursor = await conn.execute(
-                "SELECT server_id, status, url_sha256, transport, auth_type"
+                "SELECT server_id, status, url_sha256, transport, auth_type, " + columns +
                 " FROM mint.servers WHERE instance_id = %s ORDER BY server_id",
                 (instance_id,),
             )

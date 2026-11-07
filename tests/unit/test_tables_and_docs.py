@@ -128,6 +128,7 @@ def test_command_roles_follow_the_operator_role_model():
         "call-approval approve",
         "call-approval reject",
         "call-approval cancel",
+        "contract reapprove",
         "intake approve",
         "intake reject",
         "intake except",
@@ -142,7 +143,7 @@ def test_command_roles_follow_the_operator_role_model():
         elif command.roles == frozenset(OperatorRole):
             assert command.name in {
                 "check", "status", "ledger list", "alert list", "sync status", "intake list",
-                "intake show"}
+                "intake show", "contract show", "contract diff"}
         else:
             assert command.roles == frozenset({OperatorRole.ADMIN}), command.name
 

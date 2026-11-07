@@ -170,6 +170,12 @@ def _alert_deliver(job: JobContext) -> None:
     )
 
 
+def _contract_observe(job: JobContext) -> None:
+    from mint_litellm.control.contract_observe import handle
+
+    handle(job)
+
+
 def _sync(name: str) -> Callable[[JobContext], None]:
     """권한 동기화 처리기(``sync_jobs``)를 부를 때 불러온다(모듈 순환을 피한다)."""
 
@@ -213,6 +219,7 @@ def _session_verify(job: JobContext) -> None:
 # 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
 HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "approval_expiry_scan": _approval_expiry_scan,
+    "contract_observe": _contract_observe,
     "sync_server": _sync("sync_server"),
     "sync_target": _sync("sync_target"),
     "sync_reconcile": _sync("sync_reconcile"),
@@ -228,6 +235,7 @@ HANDLERS: dict[str, Callable[[JobContext], None]] = {
 # 일정(주기 작업): 종류 -> 설정에서 주기(초)를 얻는 함수. 처리기가 있는 종류만 일정을 만든다.
 SCHEDULES: dict[str, Callable[[Any], int]] = {
     "approval_expiry_scan": lambda s: 60,
+    "contract_observe": lambda s: s.observe_seconds,
     "seal": lambda s: 60,
     "submission_poll": lambda s: s.submission_poll_seconds,
     "sync_reconcile": lambda s: s.reconcile_seconds,
@@ -470,6 +478,14 @@ def register_due_schedules(conn: psycopg.Connection, instance_id: str) -> int:
         )
         registered = 0
         for row in due:
+            if KINDS[row["kind"]].convergent:
+                registered += conn.execute(
+                    "INSERT INTO mint.jobs (id,instance_id,kind,target_ref) VALUES (%s,%s,%s,%s)"
+                    " ON CONFLICT (instance_id,kind,target_ref)"
+                    " WHERE status='pending' AND idempotency_key IS NULL DO NOTHING",
+                    (new_uuid7(), instance_id, row["kind"], row["kind"]),
+                ).rowcount
+                continue
             registered += conn.execute(
                 "INSERT INTO mint.jobs (id, instance_id, kind, target_ref, idempotency_key)"
                 " VALUES (%s, %s, %s, %s, %s)"

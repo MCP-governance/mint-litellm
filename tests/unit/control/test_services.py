@@ -375,11 +375,12 @@ def test_every_state_changing_command_has_a_service():
         "call-approval cancel", "consent add", "consent revoke", "allowlist add",
         "allowlist lift", "org add", "org close", "org bind", "org unbind",
         "settings default-org", "settings mode", "settings observable", "policy activate",
-        "sync resume", "alert ack", "alert resolve", "intake create", "intake recheck",
-        "intake assign", "intake approve", "intake reject", "intake except",
+        "contract reapprove", "sync resume", "alert ack", "alert resolve", "intake create",
+        "intake recheck", "intake assign", "intake approve", "intake reject", "intake except",
     }
     assert stateful <= set(cli.HANDLERS)
     assert stateful <= set(base._COMMANDS)
     assert set(cli.HANDLERS) - stateful == {
         "check", "status", "ledger list", "alert list", "sync status", "intake list",
-        "intake show"}
+        "intake show", "contract show", "contract diff",
+    }
