@@ -32,6 +32,9 @@ mkdir -p "$STATE/export" "$STATE/dumps" && chmod 777 "$STATE/export" "$STATE/dum
 export ACC_DUMP_DIR="$STATE/dumps"
 docker volume inspect "${COMPOSE_PROJECT_NAME}_export" >/dev/null 2>&1 ||   docker volume create --driver local --opt type=none --opt o=bind --opt "device=$STATE/export" "${COMPOSE_PROJECT_NAME}_export" >/dev/null
 ./mint.sh up
+# mint.sh가 띄운 작업 실행기는 루트라 루트 소유 파일을 남긴다. 멈추고 비운 뒤 오버레이(비루트)로 다시 올린다.
+"${C[@]}" --profile worker stop worker
+docker run --rm -v "${COMPOSE_PROJECT_NAME}_export:/x" --entrypoint sh mint-litellm:local -c 'rm -rf /x/* /x/.[!.]*' || true
 "${C[@]}" up -d --wait postgres
 "${C[@]}" up -d cnt fixture
 set -a; . ./.env; set +a
