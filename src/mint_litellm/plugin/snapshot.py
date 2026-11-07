@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import math
+import re
 import socket
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -25,7 +26,7 @@ from mint_litellm.types.identity import OrgStatus, SubjectType
 from mint_litellm.types.reason_codes import OBSERVATION_CANDIDATES, Reason
 from mint_litellm.types.settings import Mode
 
-SNAPSHOT_SQL = """
+STAGE2_SNAPSHOT_SQL = """
 WITH
 s AS (SELECT * FROM mint.settings WHERE instance_id = %(iid)s),
 srv AS (
@@ -121,7 +122,16 @@ SELECT jsonb_build_object(
 ) AS doc
 """
 
-CONFIRMATION_SNAPSHOT_SQL = SNAPSHOT_SQL.replace(
+# v001 데이터베이스에는 계약 표가 없다. 같은 질의에서 계약 부분만 빈 목록으로 바꾼다.
+SNAPSHOT_SQL = re.sub(
+    r"'tool_contracts', \(.*?\),\s+'allowlists'",
+    "'tool_contracts', '[]'::jsonb,\n    'allowlists'",
+    STAGE2_SNAPSHOT_SQL,
+    count=1,
+    flags=re.S,
+)
+
+CONFIRMATION_SNAPSHOT_SQL = STAGE2_SNAPSHOT_SQL.replace(
     "'consents', (",
     """'self_confirmations', (
         SELECT coalesce(jsonb_agg(to_jsonb(c) - 'display'), '[]'::jsonb)
@@ -788,9 +798,11 @@ class PluginDatabase:
 
     async def registered_servers(self, instance_id: str) -> Sequence[RegisteredServer]:
         async def read(conn: Any) -> Any:
+            probe = await conn.execute("SELECT to_regclass('mint.tool_contracts')")
+            stage2 = (await probe.fetchone())[0] is not None
+            columns = "issuer, contract_status" if stage2 else "NULL, 'none'"
             cursor = await conn.execute(
-                "SELECT server_id, status, url_sha256, transport, auth_type, issuer,"
-                " contract_status"
+                "SELECT server_id, status, url_sha256, transport, auth_type, " + columns +
                 " FROM mint.servers WHERE instance_id = %s ORDER BY server_id",
                 (instance_id,),
             )
