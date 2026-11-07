@@ -51,6 +51,9 @@ def act(
         actor.conn.rollback()
         status = STATUS[error.code] if isinstance(error, AdminError) else 400
         return rebuild(error=str(error), status=status)
+    except ValueError:  # 선택 목록에 없는 값 등 잘못된 폼 값
+        actor.conn.rollback()
+        return rebuild(error="입력 값이 올바르지 않습니다.", status=400)
     return RedirectResponse(f"{back}?ok={ok}", status_code=303)
 
 

@@ -21,7 +21,7 @@ def bearer(role: str) -> dict:
 
 
 def add_intake(world, *, requested_by="human-9", status="passed", result="pass",
-               server="srv-wait", stale=False) -> str:
+               server="srv-wait", stale=False, reason="X_CODE") -> str:
     intake_id = str(uuid.uuid4())
     world.query(
         "INSERT INTO mint.intakes (id, instance_id, org_id, server_id, source, purpose, data_grade,"
@@ -38,9 +38,10 @@ def add_intake(world, *, requested_by="human-9", status="passed", result="pass",
         world.query(
             "INSERT INTO mint.intake_checks (id, instance_id, intake_id, \"check\", attempt,"
             " result, reason_code, method, evidence_sha256, evidence_valid_until, ran_at)"
-            " VALUES (%s, %s, %s, %s, 1, %s, 'X_CODE', 'm', %s, now() + interval '5 days',"
+            " VALUES (%s, %s, %s, %s, 1, %s, %s, 'm', %s, now() + interval '5 days',"
             " now() - interval '" + age + "')",
-            uuid.uuid4(), INSTANCE, intake_id, name, outcome, HEX)
+            uuid.uuid4(), INSTANCE, intake_id, name, outcome,
+            "URL_QUERY" if name == "url_guard" and reason == "URL_QUERY" else "X_CODE", HEX)
     world.query(
         "INSERT INTO mint.tool_contracts (id, instance_id, server_id, credential_scope, tool,"
         " canonical_text, sha256, pin_sha256, risk_grade, action_type, source, status)"
@@ -352,3 +353,64 @@ def test_the_requester_assigner_cannot_be_the_second_approver_of_an_exception(wo
     assert response.json()["code"] == AdminCode.SEPARATION_OF_DUTIES
     assert "지정자" in response.json()["message"]
     assert world.query("SELECT status FROM mint.intakes")[0][0] == "indeterminate"
+
+
+def test_a_comparison_within_the_limit_finishes_quickly():
+    import time
+
+    from mint_litellm.console import compare
+
+    left = json.dumps({f"k{i}": i for i in range(900)})
+    right = json.dumps({f"k{i}": i + (i % 3 == 0) for i in range(900)})
+    started = time.monotonic()
+    sides = compare.side_by_side(left, right)
+    assert not sides["skipped"] and time.monotonic() - started < 5
+    same = json.dumps({"a": ["x"] * 1500})
+    other = json.dumps({"a": ["y"] * 1500})
+    started = time.monotonic()
+    assert not compare.side_by_side(same, other)["skipped"]
+    assert time.monotonic() - started < 5
+
+
+def test_a_comparison_over_the_limit_is_skipped_with_hashes_and_sizes_only():
+    import time
+
+    from mint_litellm.console import compare
+
+    big = json.dumps({"description": "x" * 300_000})
+    lines = json.dumps(["v"] * 2500)
+    started = time.monotonic()
+    for text in (big, lines):
+        sides = compare.side_by_side(text, "{}")
+        assert sides["skipped"] is True
+        assert sides["approved"]["bytes"] == len(text.encode())
+        assert len(sides["observed"]["sha256"]) == 64
+    assert time.monotonic() - started < 2
+
+
+def test_an_oversized_schema_shows_the_skip_notice_on_the_screen(world):
+    seed_drift(world)
+    world.query("UPDATE mint.contract_observations SET canonical_text = %s WHERE name = 'echo'",
+                canon({"description": "x" * 300_000}))
+    viewer = world.session_client("viewer")
+    html = viewer.get("/contracts/srv-ok?scope=server&name=echo").text
+    assert "크기가 커서 줄 비교를 생략했습니다" in html and html.count("<code>") >= 2
+    assert 'class="changed"' not in html
+
+
+def test_bad_form_values_are_a_korean_400_on_the_screen(world):
+    intake = add_intake(world)
+    admin = world.session_client("admin")
+    response = admin.post(f"/intakes/{intake}/decision", data={
+        "csrf": world.csrf(admin), "decision": "zz", "state_version": version(world, intake)})
+    assert response.status_code == 400 and "입력 값이 올바르지 않습니다" in response.text
+    role = admin.post("/operators/viewer/role", data={
+        "csrf": world.csrf(admin), "role": "zz", "state_version": 1})
+    assert role.status_code == 400 and "입력 값이 올바르지 않습니다" in role.text
+
+
+def test_the_detail_shows_korean_reasons_and_no_english_status_code(world):
+    intake = add_intake(world, reason="URL_QUERY")
+    html = world.session_client("viewer").get(f"/intakes/{intake}").text
+    assert "주소에 질의 문자열 포함" in html and "<code>URL_QUERY</code>" in html
+    assert "<code>passed</code>" not in html

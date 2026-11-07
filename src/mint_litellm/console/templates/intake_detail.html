@@ -18,12 +18,11 @@
   <dt>접수 시각</dt><dd>{{ i.created_at | when }}</dd>
   {% if i.decision %}<dt>결정</dt><dd>{{ m.badge(L.DECISION, i.decision) }} · {{ i.decided_by | blank }} · {{ i.decided_at | when }}</dd>
   <dt>결정 사유</dt><dd>{{ i.decision_reason | blank }}</dd>{% endif %}
-  <dt>코드</dt><dd><code>{{ i.status }}</code></dd>
 </dl>
 <h2>검사 결과</h2>
 {% if checks %}
-<table><thead><tr><th>단계</th><th>결과</th><th>실행 시각</th><th>증거 만료</th><th>코드</th></tr></thead><tbody>
-{% for c in checks %}<tr><td>{{ L.pick(L.CHECK, c.check) }}</td><td>{{ m.badge(L.CHECK_RESULT, c.result) }}</td><td>{{ c.ran_at | when }}</td><td>{{ c.evidence_valid_until | when }}</td><td><code>{{ c.reason_code | blank }}</code></td></tr>{% endfor %}
+<table><thead><tr><th>단계</th><th>결과</th><th>실행 시각</th><th>증거 만료</th><th>사유</th><th>코드</th></tr></thead><tbody>
+{% for c in checks %}<tr><td>{{ L.pick(L.CHECK, c.check) }}</td><td>{{ m.badge(L.CHECK_RESULT, c.result) }}</td><td>{{ c.ran_at | when }}</td><td>{{ c.evidence_valid_until | when }}</td><td>{{ L.pick(L.CHECK_REASON, c.reason_code) }}</td><td><code>{{ c.reason_code | blank }}</code></td></tr>{% endfor %}
 </tbody></table>
 {% else %}<p class="muted">아직 검사 결과가 없습니다.</p>{% endif %}
 <h2>도구와 위험 등급</h2>

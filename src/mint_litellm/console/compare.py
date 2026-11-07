@@ -1,10 +1,14 @@
 """계약 드리프트 비교: 승인본과 관측본을 항목별로 맞추고, 선택한 항목을 줄 단위로 대조한다."""
 
 import difflib
+import hashlib
 import json
 from typing import Any
 
 DEPLOYMENT = "(배포)"
+# 줄 비교 상한: 한쪽이라도 이 줄 수(정규화 JSON)나 바이트 수를 넘으면 줄 비교를 하지 않는다.
+COMPARE_LIMIT_LINES = 2000
+COMPARE_LIMIT_BYTES = 256 * 1024
 
 
 def _pretty(text: str | None) -> list[str]:
@@ -53,9 +57,19 @@ def changes(info: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def side_by_side(approved: str | None, observed: str | None) -> dict[str, list[tuple[str, bool]]]:
-    """줄마다 (내용, 바뀐 줄 여부). 바뀐 줄만 강조한다."""
+def _meta(text: str | None) -> dict[str, Any]:
+    raw = (text or "").encode("utf-8")
+    return {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
+def side_by_side(approved: str | None, observed: str | None) -> dict[str, Any]:
+    """줄마다 (내용, 바뀐 줄 여부). 상한을 넘으면 줄 비교 없이 각 판본의 해시·크기만 낸다."""
+    skipped = {"skipped": True, "approved": _meta(approved), "observed": _meta(observed)}
+    if any(len((t or "").encode("utf-8")) > COMPARE_LIMIT_BYTES for t in (approved, observed)):
+        return skipped
     left, right = _pretty(approved), _pretty(observed)
+    if max(len(left), len(right)) > COMPARE_LIMIT_LINES:
+        return skipped
     match = difflib.SequenceMatcher(a=left, b=right, autojunk=False)
     out_left: list[tuple[str, bool]] = []
     out_right: list[tuple[str, bool]] = []
@@ -63,4 +77,4 @@ def side_by_side(approved: str | None, observed: str | None) -> dict[str, list[t
         same = tag == "equal"
         out_left += [(line, not same) for line in left[i1:i2]]
         out_right += [(line, not same) for line in right[j1:j2]]
-    return {"approved": out_left, "observed": out_right}
+    return {"skipped": False, "approved": out_left, "observed": out_right}
