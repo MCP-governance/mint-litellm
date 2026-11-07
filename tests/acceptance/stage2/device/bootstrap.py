@@ -1,0 +1,70 @@
+"""장비에서 실행: LiteLLM 사용자·키·팀과 운영자 토큰을 만들어 ~/mint-s2/acc.env(0600)에만 쓴다.
+
+마스터 키는 사용자·키를 만드는 데만 쓰고, 제어 평면 키는 proxy_admin 사용자 키에 allowed_routes를 제한해 발급한다.
+사용: python bootstrap.py  (deploy/.env가 있는 장비 복제본에서)
+"""
+import json
+import os
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+
+import httpx
+
+REPO = Path(__file__).resolve().parents[4]
+STATE = Path(os.environ.get("ACC_STATE_DIR", Path.home() / "mint-s2"))
+ENV = {}
+for line in (REPO / "deploy" / ".env").read_text().splitlines():
+    if "=" in line and not line.startswith("#"):
+        k, v = line.split("=", 1)
+        ENV[k] = v
+MASTER = ENV["LITELLM_MASTER_KEY"]
+BASES = {"mint": "http://127.0.0.1:4300", "plain": "http://127.0.0.1:4310"}
+ROUTES = ["/v1/mcp/server", "/key/info", "/team/info", "/user/info", "/key/list", "/team/list",
+          "/guardrails/list", "/key/update", "/team/update",
+          "/mcp-rest/test/connection", "/mcp-rest/test/tools/list"]
+
+
+def lite(base, path, body):
+    r = httpx.post(BASES[base] + path, headers={"Authorization": "Bearer " + MASTER}, json=body, timeout=60)
+    if r.status_code >= 400 and "already exists" not in r.text and "Duplicate" not in r.text:
+        sys.exit(f"{path} {r.status_code} {r.text[:300]}")
+    return r
+
+
+def user(user_id, role="internal_user"):
+    lite("mint", "/user/new", {"user_id": user_id, "user_role": role, "auto_create_key": False})
+
+
+def key(base, **body):
+    return lite(base, "/key/generate", body).json()["key"]
+
+
+def main():
+    out = {}
+    for u in ("acc-admin", "acc-approver", "acc-admin2", "acc-owner", "acc-caller", "acc-submitter"):
+        user(u)
+    user("acc-control", "proxy_admin")
+    out["ACC_CONTROL_KEY"] = key("mint", user_id="acc-control", key_alias="acc-control", allowed_routes=ROUTES)
+    out["ACC_CALLER_KEY"] = "sk-acc-caller-" + secrets.token_urlsafe(24)
+    key("mint", user_id="acc-caller", key_alias="acc-caller", key=out["ACC_CALLER_KEY"])
+    # 대조(plain) 구성에도 같은 호출 키를 만든다(지연 RTT 비교용)
+    lite("plain", "/user/new", {"user_id": "acc-caller", "user_role": "internal_user", "auto_create_key": False})
+    key("plain", user_id="acc-caller", key_alias="acc-caller", key=out["ACC_CALLER_KEY"],
+        object_permission={"mcp_servers": ["synthetic"]})
+    team = lite("mint", "/team/new", {"team_alias": "acc-submit", "members_with_roles": [
+        {"user_id": "acc-submitter", "role": "user"}]}).json()["team_id"]
+    out["ACC_SUBMIT_KEY"] = key("mint", user_id="acc-submitter", team_id=team, key_alias="acc-submit")
+    out["ACC_LITELLM_ADMIN_KEY"] = MASTER
+    # .env에 제어 평면 키를 넣고 작업 실행기·콘솔·CLI가 쓰게 한다.
+    text = (REPO / "deploy" / ".env").read_text().splitlines()
+    text = [x for x in text if not x.startswith("MINT_LITELLM_KEY=")] + ["MINT_LITELLM_KEY=" + out["ACC_CONTROL_KEY"]]
+    (REPO / "deploy" / ".env").write_text("\n".join(text) + "\n")
+    os.chmod(REPO / "deploy" / ".env", 0o600)
+    (STATE / "acc.json").write_text(json.dumps(out))
+    os.chmod(STATE / "acc.json", 0o600)
+    print("bootstrap-ok", sorted(out))
+
+
+main()

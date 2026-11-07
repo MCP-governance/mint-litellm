@@ -8,6 +8,9 @@ x-acc-env: &acc-env
   MINT_SESSION_VERIFY_SECONDS: "300"
 
 services:
+  postgres:
+    ports:
+      - "127.0.0.1:4332:5432"
   litellm:
     environment:
       <<: *acc-env
