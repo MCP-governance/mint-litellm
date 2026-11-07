@@ -61,6 +61,8 @@ def make_worker(url, admin):
         worker.open()
         if not schedules:  # 일정이 만드는 작업이 시험의 작업과 섞이지 않게 한다
             admin.execute("DELETE FROM mint.schedules")
+        elif schedules != "all":  # 일정 시험은 만료 점검 하나만 본다
+            admin.execute("DELETE FROM mint.schedules WHERE kind <> 'approval_expiry_scan'")
         made.append(worker)
         return worker
 
@@ -132,9 +134,11 @@ def test_the_worker_needs_the_worker_login(url):
 
 
 def test_the_worker_login_creates_the_schedules_it_has_handlers_for(make_worker, admin):
-    make_worker(schedules=True)
+    make_worker(schedules="all")
     rows = fetchall(admin, "SELECT kind, interval_seconds FROM mint.schedules")
-    assert rows == [{"kind": "approval_expiry_scan", "interval_seconds": 60}]
+    expected = {k: f(SETTINGS) for k, f in jobs.SCHEDULES.items() if k in jobs.HANDLERS}
+    assert {r["kind"]: r["interval_seconds"] for r in rows} == expected
+    assert {"approval_expiry_scan", "seal"} <= set(expected)
 
 
 # --- 수렴 작업 등록 규칙 ----------------------------------------------------------
@@ -159,7 +163,7 @@ def test_a_kind_without_a_handler_cannot_be_registered(url):
     with psycopg.connect(url) as conn:
         ensure(conn, INSTANCE)
         ctx = make_ctx(conn)
-        for kind, key in (("sync_server", None), ("seal", "seal:x"), ("alert_deliver", "a:1")):
+        for kind, key in (("sync_server", None), ("session_verify", "s:x"), ("alert_deliver", "a:1")):
             with pytest.raises(ControlError, match="처리기가 없습니다"):
                 base.enqueue_job(ctx, kind, "x", key)
         assert base.enqueue_job(ctx, "approval_expiry_scan", "x", "approval_expiry_scan:t")
@@ -484,11 +488,11 @@ def test_a_restored_database_blocks_external_writes_but_not_the_rest(
     worker = make_worker(restore_check=restored)
     blocked = put(admin, "sync_server", "srv")
     export = put(admin, "export_checkpoint", "c", "export_checkpoint:1")
-    free = put(admin, "seal", "s", "seal:1")
+    free = put(admin, "intake_run", "s", "intake_run:1")
     ran = 0
     while worker.step() and ran < 20:
         ran += 1
-    assert [k for k, _ in all_handlers] == ["seal"]  # 외부 쓰기 작업은 실행되지 않았다
+    assert [k for k, _ in all_handlers] == ["intake_run"]  # 외부 쓰기 작업은 실행되지 않았다
     for job_id in (blocked, export):
         row = job(admin, job_id)
         assert (row["status"], row["attempts"], row["last_error_code"]) == (

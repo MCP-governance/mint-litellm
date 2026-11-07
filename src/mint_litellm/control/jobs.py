@@ -15,6 +15,7 @@ import psycopg
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
+from mint_litellm.control import seal
 from mint_litellm.control.db.connection import fetchall, fetchone
 from mint_litellm.control.services import expiry
 from mint_litellm.types.ids import new_uuid7
@@ -38,7 +39,8 @@ KINDS: dict[str, JobKind] = {
     "sync_target": JobKind(convergent=True, external_write=True),
     "sync_reconcile": JobKind(external_write=True),
     "activation_finalize": JobKind(convergent=True, external_write=True),
-    "seal": JobKind(),
+    # 되돌림 상태에서는 봉인도 하지 않는다(되돌린 DB 위에 새 연쇄를 잇지 않는다).
+    "seal": JobKind(external_write=True),
     "export_negative_state": JobKind(external_write=True),
     "export_checkpoint": JobKind(external_write=True),
     "alert_deliver": JobKind(external_write=True),
@@ -78,9 +80,14 @@ def _approval_expiry_scan(job: JobContext) -> None:
     expiry.expire_due(job.conn, job.instance_id)
 
 
+def _seal(job: JobContext) -> None:
+    seal.seal_once(job.conn, job.instance_id)
+
+
 # 이 단계에서 처리기가 붙은 작업. 나머지는 해당 단계에서 붙이며, 처리기 없는 작업은 등록할 수 없다.
 HANDLERS: dict[str, Callable[[JobContext], None]] = {
     "approval_expiry_scan": _approval_expiry_scan,
+    "seal": _seal,
 }
 
 # 일정(주기 작업): 종류 -> 설정에서 주기(초)를 얻는 함수. 처리기가 있는 종류만 일정을 만든다.
