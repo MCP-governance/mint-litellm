@@ -69,6 +69,13 @@ def _active(ctx: Context, name: str) -> dict:
     return row
 
 
+def _serialize_admin_changes(ctx: Context) -> None:
+    """관리자 수를 세기 전에 배치 공통 잠금을 건다(동시에 둘이 낮춰 0명이 되는 것을 막는다)."""
+    ctx.conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))", (f"mint-operators:{ctx.instance_id}",)
+    )
+
+
 def _require_another_admin(ctx: Context, name: str) -> None:
     other = fetchone(
         ctx.conn,
@@ -90,6 +97,7 @@ def _end_sessions(ctx: Context, user_id: str | None, reason: str) -> None:
 @service("operator remove")
 def remove(ctx: Context, name: str, *, expected_version: int | None = None) -> None:
     """운영자를 삭제한다. 행은 남기고 만료시켜 토큰을 끝내며, 그 사용자의 콘솔 세션을 폐기한다."""
+    _serialize_admin_changes(ctx)
     lock_version(ctx, "operators", name, expected_version)
     target = _active(ctx, name)
     if target["name"] == ctx.operator.name:
@@ -111,6 +119,7 @@ def remove(ctx: Context, name: str, *, expected_version: int | None = None) -> N
 def set_role(
     ctx: Context, name: str, role: OperatorRole, *, expected_version: int | None = None
 ) -> None:
+    _serialize_admin_changes(ctx)
     lock_version(ctx, "operators", name, expected_version)
     target = _active(ctx, name)
     if target["role"] == role.value:

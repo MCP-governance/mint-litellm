@@ -107,3 +107,43 @@ def test_the_admin_screen_removes_an_operator_with_the_name_typed(world):
     assert ok.status_code == 303 and "operator_removed" in ok.headers["location"]
     assert "viewer</td>" not in admin.get("/admin").text
     assert world.client.post("/login", data={"key": Keys.viewer}).status_code == 403
+
+
+def test_two_admins_cannot_demote_themselves_at_the_same_time(world):
+    import threading
+    import time
+
+    import psycopg
+
+    from mint_litellm.control.context import Context, Operator
+    from mint_litellm.control.errors import ControlError
+    from mint_litellm.control.services import operators as service
+    from mint_litellm.types.cli_commands import OperatorRole
+
+    world.query("UPDATE mint.operators SET role = 'admin' WHERE name = 'approver'")
+    first = psycopg.connect(world.admin_url)
+    second = psycopg.connect(world.admin_url)
+    ctx_a = Context(first, "inst1", Operator("admin", "admin", "human-1"))
+    ctx_b = Context(second, "inst1", Operator("approver", "admin", "human-2"))
+    outcome: list[object] = []
+
+    def other():
+        try:
+            service.set_role(ctx_b, "approver", OperatorRole.VIEWER)
+            outcome.append("changed")
+        except ControlError as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=other)
+    with first.transaction():  # 바깥 트랜잭션이 끝날 때까지 잠금을 쥔다
+        service.set_role(ctx_a, "admin", OperatorRole.VIEWER)
+        thread.start()
+        time.sleep(1.0)
+        assert outcome == []  # 둘째는 잠금에서 기다린다
+    thread.join(10)
+    first.close()
+    second.close()
+    assert len(outcome) == 1 and isinstance(outcome[0], ControlError)
+    assert "마지막 관리자" in str(outcome[0])
+    roles = world.query("SELECT name, role FROM mint.operators WHERE role = 'admin'")
+    assert roles == [("approver", "admin")]

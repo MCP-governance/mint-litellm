@@ -337,3 +337,18 @@ def test_the_new_screens_need_a_session_and_carry_the_security_headers(world, pa
     response = world.session_client("viewer").get(path)
     assert response.status_code == 200
     assert "default-src 'self'" in response.headers["content-security-policy"]
+
+
+def test_the_requester_assigner_cannot_be_the_second_approver_of_an_exception(world):
+    intake = add_intake(world, status="indeterminate", result="indeterminate")
+    world.query(
+        "INSERT INTO mint.events (event_id, instance_id, kind, source_key, actor, payload)"
+        " VALUES (%s, %s, 'intake_requester_assigned', %s, 'approver', %s)",
+        uuid.uuid4(), INSTANCE, f"intake:{intake}:2:intake_requester_assigned",
+        json.dumps({"intake_id": intake}))
+    response = decide(world, intake, decision="except", reason="수동 확인함",
+                      second_approver_token=TOKENS["approver"])
+    assert response.status_code == 403
+    assert response.json()["code"] == AdminCode.SEPARATION_OF_DUTIES
+    assert "지정자" in response.json()["message"]
+    assert world.query("SELECT status FROM mint.intakes")[0][0] == "indeterminate"

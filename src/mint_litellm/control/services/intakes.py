@@ -601,9 +601,11 @@ def _require_separation(
     if second is None:
         raise separation_of_duties("예외 승인은 다른 사용자의 두 번째 승인자가 필요합니다.")
     if (second.role not in {r.value for r in APPROVER_UP}
-            or second.user_id in (None, user, row["requested_by"])):
+            or second.user_id in (None, user, row["requested_by"],
+                                  _assigner_user_id(ctx, row["id"]))):
         raise separation_of_duties(
-            "두 번째 승인자는 결정자·신청자와 다른 사용자에 결속된 approver 이상이어야 합니다."
+            "두 번째 승인자는 결정자·신청자·신청자 지정자와 다른 사용자에 결속된 "
+            "approver 이상이어야 합니다."
         )
     return {"name": second.name, "user_id": second.user_id}
 
