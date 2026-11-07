@@ -1,0 +1,109 @@
+name: mint-g10
+
+# 공개 MCP 서버(Playwright·Context7·Grafana) 도입 시험 스택. 사용은 stack.sh를 거친다.
+# 판본·digest·integrity는 stack.sh의 표 한 곳에서만 정하고 환경 변수로 내려온다.
+# 비밀(마스터 키·데이터베이스 비밀번호·Grafana 관리자 비밀번호·서비스 계정 토큰)은
+# stack.sh가 실행 때마다 만들어 프로세스 환경으로만 넘긴다.
+
+x-mcp-npm: &mcp-npm
+  networks: [mcp]
+  restart: "no"
+
+services:
+  postgres:
+    image: postgres:16@sha256:5db6dac2ef5dcff512f4f00a009c3c332b9f2f28f24277175bf3e4a3d02ef83a
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${G10_DB_PASSWORD:?}
+      POSTGRES_DB: litellm
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks: [mcp]
+
+  litellm:
+    image: ghcr.io/berriai/litellm-database:v1.106.6@sha256:7ef0e78fe00ad5ea7ea45666cc1d1f02cb7076aee69091543bf397de52db33ce
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${G10_MASTER_KEY:?}
+      LITELLM_SALT_KEY: ${G10_SALT_KEY:?}
+      DATABASE_URL: postgresql://litellm:${G10_DB_PASSWORD:?}@postgres:5432/litellm
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+    ports:
+      - "4741:4000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:4000/health/readiness', timeout=3).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [mcp]
+
+  grafana:
+    image: grafana/grafana-oss:12.4.3@sha256:2e986801428cd689c2358605289c90ab37d2b39e24808874971f54c99bcdc412
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${G10_GRAFANA_ADMIN_PASSWORD:?}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "4742:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    networks: [mcp]
+
+  # 서비스 계정 토큰은 Grafana가 뜬 뒤 stack.sh가 만든다. 그 전에는 이 서비스를 올리지 않는다.
+  mcp-grafana:
+    image: ${G10_GRAFANA_MCP_IMAGE:?}
+    command: ["--transport", "streamable-http", "--address", ":8000", "--allowed-hosts", "*"]
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_SERVICE_ACCOUNT_TOKEN: ${G10_GRAFANA_TOKEN:-}
+    ports:
+      - "4745:8000"
+    profiles: [grafana-mcp]
+    networks: [mcp]
+
+  mcp-playwright:
+    <<: *mcp-npm
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.npm
+      args:
+        PACKAGE: "@playwright/mcp"
+        VERSION: ${G10_PLAYWRIGHT_VERSION:?}
+        INTEGRITY: ${G10_PLAYWRIGHT_INTEGRITY:?}
+        BIN: playwright-mcp
+        BROWSER: chromium
+    image: mint-g10-playwright:${G10_PLAYWRIGHT_VERSION:?}
+    command: ["--browser", "chromium", "--headless", "--no-sandbox", "--host", "::", "--port", "8931", "--allowed-hosts", "*"]
+    ports:
+      - "4743:8931"
+
+  mcp-context7:
+    <<: *mcp-npm
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.npm
+      args:
+        PACKAGE: "@upstash/context7-mcp"
+        VERSION: ${G10_CONTEXT7_VERSION:?}
+        INTEGRITY: ${G10_CONTEXT7_INTEGRITY:?}
+        BIN: context7-mcp
+    image: mint-g10-context7:${G10_CONTEXT7_VERSION:?}
+    command: ["--transport", "http", "--port", "3000"]
+    ports:
+      - "4744:3000"
+
+networks:
+  mcp: {}

@@ -1,0 +1,23 @@
+# npm 패키지 한 개를 판본·무결성(integrity)으로 고정해 설치하는 공개 MCP 서버 이미지.
+# 기반 이미지는 digest로 고정하고, 설치 결과의 integrity가 인자와 다르면 빌드를 멈춘다.
+FROM node:24-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9
+ARG PACKAGE
+ARG VERSION
+ARG INTEGRITY
+ARG BIN
+ARG BROWSER=
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+WORKDIR /srv
+RUN npm init -y >/dev/null \
+ && npm install --save-exact --ignore-scripts --no-audit --no-fund "${PACKAGE}@${VERSION}" \
+ && PACKAGE="${PACKAGE}" INTEGRITY="${INTEGRITY}" node -e '\
+const lock = require("/srv/package-lock.json").packages["node_modules/" + process.env.PACKAGE];\
+if (!lock || lock.integrity !== process.env.INTEGRITY) {\
+  console.error("integrity mismatch:", lock && lock.integrity);\
+  process.exit(1);\
+}' \
+ && ln -s "/srv/node_modules/.bin/${BIN}" /usr/local/bin/mcp-server
+# 브라우저가 필요한 서버(Playwright)만: 설치한 playwright-core 판본이 정한 chromium을 받는다.
+RUN if [ -n "${BROWSER}" ]; then node node_modules/playwright-core/cli.js install --with-deps "${BROWSER}"  && rm -rf /var/lib/apt/lists/*; fi
+USER node
+ENTRYPOINT ["mcp-server"]
