@@ -7,13 +7,13 @@ UTF-8로 쓴다. 가변 열은 봉인 열 네 개(``seal_seq``·``prev_hash``·`
 """
 
 import hashlib
-import json
 from datetime import UTC
 from typing import Any
 
 import psycopg
 
 from mint_litellm.control.db.connection import fetchall, fetchone
+from mint_litellm.restore.files import canonical_json
 
 ZERO = bytes(32)
 BATCH_LIMIT = 5000
@@ -39,7 +39,7 @@ def canonical(row: dict[str, Any]) -> bytes:
         "subject": row["subject"],
         "payload": row["payload"],
     }
-    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return canonical_json(body)
 
 
 def row_hash(row: dict[str, Any], prev: bytes) -> bytes:

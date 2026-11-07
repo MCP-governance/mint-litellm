@@ -341,3 +341,17 @@ def test_a_lower_db_epoch_alone_is_a_supporting_signal(admin, worker_conn, setti
     j = judge.Judge()
     evaluate(j, worker_conn, settings)
     assert evaluate(j, worker_conn, settings).blocked
+
+
+def test_canonical_json_is_fixed_and_rejects_floats():
+    import json
+
+    value = {"b": [1, "한글", None, True], "a": {"z": 1, "y": "x"}}
+    assert files.canonical_json(value) == json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    assert files.canonical_json(value) == (
+        '{"a":{"y":"x","z":1},"b":[1,"한글",null,true]}'.encode())
+    with pytest.raises(ValueError, match="실수"):
+        files.canonical_json({"a": [1.5]})
+    with pytest.raises(ValueError):
+        files.sign({"x": 0.1}, b"k" * 32)

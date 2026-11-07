@@ -24,20 +24,22 @@ from mint_litellm.types.events import EventKind
 # ponytail: 항목을 전부 한 파일에 담는다(철회가 수만 건이 되면 증분 파일로 나눈다).
 SNAPSHOT_SQL = """
 WITH items AS (
-  SELECT 'approval' AS kind, id::text AS id, state_version, status AS state
+  SELECT 'approval' AS kind, id::text AS id, state_version, status AS state, NULL::jsonb AS extra
     FROM mint.approvals WHERE instance_id = %(i)s AND status = 'revoked'
-  UNION ALL SELECT 'denial', id::text, state_version, 'active'
+  UNION ALL SELECT 'denial', id::text, state_version, 'active',
+    jsonb_build_object('org_id', org_id, 'scope_type', scope_type, 'scope_id', scope_id,
+      'server_id', server_id, 'tools', tools, 'reason', reason, 'created_by', created_by)
     FROM mint.denials WHERE instance_id = %(i)s AND lifted_at IS NULL
-  UNION ALL SELECT 'server', server_id, state_version, status
+  UNION ALL SELECT 'server', server_id, state_version, status, NULL
     FROM mint.servers WHERE instance_id = %(i)s
      AND status IN ('rejected', 'suspended', 'terminating', 'terminated')
-  UNION ALL SELECT 'relation', id::text, state_version, status
+  UNION ALL SELECT 'relation', id::text, state_version, status, NULL
     FROM mint.usage_relations WHERE instance_id = %(i)s AND status IN ('terminating', 'terminated')
-  UNION ALL SELECT 'org', org_id, state_version, status
+  UNION ALL SELECT 'org', org_id, state_version, status, NULL
     FROM mint.orgs WHERE instance_id = %(i)s AND status = 'closed'
-  UNION ALL SELECT 'allowlist', id::text, state_version, status
+  UNION ALL SELECT 'allowlist', id::text, state_version, status, NULL
     FROM mint.allowlists WHERE instance_id = %(i)s AND status = 'lifted'
-  UNION ALL SELECT 'consent', id::text, state_version, 'revoked'
+  UNION ALL SELECT 'consent', id::text, state_version, 'revoked', NULL
     FROM mint.consents WHERE instance_id = %(i)s AND revoked_at IS NOT NULL
 ), last AS (
   SELECT to_seal_seq, encode(tail_hash, 'hex') AS tail FROM mint.seal_batches
@@ -46,7 +48,9 @@ WITH items AS (
 SELECT coalesce((SELECT epoch FROM mint.state_epoch WHERE instance_id = %(i)s), 0) AS epoch,
        (SELECT to_seal_seq FROM last) AS seq, (SELECT tail FROM last) AS tail,
        coalesce((SELECT jsonb_agg(jsonb_build_object('kind', kind, 'id', id,
-           'state_version', state_version, 'state', state) ORDER BY kind, id) FROM items),
+           'state_version', state_version, 'state', state)
+           || CASE WHEN extra IS NULL THEN '{}'::jsonb
+                   ELSE jsonb_build_object('recreate', extra) END ORDER BY kind, id) FROM items),
          '[]'::jsonb) AS items
 """
 

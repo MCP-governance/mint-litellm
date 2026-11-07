@@ -25,8 +25,30 @@ def key_id(key: bytes) -> str:
     return hashlib.sha256(key).hexdigest()[:16]
 
 
+# 정규 JSON(봉인 해시·HMAC·내용 해시가 모두 쓰는 유일한 정의): 키 정렬, 구분자 `,`·`:`,
+# 비ASCII 그대로, UTF-8. 실수 값은 표기가 구현마다 달라 거부한다
+# (정수·문자열·불리언·null·배열·객체만).
+CANONICAL_JSON = {"sort_keys": True, "separators": (",", ":"), "ensure_ascii": False}
+
+
+def _no_floats(value: Any) -> None:
+    if isinstance(value, float):
+        raise ValueError("정규 JSON은 실수 값을 받지 않습니다.")
+    if isinstance(value, dict):
+        for item in value.values():
+            _no_floats(item)
+    elif isinstance(value, list):
+        for item in value:
+            _no_floats(item)
+
+
+def canonical_json(value: Any) -> bytes:
+    _no_floats(value)
+    return json.dumps(value, **CANONICAL_JSON).encode("utf-8")
+
+
 def canonical(document: dict[str, Any]) -> bytes:
-    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return canonical_json(document)
 
 
 def content_sha256(document: dict[str, Any]) -> str:

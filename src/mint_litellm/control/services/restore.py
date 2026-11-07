@@ -44,6 +44,11 @@ _REAPPLY = {
     "allowlist": "UPDATE mint.allowlists SET status = 'lifted'" + _WHERE + "id::text = %s",
     "consent": "UPDATE mint.consents SET revoked_at = now()" + _WHERE + "id::text = %s",
 }
+_DENIAL_COLUMNS = ("org_id", "scope_type", "scope_id", "server_id", "tools", "reason", "created_by")
+_RECREATE_DENIAL = (
+    "INSERT INTO mint.denials (id, instance_id, org_id, scope_type, scope_id, server_id, tools,"
+    " reason, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+)
 _STATE_PARAM = {"server", "relation", "org"}
 
 
@@ -68,7 +73,9 @@ def compare(conn: psycopg.Connection, instance_id: str, items: list[dict]) -> li
             (instance_id, item["id"]),
         )
         if row is None:
-            found.append({**item, "problem": "missing_row"})
+            # 없음이 곧 차단인 종류는 효력 없음, 거부는 없으면 허용이 되므로 다시 만들어야 한다
+            problem = "missing_row" if item["kind"] == "denial" else "absent_no_effect"
+            found.append({**item, "problem": problem})
         elif row["state"] != item["state"]:
             found.append({**item, "problem": "reapply", "db_state": row["state"]})
     return found
@@ -128,11 +135,26 @@ def attest(
         )
     file_epoch = int(state.latest["state_epoch"])
     items = (state.negative or {}).get("items") or []
-    reapplied, failed = [], []
+    reapplied, failed, absent = [], [], []
     with ctx.conn.transaction():
         for problem in compare(ctx.conn, ctx.instance_id, items):
             kind, ident = problem["kind"], problem["id"]
-            if problem["problem"] == "missing_row" or kind not in _REAPPLY:
+            if problem["problem"] == "absent_no_effect":
+                absent.append({"kind": kind, "id": ident, "note": "복구 DB에 없음(효력 없음)"})
+                continue
+            if problem["problem"] == "missing_row":  # 거부: 같은 id로 다시 만든다
+                spec = problem.get("recreate")
+                try:
+                    if spec is None:
+                        raise ValueError
+                    with ctx.conn.transaction():
+                        ctx.conn.execute(_RECREATE_DENIAL, (ident, ctx.instance_id, *(
+                            spec[k] for k in _DENIAL_COLUMNS)))
+                    reapplied.append({"kind": kind, "id": ident, "recreated": True})
+                except (psycopg.Error, ValueError, KeyError):
+                    failed.append({**problem, "problem": "not_applicable"})
+                continue
+            if kind not in _REAPPLY:
                 failed.append(problem)
                 continue
             params = (ctx.instance_id, ident)
@@ -162,9 +184,10 @@ def attest(
             )
         _record(ctx, EventKind.RESTORE_ATTESTED, file_epoch,
                 {"reason": reason, "file_epoch": file_epoch, "db_epoch": current,
-                 "reapplied": reapplied})
+                 "reapplied": reapplied, "absent": absent})
     path = exports.write_files(ctx.conn, ctx.instance_id, settings)
-    return {"file_epoch": file_epoch, "db_epoch": current, "reapplied": reapplied, "export": path}
+    return {"file_epoch": file_epoch, "db_epoch": current, "reapplied": reapplied,
+            "absent": absent, "export": path}
 
 
 def accept_stale(

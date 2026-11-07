@@ -83,6 +83,8 @@
 | `mint-litellm restore attest --reason <사유>` | admin | 누락된 부정 상태를 다시 적용하고 DB 세대를 파일 세대 + 1로 올리고 `restore_attested`를 남긴 뒤 DB 기준 새 파일을 쓴다. 행이 없어 다시 적용할 수 없는 항목이 있으면 거부한다. |
 | `mint-litellm restore accept-stale --reason <사유> --second-approver <토큰>` | admin 2인 | 파일이 없거나 검증되지 않을 때 옛 파일의 이름을 바꿔 보존하고 DB 기준 새 파일을 써서 해제한다(`restore_stale_accepted`). |
 
+봉인 해시·HMAC·내용 해시가 쓰는 정규 JSON은 `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`를 UTF-8로 인코딩한 것이며(코드의 `restore.files.canonical_json` 한 곳), 실수 값은 거부한다. `restore attest`는 복구 DB에 행이 없는 철회·서버 중지·관계 종료·조직 닫힘·허용 목록 해제·동의 철회를 「복구 DB에 없음(효력 없음)」으로 표시하고 넘어가며, 없으면 허용으로 바뀌는 거부는 파일에 담긴 열로 같은 식별자로 다시 만든다.
+
 HMAC 키를 교체하려면 새 키를 `MINT_EXPORT_HMAC_KEY`, 옛 키를 `MINT_EXPORT_HMAC_KEY_PREVIOUS`에 두고 다시 기동한다. 작업 실행기가 새 키로 체크포인트를 쓰고 최신 부정 상태 파일을 다시 서명하면 `export status`가 옛 키를 빼도 된다고 알려 준다.
 
 ## 서버를 LiteLLM에서 삭제하는 순서

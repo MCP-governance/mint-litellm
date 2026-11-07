@@ -151,14 +151,66 @@ def test_restore_check_attest_releases_the_block_and_records_the_event(world):
         assert verdict.state == judge.OK  # 새 파일이 DB 기준으로 쓰였다
 
 
-def test_attest_refuses_when_a_negative_row_cannot_be_reapplied(world):
+def test_attest_notes_rows_that_are_absent_in_the_restored_database(world):
+    """없음이 곧 차단인 종류는 진행하고 「효력 없음」으로 표시한다."""
     file_epoch = revoke_and_export(world)
     with psycopg.connect(world["restored"], autocommit=True) as conn:
         conn.execute("DELETE FROM mint.orgs WHERE org_id = 'acme'")
     overtake_epoch(world["restored"], file_epoch)
     with psycopg.connect(world["restored"]) as conn:
-        with pytest.raises(ControlError, match="org:acme"):
-            restore.attest(make_ctx(conn), world["settings"], "x")
+        out = restore.attest(make_ctx(conn), world["settings"], "x")
+        conn.commit()
+    assert out["absent"] == [
+        {"kind": "org", "id": "acme", "note": "복구 DB에 없음(효력 없음)"}]
+    assert out["reapplied"] == []
+
+
+def test_attest_recreates_a_denial_with_the_same_id_so_the_subject_is_denied_again(world):
+    with psycopg.connect(world["live"], autocommit=True) as conn:
+        denial = fetchone(conn, "INSERT INTO mint.denials (id, instance_id, org_id, scope_type,"
+                          " scope_id, reason, created_by) VALUES (gen_random_uuid(), %s, 'acme',"
+                          " 'org', 'acme', '유출 의심', 'root') RETURNING id", (INSTANCE,))["id"]
+        exports.write_export(conn, INSTANCE, world["settings"], "negative_state")
+        exports.write_export(conn, INSTANCE, world["settings"], "checkpoint")
+        file_epoch = fetchone(conn, "SELECT epoch FROM mint.state_epoch")["epoch"]
+    overtake_epoch(world["restored"], file_epoch)  # 거부를 만들기 전 시점으로 복구했다
+    with psycopg.connect(world["restored"]) as conn:
+        assert fetchall(conn, "SELECT id FROM mint.denials") == []
+        out = restore.attest(make_ctx(conn), world["settings"], "복구 확인")
+        conn.commit()
+    assert out["reapplied"] == [{"kind": "denial", "id": str(denial), "recreated": True}]
+    with psycopg.connect(world["restored"]) as conn:
+        row = fetchone(conn, "SELECT * FROM mint.denials")
+        assert row["id"] == denial and row["lifted_at"] is None
+        assert (row["scope_type"], row["scope_id"], row["reason"]) == ("org", "acme", "유출 의심")
+
+
+def test_the_first_checkpoint_after_release_leaves_the_exports_row(world):
+    from mint_litellm.control.worker import RestoreCheck, Worker
+
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    settings = world["settings"]
+    with psycopg.connect(world["restored"]) as conn:
+        restore.attest(make_ctx(conn), settings, "복구 확인")
+        conn.commit()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        before = fetchone(conn, "SELECT count(*) AS n FROM mint.exports"
+                          " WHERE kind = 'checkpoint' AND status = 'written'")["n"]
+    login = url_for(world["restored"], world["clone"], "mint_worker")
+    worker = Worker(login, INSTANCE, settings, restore_check=RestoreCheck(settings, 0))
+    try:
+        worker.open()
+        worker.enqueue_startup_checkpoint()
+        while worker.step():
+            pass
+        assert worker.verdict.state == judge.OK
+    finally:
+        worker.close()
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        after = fetchone(conn, "SELECT count(*) AS n FROM mint.exports"
+                         " WHERE kind = 'checkpoint' AND status = 'written'")["n"]
+    assert after >= before + 1  # 기동 체크포인트(와 일정이 등록한 것)가 행을 남긴다
 
 
 def test_accept_stale_needs_two_admins_and_a_missing_or_unverified_file(world):
