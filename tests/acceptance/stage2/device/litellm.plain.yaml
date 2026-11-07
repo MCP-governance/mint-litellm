@@ -14,25 +14,3 @@ litellm_settings:
   key_generation_settings:
     personal_key_generation:
       allowed_user_roles: [proxy_admin]
-
-mcp_servers:
-  playwright:
-    server_id: playwright
-    url: https://cnt:8443/playwright/mcp
-    transport: http
-    allow_all_keys: false
-  context7:
-    server_id: context7
-    url: https://cnt:8443/context7/mcp
-    transport: http
-    allow_all_keys: false
-  grafana:
-    server_id: grafana
-    url: https://cnt:8443/grafana/mcp
-    transport: http
-    allow_all_keys: false
-  synthetic:
-    server_id: synthetic
-    url: https://cnt:8443/synthetic/mcp
-    transport: http
-    allow_all_keys: false

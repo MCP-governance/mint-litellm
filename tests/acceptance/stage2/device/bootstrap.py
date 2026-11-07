@@ -94,4 +94,21 @@ def operators():
     print("operators-ok")
 
 
-main() if len(sys.argv) < 2 else operators()
+def servers():
+    """공개 MCP 3종과 합성 서버를 LiteLLM 레지스트리(DB)에 서버 식별자를 이름으로 지정해 등록한다.
+    pin·승인 경로는 DB에 있는 서버에만 동작한다. 호출 키에는 접근을 미리 준다(사람이 준 항목)."""
+    names = ["playwright", "context7", "grafana", "synthetic"]
+    state = json.loads((STATE / "acc.json").read_text())
+    for base in ("mint", "plain"):
+        for name in names:
+            r = lite(base, "/v1/mcp/server", {
+                "server_id": name, "alias": name, "server_name": name, "transport": "http",
+                "url": f"https://cnt:8443/{name}/mcp", "auth_type": "none", "allow_all_keys": False,
+                "description": "acceptance"})
+            print(base, name, r.status_code)
+        r = lite(base, "/key/update", {"key": state["ACC_CALLER_KEY"],
+                                       "object_permission": {"mcp_servers": names}})
+        print(base, "caller-access", r.status_code)
+
+
+{"operators": operators, "servers": servers}.get(sys.argv[1] if len(sys.argv) > 1 else "", main)()

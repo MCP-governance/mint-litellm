@@ -21,6 +21,7 @@ setsid nohup "$PY" "$HERE/counter_service.py" http://127.0.0.1:4320/__log 4350 >
 source "$HERE/env.sh"
 mkdir -p tests/acceptance/stage2/.runtime
 "$PY" "$HERE/make_site.py" > tests/acceptance/stage2/.runtime/site.json
+"$PY" "$HERE/bootstrap.py" servers
 # 첫 정책 판본 활성화(설명 검사·위험 등급이 활성 번들의 데이터를 읽는다)
 (cd deploy && MINT_OPERATOR_TOKEN=$ACC_ADMIN_TOKEN ./mint.sh cli policy activate initial --json < /dev/null > /dev/null)
 # 수용검증의 URL 검사가 요구하는 제공자 허용 목록(계수 역프록시 호스트). 기준 스냅숏에 들어가도록 스냅숏 전에 등록한다.
