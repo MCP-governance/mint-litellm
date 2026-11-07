@@ -207,8 +207,8 @@ def bindings(conn: psycopg.Connection, instance: str) -> list[dict]:
 def operators(conn: psycopg.Connection, instance: str) -> list[dict]:
     return fetchall(
         conn,
-        "SELECT name, role, user_id, expires_at FROM mint.operators WHERE instance_id = %s"
-        " ORDER BY name",
+        "SELECT name, role, user_id, expires_at, state_version FROM mint.operators"
+        " WHERE instance_id = %s AND (expires_at IS NULL OR expires_at > now()) ORDER BY name",
         (instance,),
     )
 
@@ -384,4 +384,64 @@ def overview(
             "SELECT count(*) FROM mint.litellm_grants WHERE instance_id = %s AND held"
         ),
         "decisions_by_day": days,
+    }
+
+
+# --- 계약 변경과 신청 -------------------------------------------------------------------------
+
+
+def drifted_servers(conn: psycopg.Connection, instance: str) -> list[dict]:
+    """계약이 관리되는 서버 가운데 변경이 있거나 재승인 계획이 있는 서버."""
+    return fetchall(
+        conn,
+        "SELECT s.server_id, s.deployment_drift, s.last_observed_at, s.state_version,"
+        " (SELECT count(*) FROM mint.tool_contracts t WHERE t.instance_id = s.instance_id"
+        "  AND t.server_id = s.server_id AND t.status = 'approved' AND t.drift <> 'none')"
+        "  AS drifted_tools,"
+        " (SELECT count(*) FROM mint.tool_contracts t WHERE t.instance_id = s.instance_id"
+        "  AND t.server_id = s.server_id AND t.status = 'candidate') AS candidates,"
+        " p.status AS plan_status"
+        " FROM mint.servers s LEFT JOIN mint.contract_reapproval_plans p"
+        " ON p.instance_id = s.instance_id AND p.server_id = s.server_id"
+        " WHERE s.instance_id = %s AND s.contract_status = 'managed'"
+        " AND (s.deployment_drift OR p.status = 'pending' OR EXISTS ("
+        "  SELECT 1 FROM mint.tool_contracts t WHERE t.instance_id = s.instance_id"
+        "  AND t.server_id = s.server_id AND t.status = 'approved' AND t.drift <> 'none')"
+        "  OR EXISTS (SELECT 1 FROM mint.tool_contracts t WHERE t.instance_id = s.instance_id"
+        "  AND t.server_id = s.server_id AND t.status = 'candidate'))"
+        " ORDER BY s.server_id",
+        (instance,),
+    )
+
+
+def reapproval_plan(conn: psycopg.Connection, instance: str, server_id: str) -> dict | None:
+    return fetchone(
+        conn,
+        "SELECT status, requested_by, intake_id, result FROM mint.contract_reapproval_plans"
+        " WHERE instance_id = %s AND server_id = %s",
+        (instance, server_id),
+    )
+
+
+def candidates(conn: psycopg.Connection, instance: str, server_id: str) -> dict[str, Any]:
+    return {
+        "tools": fetchall(
+            conn,
+            "SELECT id, tool, credential_scope, risk_grade, action_type FROM mint.tool_contracts"
+            " WHERE instance_id = %s AND server_id = %s AND status = 'candidate' ORDER BY tool",
+            (instance, server_id),
+        ),
+        "deployments": fetchall(
+            conn,
+            "SELECT id, version FROM mint.deployment_contracts WHERE instance_id = %s"
+            " AND server_id = %s AND status = 'candidate' ORDER BY version",
+            (instance, server_id),
+        ),
+        "intakes": fetchall(
+            conn,
+            "SELECT id, status, created_at FROM mint.intakes WHERE instance_id = %s"
+            " AND server_id = %s AND (status = 'passed' OR (status = 'decided'"
+            " AND decision = 'approved')) ORDER BY created_at DESC",
+            (instance, server_id),
+        ),
     }

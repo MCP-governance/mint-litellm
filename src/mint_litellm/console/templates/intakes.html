@@ -1,0 +1,21 @@
+{% extends "base.html" %}{% import "macros.html" as m %}
+{% block title %}신청·수용검증 · MINT{% endblock %}
+{% block body %}
+<h1>신청·수용검증</h1>
+<form method="get" action="/intakes" class="filters">
+  <label>상태<select name="status"><option value="">전체</option>{% for k, v in L.INTAKE.items() %}<option value="{{ k }}"{% if wanted == k %} selected{% endif %}>{{ v.text }}</option>{% endfor %}</select></label>
+  <button type="submit" class="primary">조회</button>
+</form>
+{% if rows %}
+<table><thead><tr><th>서버</th><th>출처</th><th>상태</th><th>결정</th><th>신청자</th><th>접수 시각</th><th></th></tr></thead><tbody>
+{% for r in rows %}<tr>
+<td><a href="/servers/{{ r.server_id | urlencode }}">{{ r.server_id }}</a></td>
+<td>{{ L.pick(L.SOURCE, r.source) }}</td>
+<td>{{ m.badge(L.INTAKE, r.status) }}</td>
+<td>{% if r.decision %}{{ m.badge(L.DECISION, r.decision) }}{% else %}—{% endif %}</td>
+<td>{{ r.requested_by | blank }}</td><td>{{ r.created_at | when }}</td>
+<td><a class="button" href="/intakes/{{ r.id }}">상세</a></td>
+</tr>{% endfor %}
+</tbody></table>
+{% else %}{{ m.empty('조건에 맞는 신청이 없습니다', '/intakes', '조건 지우기') }}{% endif %}
+{% endblock %}

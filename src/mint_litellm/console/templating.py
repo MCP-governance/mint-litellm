@@ -17,7 +17,9 @@ templates = Jinja2Templates(directory=HERE / "templates")
 MENU = (
     ("/", "개요"),
     ("/servers", "MCP 서버"),
+    ("/intakes", "신청·수용검증"),
     ("/approvals", "승인 대기열"),
+    ("/contracts", "계약 드리프트"),
     ("/revocations", "거부·철회"),
     ("/call-approvals", "호출별 승인"),
     ("/ledger", "원장"),

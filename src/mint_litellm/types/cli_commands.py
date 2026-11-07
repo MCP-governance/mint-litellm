@@ -111,6 +111,18 @@ COMMANDS: tuple[CliCommand, ...] = (
         events=(EventKind.OPERATOR_ADDED,),
     ),
     CliCommand(
+        path=("operator", "remove"),
+        summary="운영자를 삭제한다(토큰과 콘솔 세션이 끝난다). 마지막 관리자·본인은 불가.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.OPERATOR_REMOVED,),
+    ),
+    CliCommand(
+        path=("operator", "set-role"),
+        summary="운영자의 역할을 바꾼다(콘솔 세션이 끝난다). 마지막 관리자는 낮출 수 없다.",
+        roles=ADMIN_ONLY,
+        events=(EventKind.OPERATOR_ROLE_CHANGED,),
+    ),
+    CliCommand(
         path=("server", "register"),
         summary="LiteLLM에 등록된 서버를 승인 대기 상태로 등록한다.",
         roles=ADMIN_ONLY,

@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from mint_litellm.console import compare
 from mint_litellm.console.core import Actor, api_actor, public, require_csrf
 from mint_litellm.control import operators
 from mint_litellm.control.context import Operator
@@ -23,7 +24,9 @@ from mint_litellm.control.errors import AdminCode, AdminError, AuthError, Contro
 from mint_litellm.control.services import allowlists as allowlist_service
 from mint_litellm.control.services import approvals as approval_service
 from mint_litellm.control.services import call_approvals as call_approval_service
+from mint_litellm.control.services import contracts as contract_service
 from mint_litellm.control.services import denials as denial_service
+from mint_litellm.control.services import intakes as intake_service
 from mint_litellm.control.services import operators as operator_service
 from mint_litellm.control.services import orgs as org_service
 from mint_litellm.control.services import reads
@@ -193,6 +196,14 @@ class OperatorBody(BaseModel):
     role: OperatorRole
     user_id: str | None = None
     expires_in_days: int | None = None
+
+
+class SetRoleBody(Versioned):
+    role: OperatorRole
+
+
+class RemoveOperatorBody(Versioned):
+    confirm_name: str
 
 
 class RegisterBody(BaseModel):
@@ -511,3 +522,127 @@ def add_operator(body: OperatorBody, actor: Actor = Depends(api_actor)):
         actor.ctx, actor.litellm(), body.name, body.role, body.user_id, body.expires_in_days
     )
     return done(actor, id=body.name, token=token)
+
+
+@router.post("/operators/{name}/role")
+def set_operator_role(name: str, body: SetRoleBody, actor: Actor = Depends(api_actor)):
+    operator_service.set_role(actor.ctx, name, body.role, expected_version=body.state_version)
+    return done(actor, id=name)
+
+
+@router.post("/operators/{name}/remove")
+def remove_operator(name: str, body: RemoveOperatorBody, actor: Actor = Depends(api_actor)):
+    confirm(name, body.confirm_name, "운영자")
+    operator_service.remove(actor.ctx, name, expected_version=body.state_version)
+    return done(actor, id=name)
+
+
+# --- 신청·수용검증 ----------------------------------------------------------------------------
+
+
+class RequesterBody(Versioned):
+    user_id: str
+
+
+class IntakeDecisionBody(Versioned):
+    decision: Literal["approve", "except", "reject"]
+    reason: str | None = None
+    valid_days: int | None = None
+    scope_type: Literal["key", "user", "team"] | None = None
+    scope_id: str | None = None
+    team_id: str | None = None
+    second_approver_token: str | None = None
+
+
+class ReapproveBody(Versioned):
+    intake_id: str
+    tool_contract_ids: list[str] = []
+    deployment_contract_id: str | None = None
+
+
+def intake_days(decision: str, valid_days: int | None, strict: bool) -> int:
+    """신청 승인의 기본 기간(일): 일반 90, 높음·심각 도구를 포함하거나 예외이면 30."""
+    days = valid_days or (STRICT_DAYS if decision == "except" or strict else STANDARD_DAYS)
+    if days < 1:
+        raise ControlError("유효 기간은 1일 이상이어야 합니다.")
+    if decision == "except" and days > EXCEPTION_MAX_DAYS:
+        raise ControlError(f"예외 승인의 유효 기간은 {EXCEPTION_MAX_DAYS}일을 넘을 수 없습니다.")
+    return days
+
+
+def decide_intake(actor: Actor, intake_id: str, body: IntakeDecisionBody) -> dict:
+    valid_until = None
+    if body.decision != "reject":
+        info = intake_service.show(actor.ctx, intake_id)
+        strict = any(t["risk_grade"] in ("high", "critical") for t in info["tool_contracts"])
+        valid_until = datetime.now(UTC) + timedelta(
+            days=intake_days(body.decision, body.valid_days, strict)
+        )
+    return intake_service.decide(
+        actor.ctx, intake_id, body.decision, reason=body.reason, valid_until=valid_until,
+        scope_type=body.scope_type, scope_id=body.scope_id, team_id=body.team_id,
+        second=second_approver(actor, body.second_approver_token),
+        expected_version=body.state_version,
+    )
+
+
+@router.get("/intakes")
+def list_intakes(status: str | None = None, actor: Actor = Depends(api_actor)):
+    rows = intake_service.list_intakes(actor.ctx, status)
+    return {"items": public(sorted(rows, key=lambda r: (r["created_at"], str(r["id"]))))}
+
+
+@router.get("/intakes/{intake_id}")
+def get_intake(intake_id: str, actor: Actor = Depends(api_actor)):
+    return public(intake_service.show(actor.ctx, intake_id))
+
+
+@router.post("/intakes/{intake_id}/requester")
+def assign_requester(intake_id: str, body: RequesterBody, actor: Actor = Depends(api_actor)):
+    intake_service.assign_requester(
+        actor.ctx, actor.litellm(), intake_id, body.user_id, expected_version=body.state_version
+    )
+    return done(actor, id=intake_id)
+
+
+@router.post("/intakes/{intake_id}/recheck")
+def recheck_intake(intake_id: str, body: Versioned, actor: Actor = Depends(api_actor)):
+    job = intake_service.recheck(actor.ctx, intake_id, expected_version=body.state_version)
+    return done(actor, id=intake_id, job_id=job)
+
+
+@router.post("/intakes/{intake_id}/decision")
+def decide_intake_route(
+    intake_id: str, body: IntakeDecisionBody, actor: Actor = Depends(api_actor)
+):
+    decide_intake(actor, intake_id, body)
+    return done(actor, id=intake_id)
+
+
+# --- 계약 변경 비교와 재승인 ------------------------------------------------------------------
+
+
+@router.get("/contracts")
+def list_contract_changes(actor: Actor = Depends(api_actor)):
+    return {"items": public(reads.drifted_servers(actor.conn, actor.instance))}
+
+
+@router.get("/servers/{server_id}/contracts")
+def get_contracts(server_id: str, actor: Actor = Depends(api_actor)):
+    return public(contract_service.show(actor.ctx, server_id))
+
+
+@router.get("/servers/{server_id}/contracts/diff")
+def get_contract_diff(server_id: str, actor: Actor = Depends(api_actor)):
+    info = contract_service.diff(actor.ctx, server_id)
+    return {"changes": public(compare.changes(info)),
+            "plan": public(reads.reapproval_plan(actor.conn, actor.instance, server_id))}
+
+
+@router.post("/servers/{server_id}/contracts/reapprove")
+def reapprove_contracts(server_id: str, body: ReapproveBody, actor: Actor = Depends(api_actor)):
+    result = contract_service.reapprove(
+        actor.ctx, server_id, body.intake_id, body.tool_contract_ids,
+        deployment_id=body.deployment_contract_id, expected_version=body.state_version,
+    )
+    return done(actor, **result)
