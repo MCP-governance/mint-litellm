@@ -12,7 +12,7 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 "$PY" "$HERE/bootstrap.py"
-export DOCKER_CONFIG=$HOME/.docker-acc COMPOSE_PROJECT_NAME=mints2
+export DOCKER_CONFIG=$HOME/.docker-acc COMPOSE_PROJECT_NAME=mints2 ACC_CERT_DIR=$ACC_HOME/certs
 C=(docker compose --env-file deploy/.env -f deploy/compose.yaml -f tests/acceptance/stage2/device/acc.yaml)
 "${C[@]}" --profile worker --profile console up -d worker console
 "$PY" "$HERE/bootstrap.py" operators

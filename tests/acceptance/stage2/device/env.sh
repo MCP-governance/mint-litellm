@@ -5,6 +5,7 @@ getenv() { grep -E "^$1=" "$REPO/deploy/.env" | head -n1 | cut -d= -f2-; }
 getjson() { python3 -c "import json,sys;print(json.load(open('$STATE/acc.json')).get('$1',''))"; }
 export DOCKER_CONFIG=$HOME/.docker-acc COMPOSE_PROJECT_NAME=mints2
 export PATH="$STATE/venv/bin:$PATH"
+export ACC_CERT_DIR="$STATE/certs"
 export ACC_COMPOSE="docker compose -p mints2 --env-file deploy/.env -f deploy/compose.yaml -f tests/acceptance/stage2/device/acc.yaml"
 export ACC_DATABASE_URL="postgresql://postgres:$(getenv POSTGRES_PASSWORD)@127.0.0.1:4332/mint"
 export MINT_DATABASE_URL="postgresql://mint_control_app:$(getenv MINT_CONTROL_DB_PASSWORD)@127.0.0.1:4332/mint"

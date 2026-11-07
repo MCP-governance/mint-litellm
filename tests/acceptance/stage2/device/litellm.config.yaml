@@ -25,21 +25,21 @@ litellm_settings:
 mcp_servers:
   playwright:
     server_id: playwright
-    url: http://cnt:8080/playwright/mcp
+    url: https://cnt:8443/playwright/mcp
     transport: http
     allow_all_keys: false
   context7:
     server_id: context7
-    url: http://cnt:8080/context7/mcp
+    url: https://cnt:8443/context7/mcp
     transport: http
     allow_all_keys: false
   grafana:
     server_id: grafana
-    url: http://cnt:8080/grafana/mcp
+    url: https://cnt:8443/grafana/mcp
     transport: http
     allow_all_keys: false
   synthetic:
     server_id: synthetic
-    url: http://cnt:8080/synthetic/mcp
+    url: https://cnt:8443/synthetic/mcp
     transport: http
     allow_all_keys: false

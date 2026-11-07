@@ -15,6 +15,17 @@ rand() { head -c 24 /dev/urandom | base64 | tr -d '/+=\n' | head -c "${1:-32}"; 
 
 docker network inspect mint-g10_mcp >/dev/null
 mkdir -p "$STATE"
+# 계수 역프록시의 시험용 CA와 인증서(수용검증은 https만 받는다). LiteLLM 컨테이너는 이 CA만 신뢰한다.
+export ACC_CERT_DIR="$STATE/certs"
+if [ ! -f "$ACC_CERT_DIR/ca.pem" ]; then
+  mkdir -p "$ACC_CERT_DIR" && chmod 755 "$ACC_CERT_DIR"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=acc-ca" -keyout "$ACC_CERT_DIR/ca.key" -out "$ACC_CERT_DIR/ca.pem" 2>/dev/null
+  openssl req -newkey rsa:2048 -nodes -subj "/CN=cnt" -keyout "$ACC_CERT_DIR/cnt.key" -out "$ACC_CERT_DIR/cnt.csr" 2>/dev/null
+  printf 'subjectAltName=DNS:cnt,DNS:localhost
+' > "$ACC_CERT_DIR/san.ext"
+  openssl x509 -req -in "$ACC_CERT_DIR/cnt.csr" -CA "$ACC_CERT_DIR/ca.pem" -CAkey "$ACC_CERT_DIR/ca.key" -CAcreateserial -days 30 -extfile "$ACC_CERT_DIR/san.ext" -out "$ACC_CERT_DIR/cnt.pem" 2>/dev/null
+  chmod 644 "$ACC_CERT_DIR"/*.pem "$ACC_CERT_DIR/cnt.key"
+fi
 if [ ! -f .env ]; then
   cp .env.example .env
   for pair in POSTGRES_PASSWORD=$(rand 24) MINT_PLUGIN_DB_PASSWORD=$(rand 24) MINT_CONTROL_DB_PASSWORD=$(rand 24) \
