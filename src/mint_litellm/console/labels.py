@@ -230,7 +230,7 @@ NOTICES = {
     "org_closed": "조직을 닫았습니다.",
     "allowlist_added": "허용 목록에 추가했습니다.",
     "mode_set": "모드를 변경했습니다.",
-    "staff_confirmed": "확인했습니다. 같은 요청을 다시 보내면 허용됩니다.",
+    "staff_confirmed": "확인했습니다.",
     "staff_rejected": "거절했습니다.",
     "staff_cancelled": "취소했습니다.",
     "consent_given": "동의를 등록했습니다.",

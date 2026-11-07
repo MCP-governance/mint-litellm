@@ -35,6 +35,8 @@ from mint_litellm.control.errors import AdminCode, AdminError, ControlError
 from mint_litellm.control.services import console_sessions, staff
 
 router = APIRouter(dependencies=[Depends(require_csrf)])
+# 로그인은 세션이 없을 때(또는 만료된 쿠키가 남았을 때)도 받으므로 CSRF 토큰 대신 출처만 본다.
+public = APIRouter()
 
 RECENT_RECORDS = 50
 
@@ -115,12 +117,12 @@ def act(
 # --- 로그인·로그아웃 --------------------------------------------------------------------------
 
 
-@router.get("/staff/login", response_class=HTMLResponse)
+@public.get("/staff/login", response_class=HTMLResponse)
 def login_form(request: Request) -> Response:
     return render(request, "staff_login.html", {"error": None})
 
 
-@router.post("/staff/login", dependencies=[Depends(require_origin)])
+@public.post("/staff/login", dependencies=[Depends(require_origin)])
 def login_submit(
     request: Request,
     key: str = Form(""),
@@ -171,7 +173,7 @@ def logout(actor: StaffActor = Depends(staff_actor)) -> Response:
 
 @router.get("/staff")
 def servers(request: Request, actor: StaffActor = Depends(staff_actor)):
-    rows = staff.list_available(actor.sctx)
+    rows = [r for r in staff.list_available(actor.sctx) if r["tools"]]
     return render(request, "staff_servers.html", {"rows": rows}, actor=actor)
 
 

@@ -353,6 +353,22 @@ def list_available(sctx: StaffContext) -> list[dict]:
     orgs = sorted(_member_orgs(sctx, sctx.team_ids))
     if not orgs:
         return []
+    scope = (
+        "((a.scope_type = 'user' AND a.scope_id = %(user)s)"
+        " OR (a.scope_type = 'team' AND a.scope_id = ANY(%(teams)s))"
+        " OR (a.scope_type = 'org' AND a.scope_id = r.org_id)"
+        " OR (a.scope_type = 'key' AND a.scope_id = %(key)s))"
+    )
+    denied = (
+        "EXISTS (SELECT 1 FROM mint.denials d WHERE d.instance_id = s.instance_id"
+        " AND d.lifted_at IS NULL AND (d.server_id IS NULL OR d.server_id = s.server_id)"
+        " AND ((d.scope_type = 'user' AND d.scope_id = %(user)s)"
+        "   OR (d.scope_type = 'team' AND d.scope_id = ANY(%(teams)s))"
+        "   OR (d.scope_type = 'org' AND d.scope_id = r.org_id)"
+        "   OR (d.scope_type = 'key' AND d.scope_id = %(key)s)"
+        "   OR (d.scope_type = 'server' AND d.scope_id = s.server_id))"
+        " AND (d.tools IS NULL OR t = ANY(d.tools)))"
+    )
     with sctx.control.transaction():
         return fetchall(
             sctx.control,
@@ -360,24 +376,17 @@ def list_available(sctx: StaffContext) -> list[dict]:
             " COALESCE((SELECT array_agg(DISTINCT t ORDER BY t) FROM mint.approvals a,"
             "   unnest(a.tools) AS t WHERE a.instance_id = s.instance_id"
             "   AND a.server_id = s.server_id AND a.org_id = r.org_id AND a.status = 'active'"
-            "   AND a.valid_from <= now() AND a.valid_until > now()"
-            "   AND ((a.scope_type = 'user' AND a.scope_id = %s)"
-            "     OR (a.scope_type = 'team' AND a.scope_id = ANY(%s))"
-            "     OR (a.scope_type = 'org' AND a.scope_id = r.org_id)"
-            "     OR (a.scope_type = 'key' AND a.scope_id = %s))), '{}') AS tools,"
+            f"   AND a.valid_from <= now() AND a.valid_until > now() AND {scope}"
+            f"   AND NOT {denied}), '{{}}') AS tools,"
             " (SELECT max(a.valid_until) FROM mint.approvals a WHERE a.instance_id = s.instance_id"
             "   AND a.server_id = s.server_id AND a.org_id = r.org_id AND a.status = 'active'"
-            "   AND a.valid_until > now()"
-            "   AND ((a.scope_type = 'user' AND a.scope_id = %s)"
-            "     OR (a.scope_type = 'team' AND a.scope_id = ANY(%s))"
-            "     OR (a.scope_type = 'org' AND a.scope_id = r.org_id)"
-            "     OR (a.scope_type = 'key' AND a.scope_id = %s))) AS valid_until"
+            f"   AND a.valid_until > now() AND {scope}) AS valid_until"
             " FROM mint.servers s JOIN mint.usage_relations r ON r.instance_id = s.instance_id"
             " AND r.server_id = s.server_id AND r.status = 'active'"
             " JOIN mint.orgs o ON o.instance_id = r.instance_id AND o.org_id = r.org_id"
             " AND o.status = 'active'"
-            " WHERE s.instance_id = %s AND s.status = 'approved' AND r.org_id = ANY(%s)"
+            " WHERE s.instance_id = %(iid)s AND s.status = 'approved' AND r.org_id = ANY(%(orgs)s)"
             " ORDER BY s.server_id, r.org_id",
-            (sctx.user_id, list(sctx.team_ids), sctx.key_token,
-             sctx.user_id, list(sctx.team_ids), sctx.key_token, sctx.instance_id, orgs),
+            {"user": sctx.user_id, "teams": list(sctx.team_ids), "key": sctx.key_token,
+             "iid": sctx.instance_id, "orgs": orgs},
         )

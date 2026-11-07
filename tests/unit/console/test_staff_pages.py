@@ -522,3 +522,36 @@ def test_the_record_section_lists_only_own_events_with_korean_names(sworld):
     assert "본인 확인 거절" not in page.text
     for english in ("consent_granted", "call_approval", "console_session"):
         assert english not in page.text
+
+
+def test_signing_in_works_while_an_expired_staff_cookie_is_still_in_the_browser(sworld):
+    client = logged_in(sworld)
+    sworld.query("UPDATE mint.console_sessions SET revoked_at = now()")
+    assert client.get("/staff").status_code == 303
+    response = client.post("/staff/login", data={"key": CONSOLE})
+    assert response.status_code == 303 and response.headers["location"] == "/staff"
+    assert client.get("/staff").status_code == 200
+
+
+def test_a_denied_tool_or_server_is_not_listed_as_usable(sworld):
+    add_approval(sworld, "user", STAFFER, tools=("echo", "ping"))
+    deny = ("INSERT INTO mint.denials (id, instance_id, org_id, scope_type, scope_id, server_id,"
+            " tools, reason, created_by) VALUES (gen_random_uuid(), %s, NULL, 'user', %s,"
+            " 'srv-ok', %s, '시험', 'admin')")
+    sworld.query(deny, INSTANCE, STAFFER, ["ping"])
+    page = logged_in(sworld).get("/staff")
+    assert "echo" in page.text and "ping" not in page.text
+    sworld.query("UPDATE mint.denials SET lifted_at = now(), lifted_by = 'admin'")
+    assert "echo, ping" in logged_in(sworld).get("/staff").text
+    sworld.query("INSERT INTO mint.denials (id, instance_id, scope_type, scope_id, server_id,"
+                 " reason, created_by) VALUES (gen_random_uuid(), %s, 'server', 'srv-ok',"
+                 " 'srv-ok', '시험', 'admin')",
+                 INSTANCE)
+    page = logged_in(sworld).get("/staff")
+    assert "쓸 수 있는 서버가 없습니다" in page.text
+
+
+def test_a_server_without_any_approval_for_the_user_is_not_listed(sworld):
+    page = logged_in(sworld).get("/staff")
+    assert "쓸 수 있는 서버가 없습니다" in page.text
+    assert "srv-ok" in logged_in(sworld).get("/staff/consents").text

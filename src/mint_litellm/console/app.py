@@ -106,6 +106,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     app.include_router(api.router, prefix="/api/v1")
     app.include_router(pages.router)
+    app.include_router(staff_pages.public)
     app.include_router(staff_pages.router)
 
     @app.get("/healthz", include_in_schema=False)

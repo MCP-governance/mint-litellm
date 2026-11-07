@@ -243,3 +243,16 @@ def test_the_migrations_apply_for_a_role_that_is_not_a_superuser():
             admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
             admin.execute(f"DROP OWNED BY {migrator}")
             admin.execute(f"DROP ROLE IF EXISTS {migrator}")
+
+
+def test_the_staff_login_can_execute_only_the_public_staff_functions(world):
+    expected = {"staff_confirm", "staff_reject", "staff_cancel", "staff_grant_consent",
+                "staff_revoke_consent", "staff_start_session", "staff_touch_session",
+                "staff_end_session", "staff_list_confirmations", "staff_list_consents",
+                "staff_list_events"}
+    with psycopg.connect(world[0]) as conn:
+        rows = conn.execute(
+            "SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace"
+            " WHERE n.nspname = 'mint' AND p.prorettype <> 'trigger'::regtype"
+            " AND has_function_privilege('mint_staff_app', p.oid, 'EXECUTE')").fetchall()
+    assert {r[0] for r in rows} == expected
