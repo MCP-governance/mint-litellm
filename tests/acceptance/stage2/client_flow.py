@@ -61,7 +61,7 @@ def run(rig):
             "tool_contracts", "server_id=%s AND drift='input_schema'", [server],
         ), 120, "실제 클라이언트용 드리프트")
         probe(rig, fixture, "drift")
-        rig.versioned(f"/servers/{server}/contracts", "reapprove", {}, role="approver")
+        rig.reapprove(server)
         rig.wait(lambda server=server: not rig.rows(
             "tool_contracts", "server_id=%s AND status='approved' AND drift <> 'none'", [server],
         ), 120, "실제 클라이언트용 재승인")

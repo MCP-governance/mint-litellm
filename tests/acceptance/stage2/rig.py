@@ -353,6 +353,24 @@ class Rig:
         assert grants and all(row["observed"] is True for row in grants)
         return contracts
 
+    def reapprove(self, server):
+        """재승인 CLI. 후보 계약(도구·배포)이 생길 때까지 기다린 뒤 승인된 신청의 증거로 부른다."""
+        def candidates():
+            tools = self.rows("tool_contracts", "server_id=%s AND status='candidate'", [server])
+            deployments = self.rows("deployment_contracts",
+                                    "server_id=%s AND status='candidate'", [server])
+            return (tools, deployments) if tools or deployments else None
+
+        tools, deployments = self.wait(candidates, 120, "재승인 후보 계약")
+        intake = self.rows("intakes", "server_id=%s AND decision='approved' "
+                           "ORDER BY decided_at DESC LIMIT 1", [server])[0]
+        args = ["contract", "reapprove", server, "--intake", str(intake["id"])]
+        for tool in tools:
+            args += ["--tool-contract", str(tool["id"])]
+        if deployments:
+            args += ["--deployment-contract", str(deployments[0]["id"])]
+        return self.cli(*args, role="approver")
+
     def active(self, name="context7"):
         entry = self.site["servers"][name]
         if self.rows("approvals", "server_id=%s AND status='active'", [entry["server_id"]]):

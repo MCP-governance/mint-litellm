@@ -16,7 +16,7 @@ def test_version_drift_and_reapproval(rig, name):
     rig.call(server, fixture["unchanged_tool"], fixture["unchanged_arguments"])
     contracts = rig.rows("tool_contracts", "server_id=%s AND drift='input_schema'", [server])
     window = rig.begin("reapproval", entities=[row["id"] for row in contracts], server=server)
-    rig.versioned(f"/servers/{server}/contracts", "reapprove", {}, role="approver")
+    rig.reapprove(server)
     rig.wait(lambda: not rig.rows("tool_contracts", "server_id=%s AND status='approved' "
                                 "AND drift <> 'none'", [server]), 120, "재승인·재pin")
     for tool, args in fixture["changed_tools"].items():
@@ -49,7 +49,7 @@ def test_synthetic_contract_changes(rig, mutation):
         rig.wait(lambda: rig.rows("servers", "server_id=%s AND deployment_drift", [server]),
                  120, "배포 변경")
         rig.check_events(window, worker_count=2)
-        rig.versioned(f"/servers/{server}/contracts", "reapprove", {}, role="approver")
+        rig.reapprove(server)
         rig.wait(lambda: not rig.rows("servers", "server_id=%s AND deployment_drift", [server]),
                  120, "배포 재승인")
         rig.call(server, fixture["tool"], fixture["arguments"])
