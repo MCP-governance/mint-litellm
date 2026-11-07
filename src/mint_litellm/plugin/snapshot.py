@@ -697,9 +697,11 @@ class PluginDatabase:
                         (id, instance_id, org_id, principal_id, server_id, tool, args_fp,
                          fp_key_version, policy_version_id, purpose, requested_by_key_token,
                          display, expires_at)
-                    SELECT %(id)s, %(iid)s, %(org_id)s, %(principal_id)s, %(server_id)s,
-                           %(tool)s, %(args_fp)s, %(fp_key_version)s, %(policy_version_id)s,
-                           %(purpose)s, %(key_token)s, %(display)s,
+                    SELECT %(id)s, %(iid)s::mint.ident, %(org_id)s::mint.ident, %(principal_id)s,
+                           %(server_id)s,
+                           %(tool)s, %(args_fp)s, %(fp_key_version)s,
+                           %(policy_version_id)s::mint.ident, %(purpose)s, %(key_token)s,
+                           %(display)s,
                            clock_timestamp() + interval '10 minutes'
                     WHERE (SELECT count(*) FROM mint.self_confirmations
                            WHERE instance_id = %(iid)s AND principal_id = %(principal_id)s
