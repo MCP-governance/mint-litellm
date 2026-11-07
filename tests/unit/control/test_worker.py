@@ -133,8 +133,9 @@ def test_the_worker_needs_the_worker_login(url):
 
 def test_the_worker_login_creates_the_schedules_it_has_handlers_for(make_worker, admin):
     make_worker(schedules=True)
-    rows = fetchall(admin, "SELECT kind, interval_seconds FROM mint.schedules")
-    assert rows == [{"kind": "approval_expiry_scan", "interval_seconds": 60}]
+    rows = fetchall(admin, "SELECT kind, interval_seconds FROM mint.schedules ORDER BY kind")
+    assert rows == [{"kind": "approval_expiry_scan", "interval_seconds": 60},
+                    {"kind": "contract_observe", "interval_seconds": SETTINGS.observe_seconds}]
 
 
 # --- 수렴 작업 등록 규칙 ----------------------------------------------------------
@@ -401,18 +402,21 @@ def test_a_schedule_registers_one_job_per_period_even_with_two_workers(make_work
         thread.start()
     for thread in threads:
         thread.join(15)
-    assert sorted(counts) == [0, 1]
-    [row] = fetchall(admin, "SELECT * FROM mint.jobs")
+    assert sum(counts) == 2
+    [row] = fetchall(admin, "SELECT * FROM mint.jobs WHERE kind='approval_expiry_scan'")
     assert row["kind"] == "approval_expiry_scan" and row["status"] == "pending"
     assert re.fullmatch(r"approval_expiry_scan:\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ",
                         row["idempotency_key"])
     assert jobs.register_due_schedules(first.conn, INSTANCE) == 0  # 같은 주기에는 더 없다
-    nxt = fetchone(admin, "SELECT next_run_at > now() AS future FROM mint.schedules")
+    [observation] = fetchall(admin, "SELECT * FROM mint.jobs WHERE kind='contract_observe'")
+    assert observation["idempotency_key"] is None
+    nxt = fetchone(admin, "SELECT bool_and(next_run_at > now()) AS future FROM mint.schedules")
     assert nxt["future"] is True
 
 
 def test_missed_periods_are_skipped_to_the_current_one_on_the_original_grid(make_worker, admin):
     worker = make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind='contract_observe'")
     admin.execute("UPDATE mint.schedules SET next_run_at = now() - interval '605 seconds'")
     before = fetchone(admin, "SELECT next_run_at FROM mint.schedules")["next_run_at"]
     assert jobs.register_due_schedules(worker.conn, INSTANCE) == 1  # 열 번 밀렸어도 한 건
@@ -460,6 +464,7 @@ def test_the_worker_runs_the_approval_expiry_scan_from_its_schedule(
                 " now() + %s::interval)", (INSTANCE, tag, HEX, delta))
         conn.commit()
     worker = make_worker(schedules=True)
+    admin.execute("DELETE FROM mint.schedules WHERE kind='contract_observe'")
     assert worker.step()  # 일정 등록 -> 임대 -> 처리
     states = {r["principal_id"]: r["status"]
               for r in fetchall(admin, "SELECT principal_id, status FROM mint.call_approvals")}

@@ -229,6 +229,7 @@ class RegistryEntry:
     transport: str
     auth_type: str
     allow_all_keys: bool
+    issuer: str | None = None
 
 
 def registry_entries(*, manager: Any = None) -> list[RegistryEntry]:
@@ -241,6 +242,7 @@ def registry_entries(*, manager: Any = None) -> list[RegistryEntry]:
             transport=_enum_text(server.transport),
             auth_type=normalize_auth_type(server.auth_type),
             allow_all_keys=bool(server.allow_all_keys),
+            issuer=getattr(server, "issuer", None),
         )
         for server in mgr.get_registry().values()
     ]

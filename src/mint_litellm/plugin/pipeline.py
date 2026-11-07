@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import time
@@ -34,6 +35,7 @@ from mint_litellm.plugin.snapshot import (
     Snapshot,
     SnapshotQuery,
 )
+from mint_litellm.types.canonical import credential_scope
 from mint_litellm.types.decision import (
     UNSUPPORTED_STAGE,
     Action,
@@ -277,6 +279,58 @@ def denial_and_approval(
     if any(_approval_expired(a, now) for a in in_org):
         return ApprovalSelection([StageResult.stop(Reason.APPROVAL_EXPIRED)], None)
     return ApprovalSelection([StageResult.finding(Reason.APPROVAL_ABSENT)], None)
+
+
+def control_listing_negative(
+    snapshot: Snapshot, principal: Principal, resolved: ResolvedServer, tool: str
+) -> StageResult | None:
+    if principal.principal_type is PrincipalType.ANONYMOUS:
+        return StageResult.stop(Reason.ANONYMOUS)
+    server = snapshot.server
+    if server is not None and server.status in {
+        "rejected",
+        "suspended",
+        "terminating",
+        "terminated",
+    }:
+        return server_state_result(server.status)
+    for denial in snapshot.denials:
+        if (
+            scope_matches(denial.scope_type, denial.scope_id, principal, resolved.server_id)
+            and (denial.server_id is None or denial.server_id == resolved.server_id)
+            and (denial.tools is None or tool in denial.tools)
+            and (denial.org_id is None or denial.org_id == principal.org_id)
+        ):
+            return StageResult.stop(Reason.DENIED)
+    if snapshot.negative_relation or any(
+        r.status in {"terminating", "terminated"} for r in snapshot.relations.values()
+    ):
+        return StageResult.stop(Reason.RELATION_TERMINATED)
+    return None
+
+
+def contract_result(
+    snapshot: Snapshot, tool: str, observe_seconds: int
+) -> StageResult | SkippedStage:
+    server = snapshot.server
+    if server is None or server.contract_status != "managed":
+        return UNSUPPORTED_STAGE
+    scope = credential_scope(server.auth_type)
+    contract = next(
+        (c for c in snapshot.tool_contracts if c.credential_scope == scope and c.tool == tool), None
+    )
+    if contract is None:
+        return StageResult.finding("CONTRACT_DRIFT_unapproved_tool")
+    if contract.drift == "input_schema":
+        return StageResult.finding("CONTRACT_DRIFT_input_schema")
+    if server.deployment_drift:
+        return StageResult.finding("CONTRACT_DRIFT_deployment")
+    if (
+        server.last_observed_at is None
+        or (snapshot.now - server.last_observed_at).total_seconds() > 2 * observe_seconds
+    ):
+        return StageResult.finding("CONTRACT_DRIFT_unobserved")
+    return StageResult.passed()
 
 
 def consent_state(snapshot: Snapshot, principal: Principal, purpose: str) -> tuple[str, str | None]:
@@ -596,6 +650,7 @@ class _Run:
     event_written: bool = False
     # 이 호출에서 기록을 시작한 가장 큰 시도 번호. 취소 사건은 그보다 큰 번호를 쓴다.
     last_attempt: int = 0
+    control_listing: bool = False
 
 
 def _decision_snapshot(
@@ -661,6 +716,9 @@ def _decision_snapshot(
         evaluated_decision=conclusion.evaluated_decision,
         enforced_action=conclusion.enforced_action,
         missing_reasons=reasons,
+        cause="control_key_call"
+        if conclusion.stop is not None and conclusion.stop.detail == "control_key_call"
+        else None,
         **{k: v for k, v in values.items() if v is not None},
     )
 
@@ -746,6 +804,25 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
 
     run.current = Stage.STATE
     run.principal = derive_principal(snapshot, principal)
+    control_key = settings.control_key_token if settings else None
+    is_control = (
+        control_key is not None
+        and principal.key_id is not None
+        and hmac.compare_digest(control_key.encode(), principal.key_id.encode())
+    )
+    if is_control and req.operation is OperationType.TOOL_CALL:
+        stages.add(
+            Stage.STATE, StageResult.stop(Reason.ENFORCEMENT_UNVERIFIED, detail="control_key_call")
+        )
+        return
+    if is_control and req.operation is OperationType.RUNTIME_DISCOVERY:
+        negative = control_listing_negative(snapshot, run.principal, resolved, tool)
+        if negative is not None:
+            stages.add(Stage.STATE, negative)
+        else:
+            run.control_listing = True
+            stages.add(Stage.STATE, StageResult.passed())
+        return
     state = state_results(snapshot, run.principal, resolved)
     for result in state:
         stages.add(Stage.STATE, result)
@@ -761,10 +838,17 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
     if not selection.results:
         stages.add(Stage.DENIAL_APPROVAL, StageResult.passed())
     run.selected = selection.selected
-    if stages.stopped or req.operation is OperationType.RUNTIME_DISCOVERY:
+    if stages.stopped:
         return
 
-    stages.add(Stage.CONTRACT, UNSUPPORTED_STAGE)
+    if req.operation is OperationType.RUNTIME_DISCOVERY and (
+        snapshot.server is None or snapshot.server.contract_status != "managed"
+    ):
+        return
+    run.current = Stage.CONTRACT
+    stages.add(Stage.CONTRACT, contract_result(snapshot, tool, config.observe_seconds))
+    if req.operation is OperationType.RUNTIME_DISCOVERY:
+        return
     run.current = Stage.POLICY
     try:
         policy_input = build_policy_input(
@@ -897,6 +981,11 @@ async def _evaluate(run: _Run, deps: PipelineDeps) -> Outcome:
         policy_observable=observable,
     )
     consume = run.consume if conclusion.enforced_action is Action.ALLOW else None
+    if run.control_listing:
+        document = _decision_snapshot(run, conclusion, None)
+        return Outcome(
+            True, document, None, Evidence.DB, _context_document(run, document, True, None)
+        )
     event = decision_event(_decision_snapshot(run, conclusion, consume))
     run.event_started = True
     run.last_attempt = req.attempt_id

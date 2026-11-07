@@ -37,6 +37,7 @@ from mint_litellm.plugin.pipeline import (
 from mint_litellm.plugin.policy.opa_client import Evaluation, OPAClient
 from mint_litellm.plugin.result import ResultDeps
 from mint_litellm.plugin.snapshot import PluginDatabase, RegisteredServer
+from mint_litellm.types.canonical import sha256
 from mint_litellm.types.decision import OperationType
 from mint_litellm.types.events import Event, EventKind
 from mint_litellm.types.settings import SELF_CHECK_DESCRIPTIONS, SelfCheckItem
@@ -316,8 +317,10 @@ class PluginRuntime:
     last_results: list[CheckResult] = field(default_factory=list)
     last_mismatches: list[tuple[str, str]] = field(default_factory=list)
     keys: SystemEventKeys = field(default_factory=SystemEventKeys, repr=False)
-    _reported: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
+    _reported: dict[str, dict[str, str]] = field(default_factory=dict, repr=False)
+    _observed_hashes: dict[str, dict[str, str]] = field(default_factory=dict, repr=False)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _observe_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @property
     def deps(self) -> PipelineDeps:
@@ -393,6 +396,27 @@ class PluginRuntime:
         )
         self.last_results = results
         self.last_mismatches = contract_mismatches(view, controlled or [])
+        by_id = {entry.server_id: entry for entry in view.registry}
+        for server in controlled or ():
+            entry = by_id.get(server.server_id)
+            if (
+                server.contract_status == "managed"
+                and entry is None
+                and server.status in CONTROLLED_SERVER_STATUSES
+                and (server.server_id, REGISTRY_MISSING) not in self.last_mismatches
+            ):
+                self.last_mismatches.append((server.server_id, REGISTRY_MISSING))
+            if (
+                server.contract_status == "managed"
+                and entry is not None
+                and entry.issuer != server.issuer
+            ):
+                self.last_mismatches.append((server.server_id, "issuer"))
+        self._observed_hashes = {}
+        for server_id, name in self.last_mismatches:
+            entry = by_id.get(server_id)
+            value = getattr(entry, name, None) if entry else None
+            self._observed_hashes.setdefault(server_id, {})[name] = sha256(value)
         return results
 
     async def verify(self) -> bool:
@@ -409,6 +433,18 @@ class PluginRuntime:
         except RuntimeError:
             return
         self._task = loop.create_task(self._startup())
+        self._observe_task = loop.create_task(self._observe_contracts())
+
+    async def _observe_contracts(self) -> None:
+        while True:
+            await asyncio.sleep(self.config.observe_seconds)
+            if not self.verified:
+                continue
+            try:
+                await self.run_checks()
+                await self._report_mismatches()
+            except Exception as exc:
+                log.warning("계약 관측 실패: %s", type(exc).__name__)
 
     async def _startup(self) -> None:
         self.keys = SystemEventKeys()
@@ -463,9 +499,9 @@ class PluginRuntime:
             by_server.setdefault(server_id, []).append(name)
         for server_id, names in by_server.items():
             fields = tuple(names)
-            if self._reported.get(server_id) == fields:
+            hashes = self._observed_hashes.get(server_id, {name: sha256(None) for name in fields})
+            if self._reported.get(server_id) == hashes:
                 continue
-            self._reported[server_id] = fields
             kind = EventKind.SERVER_IDENTITY_MISMATCH_OBSERVED
             await self.recorder.record(
                 Event(
@@ -473,9 +509,15 @@ class PluginRuntime:
                     inserted_at=datetime.now(UTC),
                     kind=kind,
                     source_key=self.keys.next(kind),
-                    payload={"server_id": server_id, "fields": list(fields)},
+                    payload={
+                        "server_id": server_id,
+                        "fields": list(fields),
+                        "observed_hashes": hashes,
+                    },
                 )
             )
+            self._reported[server_id] = hashes
+        self._reported = {key: value for key, value in self._reported.items() if key in by_server}
 
     async def _fail(self, error: str | None = None) -> None:
         failed = [

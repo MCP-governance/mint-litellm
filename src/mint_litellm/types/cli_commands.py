@@ -1,7 +1,7 @@
 """운영자 CLI의 명령 표와 제어 평면의 LiteLLM 접근 범위.
 
 모든 명령은 운영자 토큰으로 인증되며 행위자는 토큰에 결속된 운영자 이름이다. 제어 평면은
-LiteLLM DB를 직접 읽거나 쓰지 않고 관리 API의 읽기 경로만 사용하며, LiteLLM에는 쓰지 않는다.
+LiteLLM DB를 직접 읽거나 쓰지 않고 관리 API를 사용한다. 계약 재승인은 pin 쓰기를 수행한다.
 """
 
 from enum import StrEnum
@@ -61,6 +61,12 @@ class CliCommand(BaseModel):
 _SERVER_GET = "/v1/mcp/server/{server_id}"
 
 COMMANDS: tuple[CliCommand, ...] = (
+    CliCommand(path=("contract", "show"), summary="승인·후보 계약을 조회한다.", roles=ALL_ROLES),
+    CliCommand(path=("contract", "diff"), summary="승인본과 관측본을 비교한다.", roles=ALL_ROLES),
+    CliCommand(path=("contract", "reapprove"), summary="재검사 증거와 재pin을 확인해 재승인한다.",
+               roles=APPROVER_UP, events=(EventKind.CONTRACT_APPROVED,
+               EventKind.CONTRACT_SUPERSEDED, EventKind.DEPLOYMENT_CONTRACT_APPROVED,
+               EventKind.DEPLOYMENT_CONTRACT_SUPERSEDED)),
     CliCommand(
         path=("init",),
         summary="LiteLLM 설정 조각(권장 설정 포함)을 만들고 기본 조직을 준비한다. "

@@ -126,6 +126,7 @@ def test_command_roles_follow_the_operator_role_model():
         "call-approval approve",
         "call-approval reject",
         "call-approval cancel",
+        "contract reapprove",
     }
     for command in COMMANDS:
         if command.unauthenticated:
@@ -135,7 +136,8 @@ def test_command_roles_follow_the_operator_role_model():
             assert OperatorRole.APPROVER in command.roles, command.name
             assert OperatorRole.VIEWER not in command.roles
         elif command.roles == frozenset(OperatorRole):
-            assert command.name in {"check", "status", "ledger list"}
+            assert command.name in {
+                "check", "status", "ledger list", "contract show", "contract diff"}
         else:
             assert command.roles == frozenset({OperatorRole.ADMIN}), command.name
 

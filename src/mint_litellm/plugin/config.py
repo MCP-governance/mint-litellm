@@ -44,6 +44,7 @@ class PluginConfig:
     readiness_url: str | None = None
     selfcheck_grace_seconds: float = DEFAULT_SELFCHECK_GRACE_SECONDS
     log_level: str | None = None
+    observe_seconds: int = 3600
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> PluginConfig:
@@ -76,6 +77,7 @@ class PluginConfig:
             fingerprint_key_version=_integer(env, "MINT_FINGERPRINT_KEY_VERSION", 1, 1),
             readiness_url=env.get("MINT_READINESS_URL") or None,
             log_level=_log_level(env.get("MINT_LOG_LEVEL")),
+            observe_seconds=_integer(env, "MINT_OBSERVE_SECONDS", 3600, 1),
             selfcheck_grace_seconds=float(
                 _integer(
                     env,

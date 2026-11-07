@@ -29,8 +29,8 @@ def migrated_database() -> Iterator[str]:
     url = make_conninfo(**params)
     try:
         with psycopg.connect(url, autocommit=True) as conn:
-            conn.execute(MIGRATION.read_text(encoding="utf-8"))
-            conn.execute(STAGE2.read_text(encoding="utf-8"))
+            for migration in sorted(MIGRATIONS.glob("*.sql")):
+                conn.execute(migration.read_text(encoding="utf-8"))
         yield url
     finally:
         with psycopg.connect(DATABASE_URL, autocommit=True) as admin:

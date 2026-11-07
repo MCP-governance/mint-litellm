@@ -492,6 +492,7 @@ class DecisionSnapshot(BaseModel):
     revoked_after_snapshot: bool | None = None
     revocation_check: RevocationCheck | None = None
     missing_reasons: dict[str, str] = {}
+    cause: str | None = Field(default=None, exclude=True)
 
     @field_validator("missing_reasons", mode="after")
     @classmethod

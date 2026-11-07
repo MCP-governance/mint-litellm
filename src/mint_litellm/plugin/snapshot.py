@@ -57,6 +57,14 @@ SELECT jsonb_build_object(
     'bindings', (SELECT coalesce(jsonb_agg(to_jsonb(b)), '[]'::jsonb) FROM b),
     'orgs', (SELECT coalesce(jsonb_agg(to_jsonb(o)), '[]'::jsonb) FROM o),
     'server', (SELECT to_jsonb(srv) FROM srv),
+    'tool_contracts', (
+        SELECT coalesce(jsonb_agg(jsonb_build_object(
+            'id', t.id, 'credential_scope', t.credential_scope, 'tool', t.tool,
+            'drift', t.drift, 'version', t.version)), '[]'::jsonb) FROM mint.tool_contracts t
+        WHERE t.instance_id = %(iid)s AND t.server_id = %(server_id)s
+          AND t.tool = %(tool)s AND t.status = 'approved'
+          AND EXISTS (SELECT 1 FROM srv WHERE contract_status = 'managed')
+    ),
     'allowlists', (
         SELECT coalesce(jsonb_agg(to_jsonb(a)), '[]'::jsonb) FROM mint.allowlists a
         WHERE a.instance_id = %(iid)s AND a.id = ANY (SELECT unnest(basis_allowlist_ids) FROM srv)
@@ -64,6 +72,17 @@ SELECT jsonb_build_object(
     'relations', (
         SELECT coalesce(jsonb_agg(to_jsonb(r)), '[]'::jsonb) FROM mint.usage_relations r
         WHERE r.instance_id = %(iid)s AND r.id IN (SELECT relation_id FROM ap)
+    ),
+    'negative_relation', EXISTS (
+        SELECT 1 FROM mint.usage_relations r
+        WHERE r.instance_id = %(iid)s AND r.server_id = %(server_id)s
+          AND r.status IN ('terminating', 'terminated')
+          AND r.id IN (SELECT a.relation_id FROM mint.approvals a
+              WHERE a.instance_id = %(iid)s AND a.server_id = %(server_id)s
+                AND ((a.scope_type = 'key' AND a.scope_id = %(key_id)s)
+                  OR (a.scope_type = 'user' AND a.scope_id = %(user_id)s)
+                  OR (a.scope_type = 'team' AND a.scope_id = %(team_id)s)
+                  OR (a.scope_type = 'org' AND a.scope_id IN (SELECT org_id FROM o))))
     ),
     'approvals', (SELECT coalesce(jsonb_agg(to_jsonb(ap)), '[]'::jsonb) FROM ap),
     'denials', (
@@ -151,6 +170,7 @@ class SettingsRow:
     observable_policy_ids: frozenset[str] = frozenset()
     default_org_id: str | None = None
     settings_version: int | None = None
+    control_key_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +182,10 @@ class ServerRow:
     transport: str
     auth_type: str
     basis_allowlist_ids: tuple[str, ...]
+    contract_status: str = "none"
+    issuer: str | None = None
+    last_observed_at: datetime | None = None
+    deployment_drift: bool = False
 
 
 @dataclass(frozen=True)
@@ -238,6 +262,15 @@ class PolicyVersionRow:
 
 
 @dataclass(frozen=True)
+class ToolContractRow:
+    id: str
+    credential_scope: str
+    tool: str
+    drift: str
+    version: int
+
+
+@dataclass(frozen=True)
 class Snapshot:
     now: datetime
     epoch: int | None
@@ -252,6 +285,8 @@ class Snapshot:
     call_approvals: tuple[CallApprovalRow, ...]
     consents: tuple[ConsentRow, ...]
     policy_version: PolicyVersionRow | None
+    tool_contracts: tuple[ToolContractRow, ...] = ()
+    negative_relation: bool = False
 
 
 def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
@@ -270,6 +305,7 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
             observable_policy_ids=frozenset(settings["observable_policy_ids"]),
             default_org_id=settings.get("default_org_id"),
             settings_version=settings["settings_version"],
+            control_key_token=settings.get("control_key_token"),
         ),
         bindings={
             (SubjectType(b["subject_type"]), b["subject_id"]): b["org_id"] for b in doc["bindings"]
@@ -285,6 +321,10 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
             transport=server["transport"],
             auth_type=server["auth_type"],
             basis_allowlist_ids=tuple(server["basis_allowlist_ids"]),
+            contract_status=server.get("contract_status", "none"),
+            issuer=server.get("issuer"),
+            last_observed_at=_maybe_time(server.get("last_observed_at")),
+            deployment_drift=server.get("deployment_drift", False),
         ),
         allowlists={
             a["id"]: AllowlistRow(
@@ -356,6 +396,11 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
         policy_version=None
         if policy is None
         else PolicyVersionRow(id=policy["id"], bundle_sha256=policy["bundle_sha256"]),
+        tool_contracts=tuple(
+            ToolContractRow(c["id"], c["credential_scope"], c["tool"], c["drift"], c["version"])
+            for c in doc.get("tool_contracts", ())
+        ),
+        negative_relation=bool(doc.get("negative_relation", False)),
     )
 
 
@@ -390,6 +435,8 @@ class RegisteredServer:
     url_sha256: str
     transport: str
     auth_type: str
+    issuer: str | None = None
+    contract_status: str = "none"
 
 
 # 이 시간(초) 넘게 쓰지 않은 연결은 쓰기 전에 확인한다. 풀의 확인 기능은 실패마다 1초 넘게
@@ -624,7 +671,8 @@ class PluginDatabase:
     async def registered_servers(self, instance_id: str) -> Sequence[RegisteredServer]:
         async def read(conn: Any) -> Any:
             cursor = await conn.execute(
-                "SELECT server_id, status, url_sha256, transport, auth_type"
+                "SELECT server_id, status, url_sha256, transport, auth_type, issuer,"
+                " contract_status"
                 " FROM mint.servers WHERE instance_id = %s ORDER BY server_id",
                 (instance_id,),
             )
