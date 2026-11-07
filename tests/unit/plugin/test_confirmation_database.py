@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 from dataclasses import replace
 from uuid import uuid4
 
@@ -50,7 +51,7 @@ def world(fresh_db, login_roles):
     scene.close()
 
 
-def replica(scene, dsn, tmp_path, *, both=False):
+def replica(scene, dsn, tmp_path, *, both=False, calls=None):
     live = PluginDatabase(dsn, acquire_timeout=3)
     recorder = EvidenceRecorder(
         live, LocalBuffer(tmp_path / "buffer", 1024 * 1024), budget_seconds=5,
@@ -59,7 +60,8 @@ def replica(scene, dsn, tmp_path, *, both=False):
     deps = PipelineDeps(
         config(tmp_path, instance_id=scene.iid, decision_budget_seconds=5), live, recorder,
         evaluator("RequireApproval" if both else "Allow", policy_ids=("R2",) if both else (),
-                  obligations=(CONFIRM,), version="pv1", bundle="2" * 64), lambda: True,
+                  obligations=(CONFIRM,), version="pv1", bundle="2" * 64, calls=calls),
+        lambda: True,
     )
     return live, deps
 
@@ -229,3 +231,43 @@ def test_two_replicas_with_the_same_snapshot_consume_once(world, tmp_path, both)
 def test_stage_one_queries_never_read_confirmation_rows():
     assert "self_confirmations" not in SNAPSHOT_SQL
     assert "self_confirmations" not in CONSUME_SQL
+
+
+def test_cli_saved_condition_reaches_the_policy_input_and_the_call_stops(world, tmp_path):
+    from mint_litellm.control import approvals
+    from mint_litellm.types.reason_codes import Reason
+
+    scene, dsn = world
+    conditions = approvals.build_conditions(
+        high_risk_tools=None, business_hours_only=False, business_hours=None,
+        require_consent=None, confirm_tools=["search"], confirm_purpose="전송",
+        confirm_fields=["q"],
+    )
+    scene.conn.execute("DELETE FROM mint.approvals WHERE id = %s", (scene.approval,))
+    scene.conn.execute(
+        "INSERT INTO mint.approvals (id, instance_id, org_id, relation_id, class, server_id,"
+        " tools, scope_type, scope_id, valid_from, valid_until, conditions, basis, granted_by,"
+        " requested_by, status) VALUES (%s, %s, 'org1', %s, 'standard', 'srv-1', %s, 'team', 't1',"
+        " now() - interval '1 day', now() + interval '30 days', %s::jsonb, '{}', 'admin', 'req',"
+        " 'active')",
+        (uuid4(), scene.iid, scene.relation, ["search"], json.dumps(conditions)),
+    )
+    calls = []
+
+    async def go():
+        live, deps = replica(scene, dsn, tmp_path, calls=calls)
+        try:
+            return await ask(scene, deps, arguments={"q": "x", "secret": "y"})
+        finally:
+            await live.close()
+
+    outcome = run(go())
+    saved = calls[-1]["approval"]["conditions"]["require_user_confirmation"]
+    assert saved == {"tools": ["search"], "purpose": "전송", "display_fields": ["q"]}
+    assert not outcome.allowed
+    assert outcome.snapshot.stop.reason_code == Reason.CONFIRMATION_REQUIRED
+    row = scene.conn.execute(
+        "SELECT purpose, display FROM mint.self_confirmations WHERE instance_id = %s",
+        (scene.iid,),
+    ).fetchone()
+    assert row[0] == "전송" and set(row[1]) == {"q"}

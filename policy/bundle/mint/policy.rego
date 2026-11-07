@@ -169,6 +169,24 @@ valid_purpose if {
 	count(purpose) <= 128
 }
 
+# DS-166(POL-I-10 최소 구현): 승인 conditions.require_user_confirmation = {tools, purpose, display_fields}
+missing contains "approval.conditions.require_user_confirmation" if {
+	"require_user_confirmation" in object.keys(conditions)
+	not valid_confirmation
+}
+
+valid_confirmation if {
+	c := conditions.require_user_confirmation
+	is_object(c)
+	is_array(c.tools)
+	count(c.tools) > 0
+	valid_strings(c.tools)
+	is_string(c.purpose)
+	regex.match(`\S`, c.purpose)
+	count(c.purpose) <= 128
+	valid_strings(object.get(c, "display_fields", []))
+}
+
 missing contains "approval.conditions.business_hours_only" if {
 	value := object.get(conditions, "business_hours_only", false)
 	not is_boolean(value)
@@ -282,4 +300,18 @@ consent_obligations := [{"type": "require_consent", "purpose": conditions.requir
 	"R4" in applied
 } else := []
 
-obligations := array.concat(call_approval_obligations, consent_obligations)
+# 호출 도구가 승인 조건의 확인 대상 도구 목록에 있으면 본인 확인 의무를 낸다. 판정은 바꾸지 않는다.
+confirmation_obligations := [{
+	"type": "require_user_confirmation",
+	"purpose": c.purpose,
+	"display_fields": object.get(c, "display_fields", []),
+}] if {
+	c := object.get(conditions, "require_user_confirmation", null)
+	valid_confirmation
+	input.tool.name in c.tools
+} else := []
+
+obligations := array.concat(
+	array.concat(call_approval_obligations, consent_obligations),
+	confirmation_obligations,
+)

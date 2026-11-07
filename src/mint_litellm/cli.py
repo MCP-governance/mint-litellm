@@ -296,6 +296,9 @@ def _created(run: Run, object_id: str) -> None:
 
 def _approve(run: Run) -> None:
     a = run.args
+    outside = sorted(set(a.confirm_tool or []) - set(a.tools))
+    if outside:
+        raise ControlError(f"--confirm-tool은 승인 도구 안에 있어야 합니다: {', '.join(outside)}")
     approval_id, _ = approval_service.approve(
         run.context(),
         run.litellm(),
@@ -318,6 +321,9 @@ def _approve(run: Run) -> None:
             allowed_hosts=a.allowed_host,
             allowed_paths=a.allowed_path,
             allowed_arg_keys=a.allowed_arg_key,
+            confirm_tools=a.confirm_tool,
+            confirm_purpose=a.confirm_purpose,
+            confirm_fields=a.confirm_field,
         ),
     )
     _created(run, approval_id)
@@ -763,6 +769,10 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--allowed-host", action="append", help="허용 목적지 호스트(반복 가능)"),
         _a("--allowed-path", action="append", help="허용 폴더의 절대 경로(반복 가능)"),
         _a("--allowed-arg-key", action="append", help="허용 인자 이름(반복 가능)"),
+        _a("--confirm-tool", action="append",
+           help="호출 때 본인 확인을 요구할 도구(반복 가능, 승인 도구 안에 있어야 한다)"),
+        _a("--confirm-purpose", help="본인 확인의 목적(--confirm-tool과 함께)"),
+        _a("--confirm-field", action="append", help="확인 화면에 보일 인자 이름(반복 가능)"),
         _SECOND,
     ],
     "deny": [
