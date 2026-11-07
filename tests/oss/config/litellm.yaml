@@ -1,0 +1,5 @@
+# 공개 MCP 서버 도입 시험용 LiteLLM 설정. MINT 플러그인은 이 스택에 넣지 않는다.
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true

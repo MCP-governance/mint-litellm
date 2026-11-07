@@ -54,11 +54,15 @@ services:
       MINT_READINESS_URL: http://localhost:4000/health/readiness
       MINT_SELFCHECK_GRACE_SECONDS: ${MINT_SELFCHECK_GRACE_SECONDS:-30}
       MINT_LOG_LEVEL: ${MINT_LOG_LEVEL:-}
+      MINT_EXPORT_DIR: /var/lib/mint/export
+      MINT_EXPORT_HMAC_KEY: ${MINT_EXPORT_HMAC_KEY:?MINT_EXPORT_HMAC_KEY를 .env에 설정하십시오}
+      MINT_EXPORT_HMAC_KEY_PREVIOUS: ${MINT_EXPORT_HMAC_KEY_PREVIOUS:-}
     ports:
       - "${MINT_LITELLM_PORT:-4000}:4000"
     volumes:
       - ./config:/app/config:ro
       - buffer:/var/lib/mint/buffer
+      - export:/var/lib/mint/export:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,9 +94,13 @@ services:
       MINT_OPA_URL: http://opa:8181
       MINT_POLICY_ROOT: /opt/mint
       MINT_OPA_BUNDLE_PATH: /bundles/mint.tar.gz
+      MINT_EXPORT_DIR: /var/lib/mint/export
+      MINT_EXPORT_HMAC_KEY: ${MINT_EXPORT_HMAC_KEY:-}
+      MINT_EXPORT_HMAC_KEY_PREVIOUS: ${MINT_EXPORT_HMAC_KEY_PREVIOUS:-}
     volumes:
       - ./config:/app/config
       - bundles:/bundles
+      - export:/var/lib/mint/export
       - ${MINT_SECRETS_DIR}:/run/mint-secrets
     depends_on:
       postgres:
@@ -112,6 +120,7 @@ services:
       MINT_DATABASE_URL: postgresql://mint_worker_app:${MINT_WORKER_DB_PASSWORD:?MINT_WORKER_DB_PASSWORD를 .env에 설정하십시오}@postgres:5432/mint
       MINT_EXPORT_DIR: /var/lib/mint/export
       MINT_EXPORT_HMAC_KEY: ${MINT_EXPORT_HMAC_KEY:?MINT_EXPORT_HMAC_KEY를 .env에 설정하십시오}
+      MINT_EXPORT_HMAC_KEY_PREVIOUS: ${MINT_EXPORT_HMAC_KEY_PREVIOUS:-}
       MINT_WORKER_LEASE_SECONDS: ${MINT_WORKER_LEASE_SECONDS:-60}
     volumes:
       - export:/var/lib/mint/export

@@ -169,6 +169,9 @@ def url_guard(
     inputs: dict = {"url_sha256": sha256_hex(url), "scheme": parts.scheme, "port": port}
     if parts.scheme not in ("http", "https") or not host:
         return _done("url_guard", Outcome("fail", "URL_INVALID", method, inputs))
+    if parts.query or parts.fragment or "?" in url or "#" in url:
+        # 쿼리·조각에는 토큰이 실리기 쉽고 계약 URL 원문에 그대로 남는다
+        return _done("url_guard", Outcome("fail", "URL_QUERY", method, inputs))
     if parts.username is not None or parts.password is not None or "@" in parts.netloc:
         # 주소 앞의 자격(user:pass@)은 로그·계약에 비밀이 남고 호스트 판정을 속인다
         return _done("url_guard", Outcome("fail", "URL_USERINFO", method, inputs))

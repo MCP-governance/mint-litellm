@@ -78,9 +78,27 @@
 
 - 주기가 된 일정(`schedules`)을 한 주기에 한 번 작업으로 등록하고, 임대가 만료된 `running` 작업을 `pending`으로 되돌리고(시도 한 번으로 센다), 대기 작업을 하나씩 임대해 실행한다. 실행 중에는 임대(`MINT_WORKER_LEASE_SECONDS`, 기본 60초)를 1/3마다 연장하고, 연장에 실패하면 그 작업의 외부 호출을 멈춘다.
 - 실패한 작업은 `min(2^시도 횟수 × 5초, 10분)` 뒤에 다시 시도하고, 시도 8번째 실패에서 `failed`가 되며 경보 `job_failed`(같은 종류·대상은 한 건으로 묶고 횟수만 올린다)를 남긴다. 오류 메시지는 저장하지 않고 오류 코드만 남긴다.
-- 이 판본에서 처리기가 있는 작업은 `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시), `submission_poll`(`MINT_SUBMISSION_POLL_SECONDS`마다 LiteLLM 제출을 신청으로 만든다), `intake_run`(수용검증), `evidence_expiry_scan`(1시간마다 증거 만료 7일 전 경보와 재검사 등록)이다. 나머지 종류(동기화·관측·봉인·내보내기·경보 전송 등)는 해당 기능이 들어올 때 붙는다. 등록은 받지만 처리기가 붙기 전에는 `pending`으로 남고 실행기가 가져가지 않는다.
-- 되돌림 판정은 아직 없어 언제나 정상으로 본다. 판정이 들어오면 되돌림 상태에서 외부 쓰기 작업은 실행되지 않고 `restore_blocked`로 대기한다.
+- 이 판본에서 처리기가 있는 작업은 `submission_poll`(`MINT_SUBMISSION_POLL_SECONDS`마다 LiteLLM 제출을 신청으로 만든다), `intake_run`(수용검증), `evidence_expiry_scan`(1시간마다 증거 만료 7일 전 경보와 재검사 등록), `approval_expiry_scan`(1분마다 만료된 호출별 승인·본인 확인을 `expired`로 표시), `seal`(1분마다 미봉인 사건을 해시 연쇄로 봉인), `export_negative_state`(부정 상태 전이가 커밋될 때 등록), `export_checkpoint`(10분마다, 기동 직후 한 번)이다. 나머지 종류는 해당 기능이 들어올 때 붙으며, 그 전에는 등록할 수 없다.
+- 60초마다 내보내기 파일과 DB를 대조해 되돌림을 판정한다. 처음 어긋나면 봉인·내보내기를 보류하고, 두 번 연속 어긋나거나 파일이 없거나 검증되지 않으면 외부 쓰기를 모두 멈춘다(`restore_blocked`로 대기, 시도 횟수 불변). 외부 쓰기 직전마다 같은 판정과 임대 유효성을 다시 확인한다.
 - SIGTERM·SIGINT를 받으면 실행 중인 작업에 취소를 알린다. 작업이 그대로 끝나면 완료로 기록하고, 취소를 받아 멈추면 시도 횟수를 올리지 않고 임대를 놓은 뒤 종료한다.
+
+## 봉인·내보내기·복원 명령
+
+운영자 토큰으로 실행한다. `MINT_EXPORT_DIR`·`MINT_EXPORT_HMAC_KEY`(키 교체 중에는 `MINT_EXPORT_HMAC_KEY_PREVIOUS`)가 필요하다.
+
+| 명령 | 역할 | 설명 |
+| --- | --- | --- |
+| `mint-litellm seal verify [--from N --to M]` | 전부 | 봉인 연쇄를 처음부터 다시 계산하고 마지막 체크포인트 파일의 봉인 끝과 대조한다. 어긋나면 종료 코드 1. |
+| `mint-litellm export status` | 전부 | 최근 내보내기와 최신 파일의 서명 키를 보여 주고 옛 키를 빼도 되는지 알려 준다. |
+| `mint-litellm restore check` | admin | 파일의 부정 상태와 DB를 비교해 누락·봉인 앵커·마지막 성공 전송 이후 활동 서버를 보여 준다. |
+| `mint-litellm restore attest --reason <사유>` | admin | 파일에 담긴 부정 상태 행 전체 스냅숏으로 복구 DB를 되돌리고(없는 행은 같은 식별자로 다시 넣고, 뒤처진 행은 파일 내용으로 되돌린다), DB 세대를 파일 세대 + 1로 올리고, 복원 요청과 `restore_attested`를 커밋한다. 부모 행이 없어 되돌릴 수 없는 항목이 있으면 목록과 함께 거부한다. 반복해도 같은 결과다. 명령은 파일을 쓰지 않는다. |
+| `mint-litellm restore accept-stale --reason <사유> --second-approver <토큰>` | admin 2인 | 파일이 없거나 검증되지 않을 때 복원 요청과 `restore_stale_accepted`를 커밋한다. 명령은 파일을 쓰지 않는다. |
+
+복원 요청은 작업 `restore_publish`를 등록하고, 작업 실행기는 되돌림 차단 상태에서도 이 작업만은 실행한다. 순서는 기존 파일을 `restored/<요청>/`로 옮겨 보관, DB 기준 새 부정 상태·체크포인트·`latest.json` 게시, 다시 읽어 서명·내용 검증, `exports` 행 확정이다. 중간에 중단되면 차단이 유지되고 작업이 이어서 끝낸다.
+
+봉인 해시·HMAC·내용 해시가 쓰는 정규 JSON은 `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`를 UTF-8로 인코딩한 것이며(코드의 `restore.files.canonical_json` 한 곳), 실수 값은 거부한다. 서명 입력은 `hmac` 필드를 뺀 본문 전체(`key_id` 포함), 배열은 저장 순서이며 시각은 UTC ISO 8601 초 단위 `Z`다. 허용 자료형은 문자열·정수·참거짓·null·배열·객체뿐이고 사건 본문에도 실수를 넣을 수 없다. 시험 벡터는 `tests/unit/control/test_export.py`에 있다.
+
+HMAC 키를 교체하려면 새 키를 `MINT_EXPORT_HMAC_KEY`, 옛 키를 `MINT_EXPORT_HMAC_KEY_PREVIOUS`에 두고 다시 기동한다. 작업 실행기가 새 키로 체크포인트를 쓰고 최신 부정 상태 파일을 다시 서명하면 `export status`가 옛 키를 빼도 된다고 알려 준다.
 
 ## 수용검증 신청 `mint-litellm intake`
 

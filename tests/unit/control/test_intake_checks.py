@@ -418,3 +418,19 @@ def test_deep_json_does_not_hit_the_recursion_limit():
     assert c._strings(deep) == ["a"] * 5000
     out = c.definitions(FakeClient(tools=tools_response([{**TOOL, "inputSchema": deep}])), {})
     assert (out.result, out.reason) == ("indeterminate", "LIMIT_EXCEEDED")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://mcp.example.com/mcp?token=abc",
+        "https://mcp.example.com/mcp#frag",
+        "https://mcp.example.com/mcp?",
+        "https://mcp.example.com/mcp#",
+        "https://mcp.example.com?x=1",
+    ],
+)
+def test_url_guard_refuses_a_query_or_fragment(url):
+    out = c.url_guard(url, "http", [PROVIDER])
+    assert (out.result, out.reason) == ("fail", "URL_QUERY")
+    assert "abc" not in json.dumps(out.inputs)

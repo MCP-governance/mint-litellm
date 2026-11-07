@@ -605,14 +605,26 @@ def test_a_refused_litellm_reject_is_not_retried_and_raises_an_alert(world):
     )
 
 
-def test_the_url_query_is_stored_only_in_the_contract(world):
-    secret = "token=s3cr3t"
-    world.conn.execute("UPDATE mint.allowlists SET status = 'lifted' WHERE kind = 'provider'")
-    world.allow("provider", "up.test")
-    world.call(
-        lambda ctx: svc.create(ctx, world.admin_client, "srv-a", url=f"{URL}?{secret}", **INPUTS)
-    )
-    world.drain()
+def test_a_url_with_a_query_or_fragment_is_rejected(world):
+    for suffix in ("?token=s3cr3t", "#frag", "?"):
+        world.stub.servers["srv-a"] = {
+            "server_id": "srv-a",
+            "transport": "http",
+            "auth_type": None,
+            "url": None,
+        }
+        intake_id = world.call(
+            lambda ctx, suffix=suffix: svc.create(
+                ctx, world.admin_client, "srv-a", url=f"{URL}{suffix}", **INPUTS
+            )
+        )
+        world.drain()
+        row = world.intake(intake_id)
+        assert (row["status"], row["decision_reason"]) == (
+            "decided",
+            "check_failed:url_guard:URL_QUERY",
+        ), suffix
+        assert [c["check"] for c in world.checks(intake_id)] == ["url_guard"]
     for table in ("intake_checks", "events", "jobs", "alerts"):
         rows = fetchall(world.conn, f"SELECT t::text AS t FROM mint.{table} t")
         assert not [r for r in rows if "s3cr3t" in r["t"]], table

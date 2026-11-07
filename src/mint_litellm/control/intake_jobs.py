@@ -1,7 +1,8 @@
 """수용검증 작업 처리기: ``submission_poll``, ``intake_run``, ``evidence_expiry_scan``.
 
 LiteLLM 읽기·쓰기는 모두 제어 평면 클라이언트(``JobContext.litellm``)를 통한다. 쓰기(제출
-승인·거절)는 클라이언트의 쓰기 메서드 한 곳을 지나며 그 직전에 ``guard_external_write``가 불린다.
+승인·거절)는 클라이언트의 쓰기 메서드 한 곳을 지나며, 그 직전에 공통 경계
+``JobContext.external_write``가 불린다.
 """
 
 import json
@@ -13,7 +14,7 @@ from mint_litellm.control import intake_checks as checks
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.db.connection import fetchall
 from mint_litellm.control.errors import ControlError
-from mint_litellm.control.jobs import JobContext, guard_external_write
+from mint_litellm.control.jobs import JobContext
 from mint_litellm.control.litellm_admin import LiteLLMError
 from mint_litellm.control.services import intakes
 from mint_litellm.control.services.base import enqueue_job
@@ -30,7 +31,7 @@ class LiteLLMNotConfigured(ControlError):
 def _client(job: JobContext) -> Any:
     if job.litellm is None:
         raise LiteLLMNotConfigured("MINT_LITELLM_URL과 MINT_LITELLM_KEY가 필요합니다.")
-    return job.litellm.with_guard(lambda: guard_external_write(job))
+    return job.litellm.with_guard(job.external_write)
 
 
 def _context(job: JobContext) -> Context:
