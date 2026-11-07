@@ -320,7 +320,8 @@ class Rig:
         url = next((e["url"] for e in self.site["servers"].values()
                     if e["server_id"] == server and e.get("url")), None)
         return self.cli(
-            "intake", "create", server, *(["--url", url] if url else []), "--org", s["org_id"], "--purpose", s["purpose"],
+            "intake", "create", server, *(["--url", url] if url else []), "--org", s["org_id"],
+            "--purpose", s["purpose"],
             "--data-grade", s["data_grade"],
             "--allowed-resources", json.dumps(s["allowed_resources"]),
             "--provider", s["provider"], "--owner", s["owner_user_id"],

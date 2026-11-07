@@ -191,14 +191,17 @@ def db_restore(ctx, restart=True):
 
 @adapter("snapshot")
 def snapshot(ctx):
-    """DB 덤프와 내보내기 파일을 한 쌍으로 보관한다(DB만 되돌리면 파일 세대와 어긋나 되돌림 차단이 걸린다)."""
+    """DB 덤프와 내보내기 파일을 한 쌍으로 보관한다.
+
+    DB만 되돌리면 파일 세대와 어긋나 되돌림 차단이 걸린다.
+    """
     ctx.run_id = "baseline"
     host = os.environ.get("ACC_EXPORT_HOST_DIR")
     if host:
         deadline = time.monotonic() + 180
         while not (export_dir() / "latest.json").is_file():
             if time.monotonic() > deadline:
-                raise SystemExit("기준 내보내기 체크포인트(latest.json)가 없습니다: 작업 실행기 확인")
+                raise SystemExit("기준 내보내기 체크포인트(latest.json)가 없습니다")
             time.sleep(2)
     db_backup(ctx)
     if host:
@@ -214,8 +217,9 @@ def restore_services():
 
 
 def wait_ready(seconds=300):
-    """복제본이 요청을 받을 때까지 기다린다. 주소는 ACC_READY_URLS(쉼표)이며 없으면 ACC_LITELLM_ADMIN_URL."""
-    urls = [u for u in (os.environ.get("ACC_READY_URLS") or env("ACC_LITELLM_ADMIN_URL", "")).split(",") if u]
+    """복제본이 요청을 받을 때까지 기다린다. 주소는 ACC_READY_URLS(쉼표), 없으면 관리 주소."""
+    raw = os.environ.get("ACC_READY_URLS") or env("ACC_LITELLM_ADMIN_URL", "")
+    urls = [u for u in raw.split(",") if u]
     deadline = time.monotonic() + seconds
     for url in urls:
         while True:
@@ -487,8 +491,8 @@ for _name in SCENARIOS:
 def case_setup(case):
     """시험 사례 직전의 깨끗한 상태: 기준 스냅숏 복원, 내보내기 비움, 합성 서버·공개 판본 원복.
 
-    프로세스는 멈춘 채로 복원하고 내보내기를 비운 뒤 한꺼번에 올린다(작업 실행기가 살아 있을 때 파일을
-    지우면 `export_missing` 차단이 걸린다).
+    프로세스는 멈춘 채로 복원하고 내보내기를 되돌린 뒤 한꺼번에 올린다
+    (작업 실행기가 살아 있을 때 파일을 지우면 `export_missing` 차단이 걸린다).
     """
     class Ctx:
         run_id = "baseline"

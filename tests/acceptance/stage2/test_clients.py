@@ -1,4 +1,4 @@
-"""항목 1·2의 실제 Claude Code 단계만 따로 실행한다(ACC_CLIENTS_ONLY=1). 전체 실행에서는 건너뛴다."""
+"""항목 1·2의 실제 Claude Code 단계만 따로 실행한다(ACC_CLIENTS_ONLY=1). 평소엔 건너뛴다."""
 
 import os
 

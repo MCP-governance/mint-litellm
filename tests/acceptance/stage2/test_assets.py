@@ -15,7 +15,7 @@ def test_catalog_matches_source_without_loading_product():
     kinds = {node.value.value for node in enum.body if isinstance(node, ast.Assign)
              and isinstance(node.value, ast.Constant)}
     expected = load_expectations()
-    assert len(kinds) == len(expected["event_catalog"]) == 57
+    assert len(kinds) == len(expected["event_catalog"]) == 59
     assert kinds == set(expected["event_catalog"])
     for counts in expected["flows"].values():
         assert set(counts) <= kinds

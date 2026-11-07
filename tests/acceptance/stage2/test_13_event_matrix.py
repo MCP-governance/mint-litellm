@@ -1,4 +1,4 @@
-"""13. 사건 57종과 핵심 흐름별 원장 건수, 장비 클라이언트 증거 교차 검사."""
+"""13. 사건 59종과 핵심 흐름별 원장 건수, 장비 클라이언트 증거 교차 검사."""
 
 import json
 
@@ -9,7 +9,7 @@ def test_event_matrix(rig):
     from mint_litellm.types.events import EventKind
 
     assert set(rig.expected["event_catalog"]) == {kind.value for kind in EventKind}
-    assert len(rig.expected["event_catalog"]) == 57
+    assert len(rig.expected["event_catalog"]) == 59
     required = set(rig.expected["required_flows"])
     found = set()
     records = []
@@ -38,4 +38,4 @@ def test_event_matrix(rig):
         for server in ("playwright", "context7", "grafana"):
             rig.check_observation("client_flow", record["servers"][server])
         rig.verify_artifact(record["transcript"])
-    rig.note(flow_matrix=sorted(found), prior_results=len(records), catalog_count=57)
+    rig.note(flow_matrix=sorted(found), prior_results=len(records), catalog_count=59)

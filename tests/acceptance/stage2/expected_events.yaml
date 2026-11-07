@@ -84,6 +84,8 @@ event_catalog:
   - deployment_contract_approved
   - deployment_drift_detected
   - deployment_contract_superseded
+  - operator_removed
+  - operator_role_changed
 required_flows: [activation, reapproval, revocation, sync_hold, export, restore_attest]
 capabilities:
   test_01_activation.py:
