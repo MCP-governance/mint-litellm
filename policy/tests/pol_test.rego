@@ -7,7 +7,9 @@ patterns(overrides) := object.union(
 	overrides,
 )
 
-with_patterns(overrides) := object.union(sample, {"arguments": {"keys": [], "sizes": {}, "patterns": patterns(overrides)}})
+managed := object.union(sample, {"server": object.union(sample.server, {"contract_status": "managed"})})
+
+with_patterns(overrides) := object.union(managed, {"arguments": {"keys": [], "sizes": {}, "patterns": patterns(overrides)}})
 
 with_conditions(value, conditions) := object.union(
 	value,
@@ -18,6 +20,20 @@ test_pol_patterns_all_false_allow if {
 	d := evaluate(with_patterns({}))
 	d.decision == "Allow"
 	d.missing_inputs == []
+}
+
+test_pol_not_applied_to_stage1_servers_even_with_patterns if {
+	value := replace(with_patterns({"url_external": true, "private_host": true, "path_traversal": true}), {"server": sample.server})
+	evaluate(value).decision == "Allow"
+	stage1_keys := object.union(sample, {"arguments": {"keys": ["x"], "sizes": {"x": 1}}})
+	evaluate(with_conditions(stage1_keys, {"allowed_arg_keys": ["repo"]})).decision == "Allow"
+	evaluate(with_conditions(with_patterns({"url_external": true}), {})).decision == "Block"
+}
+
+test_pol_not_applied_when_server_is_none_contract if {
+	server := object.union(sample.server, {"contract_status": "none"})
+	value := object.union(with_patterns({"url_external": true}), {"server": server})
+	evaluate(value).decision == "Allow"
 }
 
 test_pol_without_patterns_is_stage1_input if {
@@ -70,7 +86,7 @@ test_pol_block_keeps_call_approval_obligation if {
 
 test_pol_e08_e15_extra_key_blocked if {
 	value := with_conditions(
-		object.union(sample, {"arguments": {"keys": ["repo", "hidden"], "sizes": {"repo": 1, "hidden": 1}}}),
+		object.union(managed, {"arguments": {"keys": ["repo", "hidden"], "sizes": {"repo": 1, "hidden": 1}}}),
 		{"allowed_arg_keys": ["repo"]},
 	)
 	d := evaluate(value)
@@ -81,14 +97,14 @@ test_pol_e08_e15_extra_key_blocked if {
 
 test_pol_e08_e15_subset_allowed if {
 	value := with_conditions(
-		object.union(sample, {"arguments": {"keys": ["repo"], "sizes": {"repo": 1}}}),
+		object.union(managed, {"arguments": {"keys": ["repo"], "sizes": {"repo": 1}}}),
 		{"allowed_arg_keys": ["repo", "title"]},
 	)
 	evaluate(value).decision == "Allow"
 }
 
 test_pol_e08_e15_without_allowed_keys_is_not_applied if {
-	value := object.union(sample, {"arguments": {"keys": ["anything"], "sizes": {"anything": 1}}})
+	value := object.union(managed, {"arguments": {"keys": ["anything"], "sizes": {"anything": 1}}})
 	evaluate(value).decision == "Allow"
 }
 
@@ -100,7 +116,7 @@ test_pol_malformed_patterns_are_missing_inputs if {
 }
 
 test_pol_malformed_allowed_arg_keys_are_missing_inputs if {
-	value := with_conditions(sample, {"allowed_arg_keys": "repo"})
+	value := with_conditions(managed, {"allowed_arg_keys": "repo"})
 	"approval.conditions.allowed_arg_keys" in evaluate(value).missing_inputs
 }
 

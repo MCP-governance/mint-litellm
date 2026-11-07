@@ -169,6 +169,7 @@ class ServerRow:
     transport: str
     auth_type: str
     basis_allowlist_ids: tuple[str, ...]
+    contract_status: str = "none"
 
 
 @dataclass(frozen=True)
@@ -294,6 +295,7 @@ def parse_snapshot(doc: Mapping[str, Any]) -> Snapshot:
             transport=server["transport"],
             auth_type=server["auth_type"],
             basis_allowlist_ids=tuple(server["basis_allowlist_ids"]),
+            contract_status=server.get("contract_status", "none"),
         ),
         allowlists={
             a["id"]: AllowlistRow(

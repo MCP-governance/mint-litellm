@@ -307,6 +307,9 @@ def _approve(run: Run) -> None:
             business_hours_only=a.business_hours_only,
             business_hours=a.business_hours,
             require_consent=a.require_consent,
+            allowed_hosts=a.allowed_host,
+            allowed_paths=a.allowed_path,
+            allowed_arg_keys=a.allowed_arg_key,
         ),
     )
     _created(run, approval_id)
@@ -613,6 +616,9 @@ ARGUMENTS: dict[str, list[Any]] = {
         _a("--business-hours",
            help="업무 시간 재정의: 시간대,요일,시작,끝 (예: Asia/Seoul,1-5,09:00,18:00)"),
         _a("--require-consent", help="이 목적의 동의가 있어야 호출 허용"),
+        _a("--allowed-host", action="append", help="허용 목적지 호스트(반복 가능)"),
+        _a("--allowed-path", action="append", help="허용 폴더의 절대 경로(반복 가능)"),
+        _a("--allowed-arg-key", action="append", help="허용 인자 이름(반복 가능)"),
         _SECOND,
     ],
     "deny": [

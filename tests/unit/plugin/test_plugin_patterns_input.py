@@ -7,6 +7,7 @@ from plugin_helpers import (
     evaluator,
     harness,
     request,
+    server_row,
     snapshot,
 )
 
@@ -17,6 +18,9 @@ from mint_litellm.plugin.policy.opa_client import OPAClient
 D = "."  # 점 표기 주소를 저장소 위생 시험이 막으므로 나눠 쓴다
 
 
+MANAGED = snapshot(server=server_row(contract_status="managed"))
+
+
 def decide(h, **hook):
     return asyncio.run(evaluate_request(request(**hook), h.deps))
 
@@ -24,7 +28,9 @@ def decide(h, **hook):
 def sent_patterns(tmp_path, arguments, *, conditions=None, egress=(), markers=None):
     calls = []
     snap = snapshot(
-        approvals=(approval(conditions=conditions or {}),), egress_targets=tuple(egress)
+        server=server_row(contract_status="managed"),
+        approvals=(approval(conditions=conditions or {}),),
+        egress_targets=tuple(egress),
     )
     h = harness(tmp_path, snap, evaluate=evaluator(calls=calls))
     if markers is not None:
@@ -41,7 +47,7 @@ def sent_patterns(tmp_path, arguments, *, conditions=None, egress=(), markers=No
 
 def test_every_call_carries_the_four_booleans_and_no_argument_text(tmp_path):
     calls = []
-    h = harness(tmp_path, evaluate=evaluator(calls=calls))
+    h = harness(tmp_path, MANAGED, evaluate=evaluator(calls=calls))
     assert decide(h, arguments={"q": f"http://10{D}0{D}0{D}1/secret-text"}).allowed
     assert calls[0]["arguments"]["patterns"] == {
         "url_external": True,
@@ -87,7 +93,7 @@ def test_secret_markers_come_from_the_fetched_bundle_data(tmp_path):
 
 
 def test_missing_markers_stop_the_call_as_a_policy_engine_failure(tmp_path):
-    h = harness(tmp_path)
+    h = harness(tmp_path, MANAGED)
 
     async def none(**_):
         return None
@@ -100,7 +106,10 @@ def test_missing_markers_stop_the_call_as_a_policy_engine_failure(tmp_path):
 
 def test_malformed_pattern_conditions_are_a_schema_error_not_a_crash(tmp_path):
     calls = []
-    snap = snapshot(approvals=(approval(conditions={"allowed_hosts": "a.test"}),))
+    snap = snapshot(
+        server=server_row(contract_status="managed"),
+        approvals=(approval(conditions={"allowed_hosts": "a.test"}),),
+    )
     h = harness(tmp_path, snap, evaluate=evaluator(calls=calls))
     outcome = decide(h)
     assert not outcome.allowed and not calls
@@ -155,3 +164,20 @@ def test_markers_are_read_once_per_version_and_must_match_the_active_bundle():
 def test_marker_errors_are_none():
     assert _markers_client(lambda r: httpx.Response(500)) == (None, None, None)
     assert _markers_client(lambda r: httpx.Response(200, json={"result": {}})) == (None, None, None)
+
+
+def test_stage1_servers_get_no_patterns_and_are_not_blocked_by_url_arguments(tmp_path):
+    calls = []
+    h = harness(tmp_path, evaluate=evaluator(calls=calls))
+    outcome = decide(h, arguments={"u": "http://10" + D + "0.0.1/", "p": "../x"})
+    assert outcome.allowed
+    assert "patterns" not in calls[0]["arguments"]
+    assert "contract_status" not in calls[0]["server"]
+    assert calls[0]["server"].keys() >= {"id", "status"}
+
+
+def test_managed_servers_send_the_contract_status(tmp_path):
+    calls = []
+    h = harness(tmp_path, MANAGED, evaluate=evaluator(calls=calls))
+    assert decide(h).allowed
+    assert calls[0]["server"]["contract_status"] == "managed"

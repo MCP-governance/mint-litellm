@@ -215,13 +215,18 @@ pattern_rules := {
 	"POL-E-14": "private_host",
 }
 
+# 계약 관리 서버(`server.contract_status == "managed"`)에만 판정한다.
+managed if input.server.contract_status == "managed"
+
 applied contains id if {
+	managed
 	some id, name in pattern_rules
 	object.get(input.arguments, ["patterns", name], false) == true
 }
 
 # POL-E-08(전송 범위)·POL-E-15(정의되지 않은 항목): 승인 conditions.allowed_arg_keys 밖의 인자 키.
 applied contains id if {
+	managed
 	some id in {"POL-E-08", "POL-E-15"}
 	keys := conditions.allowed_arg_keys
 	allowed := {key | some key in keys}

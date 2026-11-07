@@ -55,6 +55,9 @@ def build_conditions(
     business_hours_only: bool,
     business_hours: str | None,
     require_consent: str | None,
+    allowed_hosts: list[str] | None = None,
+    allowed_paths: list[str] | None = None,
+    allowed_arg_keys: list[str] | None = None,
 ) -> dict:
     """정책이 읽는 승인 조건. 지정하지 않은 조건은 키를 넣지 않는다."""
     conditions: dict = {}
@@ -70,6 +73,15 @@ def build_conditions(
         if not 1 <= len(require_consent.strip()) <= 128:
             raise ControlError("--require-consent의 목적은 1자 이상 128자 이하여야 합니다.")
         conditions["require_consent"] = require_consent.strip()
+    for name, values in (
+        ("allowed_hosts", allowed_hosts),
+        ("allowed_paths", allowed_paths),
+        ("allowed_arg_keys", allowed_arg_keys),
+    ):
+        if values:
+            if any(not v.strip() for v in values):
+                raise ControlError(f"--{name.replace('_', '-')[:-1]} 값이 비어 있습니다.")
+            conditions[name] = sorted({v.strip() for v in values})
     return conditions
 
 

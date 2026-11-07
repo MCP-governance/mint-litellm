@@ -1548,8 +1548,8 @@ class TestPolicyInput:
         doc = self.build(arguments={"q": "secret value", "n": 3, "nested": {"k": "v"}})
         assert doc["arguments"]["keys"] == ["n", "nested", "q"]
         assert doc["arguments"]["sizes"]["q"] == len("secret value")
-        assert "secret value" not in json.dumps(doc)
-        assert set(doc["arguments"]) == {"keys", "sizes", "patterns"}
+        assert "secret" not in json.dumps(doc)
+        assert set(doc["arguments"]) == {"keys", "sizes"}
 
     def test_approval_summary_and_expiry_days(self):
         doc = self.build(snap=snapshot(approvals=(approval(conditions={"a": 1}),)))

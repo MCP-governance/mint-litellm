@@ -382,6 +382,9 @@ def build_policy_input(
         "provider_allowed": "provider" in allowed_kinds,
         "auth_server_allowed": "auth_server" in allowed_kinds,
     }
+    managed = server is not None and server.contract_status == "managed"
+    if managed:
+        server_doc["contract_status"] = "managed"
 
     if selected is None:
         approval: dict[str, Any] = {"present": False}
@@ -416,8 +419,13 @@ def build_policy_input(
         high_risk_tools=sorted(high_risk_tools),
         mode=mode.value,
         operation=operation.value,
-        argument_patterns=_argument_patterns(
-            snapshot, principal, approval.get("conditions", {}), arguments, secret_markers
+        # 인자 패턴 정책은 계약 관리 서버에만 판정한다. 1단계 서버는 입력도 만들지 않는다.
+        argument_patterns=(
+            _argument_patterns(
+                snapshot, principal, approval.get("conditions", {}), arguments, secret_markers
+            )
+            if managed
+            else None
         ),
     )
 
@@ -810,7 +818,12 @@ async def _run_stages(run: _Run, deps: PipelineDeps) -> None:
     stages.add(Stage.CONTRACT, UNSUPPORTED_STAGE)
     run.current = Stage.POLICY
     markers: Sequence[str] = ()
-    if deps.secret_markers is not None and snapshot.policy_version is not None:
+    if (
+        deps.secret_markers is not None
+        and snapshot.policy_version is not None
+        and snapshot.server is not None
+        and snapshot.server.contract_status == "managed"
+    ):
         try:
             fetched = await deps.secret_markers(
                 policy_version_id=snapshot.policy_version.id,

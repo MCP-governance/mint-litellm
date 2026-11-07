@@ -8,7 +8,10 @@ from mint_litellm.plugin.policy.patterns import NAMES as PATTERN_NAMES
 from mint_litellm.types.identity import Principal
 
 _FIELDS = {
-    "server": ("id", "status", "transport", "auth_type", "provider_allowed", "auth_server_allowed"),
+    "server": (
+        "id", "status", "transport", "auth_type", "provider_allowed", "auth_server_allowed",
+        "contract_status",
+    ),
     "tool": ("name",),
     "arguments": ("keys", "sizes", "patterns"),
     "approval": ("present", "id", "class", "scope_type", "expires_in_days", "conditions"),
