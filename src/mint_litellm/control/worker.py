@@ -1,4 +1,4 @@
-"""작업 실행기 ``mint-litellm worker``(설계 §21.2).
+"""작업 실행기 ``mint-litellm worker``.
 
 작업 실행기는 ``mint_worker_app`` 로그인으로 접속하고, 일정을 작업으로 등록하고, 임대가 만료된
 작업을 회수하고, 대기 작업을 하나씩 임대해 처리기를 부른다. 복제본이 여럿이어도 임대와 일정
@@ -30,9 +30,9 @@ RESTORE_BLOCKED_RETRY_SECONDS = 10
 
 
 def no_restore_detected(conn: psycopg.Connection, instance_id: str) -> bool:
-    """되돌림 판정(§21.6, G5). 지금은 판정 자체가 없어 언제나 「정상」으로 본다.
+    """되돌림 판정(후속 단계). 지금은 판정 자체가 없어 언제나 「정상」으로 본다.
 
-    G5가 이 함수를 대신한다. 되돌림 상태이면 참을 돌려준다.
+    후속 단계가 이 함수를 대신한다. 되돌림 상태이면 참을 돌려준다.
     """
     return False
 
