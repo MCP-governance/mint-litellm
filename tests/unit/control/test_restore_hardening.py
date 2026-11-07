@@ -277,17 +277,20 @@ def test_an_old_archived_request_is_rejected_after_another_restore_finished(
                              Operator("second", "admin", "u2"))
         conn.commit()
     assert run_worker(world).state == judge.OK  # B가 끝난다(A 작업은 재시도 대기)
-    latest = files.latest_path(settings.export_dir, INSTANCE)
-    after_b = latest.read_bytes()
     with psycopg.connect(world["restored"], autocommit=True) as conn:
         conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'"
                      " WHERE status = 'pending'")
+        a_id, b_id = [str(r["id"]) for r in fetchall(
+            conn, "SELECT id FROM mint.restore_requests ORDER BY created_at")]
     run_worker(world)
-    assert latest.read_bytes() == after_b  # 최신 증거를 다시 덮지 않았다
+    restored = settings.export_dir / INSTANCE / "restored"
+    assert (restored / b_id / ".done").exists() and not (restored / a_id / ".done").exists()
     with psycopg.connect(world["restored"], autocommit=True) as conn:
         statuses = [r["status"] for r in fetchall(
             conn, "SELECT status FROM mint.restore_requests ORDER BY created_at")]
         assert statuses == ["rejected", "published"]
+        assert fetchone(conn, "SELECT count(*) AS n FROM mint.alerts"
+                        " WHERE kind = 'restore_request_rejected'")["n"] == 1
 
 
 def test_attest_refuses_a_content_difference_without_a_second_admin_and_accepts_with_two(
