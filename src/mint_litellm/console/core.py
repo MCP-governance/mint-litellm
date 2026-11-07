@@ -167,6 +167,8 @@ def error_response(error: ControlError, request_id: str) -> JSONResponse:
     if isinstance(error, AdminError):
         status = 401 if isinstance(error, Unauthenticated) else STATUS[error.code]
         body = error.body()
+        if ":" not in body["reference"]:  # 사건 키(source_key)가 없으면 요청 식별자이다
+            body["reference"] = request_id
     else:
         status = 400
         body = {"code": INVALID, "message": str(error), "reference": request_id}

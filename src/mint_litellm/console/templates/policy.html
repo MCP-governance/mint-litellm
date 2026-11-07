@@ -19,7 +19,7 @@
 {% if actor.role == 'admin' %}
 <form method="post" action="/policy/mode" class="filters">
   {{ m.csrf(actor) }}<input type="hidden" name="state_version" value="{{ s.settings_version }}">
-  <label>모드<select name="mode"><option value="enforce"{% if s.mode == 'enforce' %} selected{% endif %}>집행</option><option value="observe"{% if s.mode == 'observe' %} selected{% endif %}>관측</option></select></label>
+  <label>모드<select name="mode"><option value="enforce"{% if s.mode == 'enforce' %} selected{% endif %}>집행</option><option value="observe"{% if ceiling == 'enforce' %} disabled{% endif %}{% if s.mode == 'observe' %} selected{% endif %}>관측</option></select></label>
   <button type="submit" class="primary">모드 바꾸기</button>
 </form>
 {% endif %}
