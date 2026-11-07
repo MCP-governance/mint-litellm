@@ -4,7 +4,11 @@
 ``expired``로만 바꾸는 규칙은 이 계층의 문장이 지킨다.
 """
 
+from datetime import timedelta
+
 import psycopg
+
+from mint_litellm.control import alerts
 
 
 def expire_due(conn: psycopg.Connection, instance_id: str) -> dict[str, int]:
@@ -21,3 +25,53 @@ def expire_due(conn: psycopg.Connection, instance_id: str) -> dict[str, int]:
             (instance_id,),
         ).rowcount
     return {"call_approvals": approvals, "self_confirmations": confirmations}
+
+
+# 만료 전 경보를 내는 기간. 호출별 승인과 본인 확인(대기·확정 상태)에만 건다.
+WARN_WITHIN = timedelta(days=7)
+_SOURCES = (
+    ("call_approval", "call_approvals", ("pending", "approved")),
+    ("self_confirmation", "self_confirmations", ("pending", "confirmed")),
+)
+
+
+def warn_expiring(conn: psycopg.Connection, instance_id: str) -> int:
+    """7일 안에 만료될 대기·확정 건마다 경보 ``approval_expiring``을 하나 연다.
+
+    한 번 연 건은 이후 해결돼도 다시 열지 않는다(운영자가 닫은 경보가 매분 되살아나지 않게).
+    대기·확정 상태를 벗어난 건의 경보는 해결됨으로 닫는다. 새로 연 경보 수를 돌려준다.
+    """
+    opened = 0
+    with conn.transaction():
+        for source, table, statuses in _SOURCES:
+            rows = conn.execute(
+                f"SELECT t.id, t.expires_at FROM mint.{table} t"
+                " WHERE t.instance_id = %s AND t.status = ANY(%s)"
+                " AND t.expires_at > now() AND t.expires_at <= now() + %s"
+                " AND NOT EXISTS (SELECT 1 FROM mint.alerts a WHERE a.instance_id = t.instance_id"
+                "  AND a.dedup_key = 'approval_expiring:' || %s || ':' || t.id::text)",
+                (instance_id, list(statuses), WARN_WITHIN, source),
+            ).fetchall()
+            for row_id, expires_at in rows:
+                opened += alerts.raise_alert(
+                    conn,
+                    instance_id,
+                    kind="approval_expiring",
+                    severity="medium",
+                    dedup_key=f"approval_expiring:{source}:{row_id}",
+                    subject={
+                        "source": source,
+                        "id": str(row_id),
+                        "expires_at": expires_at.isoformat(),
+                    },
+                )
+        for source, table, statuses in _SOURCES:
+            conn.execute(
+                "UPDATE mint.alerts a SET status = 'resolved', resolved_at = now()"
+                " WHERE a.instance_id = %s AND a.kind = 'approval_expiring'"
+                " AND a.status <> 'resolved' AND a.subject->>'source' = %s"
+                f" AND NOT EXISTS (SELECT 1 FROM mint.{table} t WHERE t.instance_id = a.instance_id"
+                "  AND t.id::text = a.subject->>'id' AND t.status = ANY(%s))",
+                (instance_id, source, list(statuses)),
+            )
+    return opened
