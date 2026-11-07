@@ -80,7 +80,7 @@ def build_conditions(
             "purpose": purpose,
             "display_fields": fields,
         }
-    elif confirm_purpose or confirm_fields:
+    elif confirm_purpose is not None or confirm_fields is not None:
         raise ControlError("--confirm-purpose·--confirm-field는 --confirm-tool과 함께 써야 합니다.")
     if high_risk_tools:
         conditions["high_risk_tools"] = sorted(set(high_risk_tools))

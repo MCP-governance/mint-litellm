@@ -42,7 +42,9 @@ def test_fields_are_optional_and_absent_flags_add_nothing():
     ["--confirm-tool", "echo"],
     ["--confirm-tool", "echo", "--confirm-purpose", " "],
     ["--confirm-purpose", "p"],
+    ["--confirm-purpose", ""],
     ["--confirm-field", "q"],
+    ["--confirm-field", ""],
 ])
 def test_incomplete_confirmation_flags_are_rejected(flags):
     with pytest.raises(ControlError):

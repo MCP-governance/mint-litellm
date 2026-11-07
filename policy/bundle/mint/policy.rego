@@ -180,11 +180,20 @@ valid_confirmation if {
 	is_object(c)
 	is_array(c.tools)
 	count(c.tools) > 0
-	valid_strings(c.tools)
+	valid_names(c.tools)
 	is_string(c.purpose)
 	regex.match(`\S`, c.purpose)
 	count(c.purpose) <= 128
-	valid_strings(object.get(c, "display_fields", []))
+	valid_names(object.get(c, "display_fields", []))
+}
+
+# 공백이 아닌 문자가 있는 문자열만 이름으로 인정한다(빈 이름이 정상 도구 호출을 비켜 가지 못하게).
+valid_names(values) if {
+	is_array(values)
+	every value in values {
+		is_string(value)
+		regex.match(`\S`, value)
+	}
 }
 
 missing contains "approval.conditions.business_hours_only" if {

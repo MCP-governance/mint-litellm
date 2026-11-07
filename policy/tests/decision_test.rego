@@ -221,7 +221,7 @@ test_confirmation_with_call_approval_orders_obligations if {
 }
 
 test_confirmation_malformed_condition_is_missing_input if {
-	every bad in [{"tools": [], "purpose": "use"}, {"tools": ["read"], "purpose": " "}, {"tools": "read", "purpose": "use"}, {"tools": ["read"], "purpose": "use", "display_fields": [1]}] {
+	every bad in [{"tools": [], "purpose": "use"}, {"tools": ["read"], "purpose": " "}, {"tools": "read", "purpose": "use"}, {"tools": ["read"], "purpose": "use", "display_fields": [1]}, {"tools": [""], "purpose": "use"}, {"tools": ["read", " "], "purpose": "use"}, {"tools": ["read"], "purpose": "use", "display_fields": [""]}, {"tools": ["read"], "purpose": "use", "display_fields": ["  "]}] {
 		c := {"require_user_confirmation": bad}
 		d := evaluate(object.union(sample, {"approval": object.union(sample.approval, {"conditions": c})}))
 		"approval.conditions.require_user_confirmation" in d.missing_inputs
