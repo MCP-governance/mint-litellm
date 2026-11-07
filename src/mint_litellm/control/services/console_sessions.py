@@ -7,6 +7,7 @@ SHA-256(``key_token``),
 
 import hashlib
 import hmac
+import json
 import secrets
 from dataclasses import dataclass
 
@@ -138,12 +139,32 @@ def revoke_user_sessions(
 def active_sessions(conn: psycopg.Connection, instance_id: str) -> list[dict]:
     return fetchall(
         conn,
-        "SELECT id_hash, user_id, key_token, role,"
+        "SELECT id_hash, user_id, key_token, role, subject,"
         " EXTRACT(EPOCH FROM now() - last_verified_at) AS unverified_seconds"
         " FROM mint.console_sessions"
         " WHERE instance_id = %s AND revoked_at IS NULL AND absolute_expiry > now()"
-        " AND idle_expiry > now() AND subject = 'admin'",
+        " AND idle_expiry > now()",
         (instance_id,),
+    )
+
+
+def teams_of(key_info: dict, user_info: dict) -> tuple[str, ...]:
+    """키 정보와 사용자 정보에 적힌 팀 식별자(문자열만)를 정렬해 돌려준다."""
+    found = {key_info.get("team_id")}
+    teams = user_info.get("teams")
+    if isinstance(teams, list):
+        found.update(teams)
+    return tuple(sorted(t for t in found if isinstance(t, str) and t))
+
+
+def set_teams(
+    conn: psycopg.Connection, instance_id: str, id_hash: str, team_ids: tuple[str, ...]
+) -> None:
+    """직원 세션의 소속 팀을 본인 키 정보에서 읽은 값으로 맞춘다(로그인 직후와 재확인 때)."""
+    conn.execute(
+        "UPDATE mint.console_sessions SET team_ids = %s::jsonb WHERE instance_id = %s"
+        " AND id_hash = %s AND subject = 'staff' AND team_ids IS DISTINCT FROM %s::jsonb",
+        (json.dumps(list(team_ids)), instance_id, id_hash, json.dumps(list(team_ids))),
     )
 
 

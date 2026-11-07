@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="htmx-config" content='{"allowEval":false,"includeIndicatorStyles":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true},{"code":"...","swap":false}]}'>
+<title>{% block title %}MINT 직원 화면{% endblock %}</title>
+<link rel="stylesheet" href="/static/console.css">
+<script src="/static/htmx.min.js"></script>
+<script src="/static/console.js"></script>
+</head>
+<body hx-boost="true" hx-headers='{"X-CSRF-Token": "{{ actor.csrf }}"}'>
+<header class="topbar">
+  <span class="brand">MINT 직원 화면</span>
+  <span>
+    <span class="who">{{ actor.user_id }}</span>
+    <form method="post" action="/staff/logout" hx-boost="false"><input type="hidden" name="csrf" value="{{ actor.csrf }}"><button type="submit">로그아웃</button></form>
+  </span>
+</header>
+<nav class="sidebar" aria-label="메뉴">
+{% for href, text in STAFF_MENU %}<a href="{{ href }}" class="{{ 'active' if (path == href or (href != '/staff' and path.startswith(href))) else '' }}">{{ text }}</a>
+{% endfor %}
+</nav>
+<main><div class="page">
+{% if notice %}<div class="banner ok" role="status">{{ notice }}</div>{% endif %}
+{% if error %}<div class="banner error" role="alert">{{ error }}</div>{% endif %}
+{% block body %}{% endblock %}
+</div></main>
+</body>
+</html>

@@ -1,7 +1,5 @@
 """관리자 콘솔 앱: FastAPI + Jinja2(서버 렌더링) + HTMX. 빌드 단계와 외부 자산이 없다."""
 
-import time
-from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -11,7 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from mint_litellm.console import api, login, pages
+from mint_litellm.console import api, login, pages, staff_pages
 from mint_litellm.console.core import (
     COOKIE,
     ConsoleConfig,
@@ -22,6 +20,7 @@ from mint_litellm.console.core import (
     login_redirect,
     require_csrf,
     require_origin,
+    too_many_attempts,
 )
 from mint_litellm.console.templating import render
 from mint_litellm.control.errors import AdminCode, AdminError, ControlError
@@ -39,21 +38,6 @@ HEADERS = {
     "Cross-Origin-Opener-Policy": "same-origin",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 }
-
-
-LOGIN_ATTEMPTS_PER_MINUTE = 10
-
-def too_many_attempts(request: Request) -> bool:
-    """같은 주소의 분당 로그인 시도 수 제한. 프로세스별 메모리 기준이다(복제본마다 따로 센다)."""
-    now = time.monotonic()
-    address = request.client.host if request.client else ""
-    window = request.app.state.attempts.setdefault(address, deque())
-    while window and now - window[0] > 60:
-        window.popleft()
-    if len(window) >= LOGIN_ATTEMPTS_PER_MINUTE:
-        return True
-    window.append(now)
-    return False
 
 
 def create_app(
@@ -122,6 +106,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     app.include_router(api.router, prefix="/api/v1")
     app.include_router(pages.router)
+    app.include_router(staff_pages.router)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict[str, str]:

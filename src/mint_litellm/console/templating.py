@@ -24,6 +24,11 @@ MENU = (
     ("/policy", "정책·관측 설정"),
     ("/admin", "운영자·조직"),
 )
+STAFF_MENU = (
+    ("/staff", "쓸 수 있는 서버·도구"),
+    ("/staff/confirmations", "본인 확인 요청"),
+    ("/staff/consents", "동의 관리·내 기록"),
+)
 ICONS = {"ok": "✓", "wait": "◷", "error": "▲", "block": "⊘", "off": "–"}
 
 
@@ -59,12 +64,20 @@ def join(values: Any) -> str:
     return ", ".join(values) if values else "—"
 
 
+def clip(value: Any, limit: int = 256) -> str:
+    """표시 값은 필드당 256자까지만 화면에 낸다."""
+    text = "—" if value is None or value == "" else str(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def to_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-templates.env.filters.update(span=span, when=when, blank=blank, join=join, to_json=to_json)
-templates.env.globals.update(L=labels, ICONS=ICONS, MENU=MENU)
+templates.env.filters.update(
+    span=span, when=when, blank=blank, join=join, to_json=to_json, clip=clip
+)
+templates.env.globals.update(L=labels, ICONS=ICONS, MENU=MENU, STAFF_MENU=STAFF_MENU)
 
 
 def render(

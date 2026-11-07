@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import httpx
 
 from mint_litellm.control.operators import HUMAN_ROLES
+from mint_litellm.control.services.console_sessions import teams_of
 
 
 class LoginRefused(Exception):
@@ -21,6 +22,8 @@ class LoginRefused(Exception):
 class Identity:
     user_id: str
     key_token: str
+    # 본인 키 정보(키의 team_id)와 본인 사용자 정보(teams)에서 읽은 팀. 화면 입력이 아니다.
+    team_ids: tuple[str, ...] = ()
 
 
 def _get(client: httpx.Client, base: str, path: str, key: str) -> httpx.Response:
@@ -91,4 +94,4 @@ def verify(litellm_url: str, key: str, *, timeout: float = 10.0) -> Identity:
             or user.get("user_role") not in HUMAN_ROLES
         ):
             raise LoginRefused("사람 사용자의 키가 아닙니다.")
-    return Identity(user_id=user_id, key_token=token)
+    return Identity(user_id=user_id, key_token=token, team_ids=teams_of(info, user))

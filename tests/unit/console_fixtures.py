@@ -139,9 +139,9 @@ def stub() -> Iterator[LiteLLMStub]:
     server.close()
 
 
-def login_url(url: str) -> str:
+def login_url(url: str, user: str = "mint_control_app", password: str = "pw-control") -> str:
     params = conninfo_to_dict(url)
-    params.update(user="mint_control_app", password="pw-control")
+    params.update(user=user, password=password)
     return make_conninfo(**params)
 
 
@@ -178,7 +178,10 @@ def world(fresh_db, login_roles, stub, tmp_path):
     url = login_url(fresh_db)
     stage2 = Stage2Settings(export_dir=Path(tmp_path), export_hmac_key=b"k" * 32)
     control = ControlConfig(url, INSTANCE, stub.url, None, None, Mode.ENFORCE, 1)
-    config = ConsoleConfig(control, stage2, stub.url, None, url)
+    config = ConsoleConfig(
+        control, stage2, stub.url, None, url,
+        login_url(fresh_db, "mint_staff_app", "pw-staff"),
+    )
     app = create_app(config)
     client = TestClient(app, base_url="https://testserver", follow_redirects=False)
     yield World(fresh_db, url, config, client, stub, app)

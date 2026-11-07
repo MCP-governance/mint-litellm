@@ -1,7 +1,8 @@
 """작업 ``session_verify``: 활성 콘솔 세션마다 제어 평면 키로 본인 키와 사용자를 다시 확인한다.
 
-키가 활성(삭제된 키의 보관 응답이 아님)이고 차단되지 않았고 만료 전이며 사람 사용자이고 그 사용자의
-운영자 행이 아직 유효하고 역할이 같을 때만 세션을 유지한다. 그렇지 않으면 폐기한다. LiteLLM에 닿지
+키가 활성(삭제된 키의 보관 응답이 아님)이고 차단되지 않았고 만료 전이며 사람 사용자이고 (관리자
+세션이면) 그 사용자의 운영자 행이 아직 유효하고 역할이 같을 때만 세션을 유지한다. 직원 세션은
+운영자 행을 보지 않고 소속 팀을 새 키 정보로 갱신한다. 그렇지 않으면 폐기한다. LiteLLM에 닿지
 못한 경우는 키의 상태를 알 수 없으므로 폐기하지 않고 작업을 실패로 끝내 재시도한다.
 """
 
@@ -42,7 +43,7 @@ def verdict(
         return "key_owner_changed"
     if user is None or user.get("user_role") not in HUMAN_ROLES:
         return "user_not_human"
-    if operator is None or operator["role"] != session["role"]:
+    if session["subject"] == "admin" and (operator is None or operator["role"] != session["role"]):
         return "operator_changed"
     return None
 
@@ -73,6 +74,9 @@ def run(job: jobs.JobContext) -> None:
         operator = console_sessions.active_operator(conn, instance, session["user_id"])
         reason = verdict(session, key, user, operator)
         if reason is None:
+            if session["subject"] == "staff":
+                teams = console_sessions.teams_of(key or {}, user or {})
+                console_sessions.set_teams(conn, instance, session["id_hash"], teams)
             console_sessions.mark_verified(conn, instance, session["id_hash"])
         else:
             console_sessions.revoke(
