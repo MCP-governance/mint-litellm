@@ -80,10 +80,12 @@ class FakeLiteLLM:
         self.keys[token] = key
         return key
 
-    def add_server(self, server_id: str, status: str = "active") -> dict:
-        server = {"server_id": server_id, "server_name": server_id, "approval_status": status,
-                  "url": None, "pinned_tools": None, "allow_all_keys": False,
-                  "credentials": {"secret": "x"}}
+    def add_server(
+        self, server_id: str, status: str = "active", tools: dict | None = None
+    ) -> dict:
+        server = {"tools": tools or {}, "pinned": False, "server_id": server_id,
+                  "server_name": server_id, "approval_status": status, "url": None,
+                  "pinned_tools": None, "allow_all_keys": False, "credentials": {"secret": "x"}}
         self.servers[server_id] = server
         return server
 
@@ -101,8 +103,9 @@ class FakeLiteLLM:
         if method != "GET":
             if self.before_write is not None:
                 self.before_write(method, path, body)
-            if path in self.fail_writes:
-                return self.fail_writes[path], {"error": "forced"}
+            forced = self.fail_writes.get(f"{method} {path}", self.fail_writes.get(path))
+            if forced is not None:
+                return forced, {"error": "forced"}
         if method == "GET" and path == "/key/info":
             key = self.keys.get(params.get("key", ""))
             return (200, {"key": key["key"], "info": copy.deepcopy(key)}) if key else (404, {})
@@ -127,7 +130,13 @@ class FakeLiteLLM:
             if server is None:
                 return 404, {"detail": {"error": "not found"}}
             if method == "GET" and not action:
-                return 200, copy.deepcopy(server)
+                return 200, {k: v for k, v in copy.deepcopy(server).items() if k != "tools"}
+            if method == "POST" and action == "pin":
+                server["pinned"] = True
+                return 200, copy.deepcopy(server["tools"])
+            if method == "DELETE" and action == "pin":
+                server["pinned"] = False
+                return 200, {"server_id": server_id, "status": "unpinned"}
             if method == "PUT" and action == "approve":
                 if server["approval_status"] == "active":
                     return 400, {"detail": {"error": "MCP server is already active."}}

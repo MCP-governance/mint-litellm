@@ -18,6 +18,7 @@ from typing import Any
 import psycopg
 
 from mint_litellm.control.db.connection import fetchall, fetchone
+from mint_litellm.types.canonical import credential_scope, sha256
 from mint_litellm.types.ids import new_uuid7
 
 ACTOR = "mint-worker"
@@ -46,9 +47,59 @@ class Desired:
     approvals: tuple[str, ...] = ()
 
 
-def pin_satisfied(conn: psycopg.Connection, instance_id: str, server_id: str) -> bool:
-    """대기 승인의 서버에 고정(pin) 해시가 맞는지. 고정 단계가 들어올 때까지 언제나 참이다."""
-    return True
+def server_scope(conn: psycopg.Connection, instance_id: str, server_id: str) -> str | None:
+    """계약을 관리하는 서버의 자격 범위 하나(배포 계약의 인증 방식에서). 관리 서버가 아니면 None."""
+    row = fetchone(
+        conn,
+        "SELECT auth_type FROM mint.servers WHERE instance_id = %s AND server_id = %s"
+        " AND contract_status = 'managed'",
+        (instance_id, server_id),
+    )
+    return None if row is None else credential_scope(row["auth_type"])
+
+
+def expected_pin(
+    conn: psycopg.Connection, instance_id: str, server_id: str, *, lock: bool = False
+) -> dict[str, str] | None:
+    """계약을 관리하는 서버의 승인 계약 ``{도구: pin 해시}``(그 서버의 자격 범위 하나만).
+
+    관리 서버가 아니면 None, 승인 계약이 하나도 없으면 빈 맵이다.
+    """
+    scope = server_scope(conn, instance_id, server_id)
+    if scope is None:
+        return None
+    rows = fetchall(
+        conn,
+        "SELECT tool, pin_sha256 FROM mint.tool_contracts WHERE instance_id = %s"
+        " AND server_id = %s AND credential_scope = %s AND status = 'approved' ORDER BY tool"
+        + (" FOR SHARE" if lock else ""),
+        (instance_id, server_id, scope),
+    )
+    return {r["tool"]: r["pin_sha256"] for r in rows}
+
+
+def pin_satisfied(
+    conn: psycopg.Connection, instance_id: str, server_id: str, *, lock: bool = False
+) -> bool:
+    """서버의 고정(pin)이 승인 계약과 맞는가. 계약을 관리하지 않는 서버는 언제나 참이다.
+
+    맞다는 것은 ``observed``이고 ``applied_sha256``이 승인 계약의 해시 맵과 같다는 뜻이다.
+    승인 계약이 하나도 없는 관리 서버는 거짓이다(활성화하지 않는다). ``lock``이면 승인 계약 행을
+    공유 잠금, 고정 행을 갱신 잠금으로 읽는다(활성화 트랜잭션 안에서 다시 확인할 때).
+    """
+    expected = expected_pin(conn, instance_id, server_id, lock=lock)
+    if expected is None:
+        return True
+    if not expected:
+        return False
+    row = fetchone(
+        conn,
+        "SELECT observed, applied_sha256 FROM mint.litellm_grants WHERE instance_id = %s"
+        " AND target_type = 'server' AND target_id = %s AND item = 'pin' AND server_id = %s"
+        + (" FOR UPDATE" if lock else ""),
+        (instance_id, server_id, server_id),
+    )
+    return bool(row and row["observed"] is True and row["applied_sha256"] == sha256(expected))
 
 
 def desired_for_target(
@@ -208,7 +259,8 @@ def mark_observed(conn: psycopg.Connection, grant_id: Any) -> dict:
     """원하는 항목이 이미 LiteLLM에 있음을 확인했다(쓰기 직후 확인이 늦어 남은 행을 바로잡는다)."""
     return fetchone(
         conn,
-        "UPDATE mint.litellm_grants SET observed = true, observed_at = now() WHERE id = %s"
+        "UPDATE mint.litellm_grants SET observed = true, observed_at = now(),"
+        " last_applied_at = now() WHERE id = %s"
         " RETURNING id, state_version",
         (grant_id,),
     )
@@ -226,16 +278,18 @@ def upsert_grant(
     preexisting: bool,
     observed: bool | None,
     applied: bool = False,
+    applied_sha256: str | None = None,
 ) -> dict:
     """행을 만들거나 바꾼다. 관리하지 않던 행(``observed`` NULL)을 되살리면 카운터를 지운다."""
     return fetchone(
         conn,
         "INSERT INTO mint.litellm_grants (id, instance_id, target_type, target_id, item,"
-        " server_id, tools, preexisting, observed, observed_at, last_applied_at)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), CASE WHEN %s THEN now() END)"
+        " server_id, tools, preexisting, observed, observed_at, last_applied_at, applied_sha256)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), CASE WHEN %s THEN now() END, %s)"
         " ON CONFLICT (instance_id, target_type, target_id, item, server_id) DO UPDATE SET"
         " tools = EXCLUDED.tools, preexisting = EXCLUDED.preexisting,"
         " observed = EXCLUDED.observed, observed_at = now(),"
+        " applied_sha256 = EXCLUDED.applied_sha256,"
         " last_applied_at = CASE WHEN %s THEN now() ELSE mint.litellm_grants.last_applied_at END,"
         " missing_count = CASE WHEN mint.litellm_grants.observed IS NULL THEN 0"
         "  ELSE mint.litellm_grants.missing_count END,"
@@ -247,7 +301,7 @@ def upsert_grant(
         "  ELSE mint.litellm_grants.held_at END"
         " RETURNING id, state_version",
         (new_uuid7(), instance_id, target_type, target_id, item, server_id, tools, preexisting,
-         observed, applied, applied),
+         observed, applied, applied_sha256, applied),
     )
 
 

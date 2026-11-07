@@ -206,3 +206,55 @@ def test_a_server_opened_to_all_keys_is_closed_with_the_minimal_body(admin, real
     assert body["allow_all_keys"] is False
     assert body["url"] == "http://upstream.invalid/mcp"  # 다른 필드는 그대로
     assert [a["kind"] for a in alerts(admin)] == ["sync_foreign_change"]
+
+
+def managed_real_server(admin, definitions=None) -> tuple[str, dict]:
+    """실제 LiteLLM에 서버를 만들고 지금 고정 응답을 승인 계약으로 삼는다."""
+    from .test_sync_pin import add_contract
+
+    name = f"pin_{tag()}"
+    status, body = call("POST", "/v1/mcp/server", {
+        "server_name": name, "alias": name, "url": os.environ.get(
+            "MINT_TEST_UPSTREAM_URL", "http://mint-g4-ts:9000/mcp"), "transport": "http"})
+    assert status == 201, body
+    server_id = body["server_id"]
+    status, pinned = call("POST", f"/v1/mcp/server/{server_id}/pin")
+    assert status == 200 and pinned, pinned  # 실측: {도구: {description, input_schema}}
+    call("DELETE", f"/v1/mcp/server/{server_id}/pin")
+    add_server(admin, server_id)
+    admin.execute("UPDATE mint.servers SET contract_status = 'managed'")
+    for tool, value in (definitions or pinned).items():
+        add_contract(admin, tool, value, server=server_id)
+    return server_id, pinned
+
+
+@pytest.mark.skipif(not os.environ.get("MINT_TEST_UPSTREAM_URL")
+                    and not os.environ.get("MINT_TEST_PIN"), reason="업스트림 MCP 서버 필요")
+def test_a_real_pin_matches_the_approved_contracts_and_activates(admin, real_worker):
+    server_id, pinned = managed_real_server(admin)
+    approval = add_approval(admin, "user", f"u_{tag()}", server_id=server_id, status="pending")
+    enqueue(admin, "sync_server", server_id)
+    drain(real_worker)
+    row = grant(admin, "pin", "server", server_id, server_id)
+    from mint_litellm.types.canonical import pin_set_sha256
+
+    assert (row["observed"], row["applied_sha256"]) == (True, pin_set_sha256(pinned))
+    assert admin.execute("SELECT status FROM mint.approvals WHERE id = %s",
+                         (approval,)).fetchone()[0] == "active"
+    assert alerts(admin) == []
+
+
+@pytest.mark.skipif(not os.environ.get("MINT_TEST_UPSTREAM_URL")
+                    and not os.environ.get("MINT_TEST_PIN"), reason="업스트림 MCP 서버 필요")
+def test_a_real_pin_with_a_changed_definition_is_unpinned_and_reported(admin, real_worker):
+    server_id, pinned = managed_real_server(admin)
+    admin.execute("SET session_replication_role = replica")
+    admin.execute("UPDATE mint.tool_contracts SET pin_sha256 = %s WHERE tool = 'echo'", ("0" * 64,))
+    admin.execute("SET session_replication_role = origin")
+    approval = add_approval(admin, "user", f"u_{tag()}", server_id=server_id, status="pending")
+    enqueue(admin, "sync_server", server_id)
+    drain(real_worker)
+    assert [a["subject"]["tools"] for a in alerts(admin)] == [["echo"]]
+    assert call("GET", f"/v1/mcp/server/{server_id}")[1]["pinned_tools"] in (None, {}, [])
+    assert admin.execute("SELECT status FROM mint.approvals WHERE id = %s",
+                         (approval,)).fetchone()[0] == "pending"

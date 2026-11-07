@@ -7,6 +7,7 @@
 """
 
 import functools
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -17,7 +18,7 @@ from mint_litellm.control.alerts import raise_alert
 from mint_litellm.control.alerts import resolve as resolve_alert
 from mint_litellm.control.context import Context, Operator
 from mint_litellm.control.db.connection import fetchall, fetchone
-from mint_litellm.control.errors import ControlError
+from mint_litellm.control.errors import AdminError, ControlError
 from mint_litellm.control.jobs import JobContext, PermanentFailure
 from mint_litellm.control.litellm_write import (
     LiteLLMForbidden,
@@ -32,18 +33,22 @@ from mint_litellm.control.sync_state import (
     Item,
     Plan,
     desired_for_target,
+    expected_pin,
     load_rows,
     make_plan,
     mark_observed,
     permission_of,
     pin_satisfied,
     present,
+    server_scope,
     split_ref,
     target_ref,
     upsert_grant,
     withdraw_grant,
 )
+from mint_litellm.types.canonical import canonical_text, pin_sha256, sha256
 from mint_litellm.types.events import EventKind
+from mint_litellm.types.ids import new_uuid7
 
 # MINT가 소유하지 않는 키·팀 필드. 쓰기 응답에서 읽기 전 값과 다르면 다른 관리자의 동시 수정이다.
 FOREIGN_FIELDS = ("blocked", "models", "max_budget", "user_id", "team_id", "allowed_routes",
@@ -258,9 +263,10 @@ def sync_target(ctx: JobContext) -> None:
 
 @_reachable
 def sync_server(ctx: JobContext) -> None:
-    """LiteLLM 서버가 있는지 확인하고, 제출 서버면 승인한다. 결과를 적고 활성화 완결을 요청한다.
+    """LiteLLM 서버가 있는지 확인하고, 제출 서버면 승인한 뒤 고정(pin)을 맞춘다.
 
-    고정(pin) 단계는 이 자리에 들어온다.
+    재승인 계획이 있으면 그 확정(재pin과 승인본 교체)이 먼저다. 결과를 적고 활성화 완결과
+    대기 승인 대상의 동기화를 요청한다.
     """
     server_id, conn, inst = ctx.job["target_ref"], ctx.conn, ctx.instance_id
     if not fetchone(
@@ -268,16 +274,24 @@ def sync_server(ctx: JobContext) -> None:
         (inst, server_id),
     ):
         return
+    client = None
+    if _unpin_pending(conn, inst, server_id):
+        # 승인이 모두 사라졌어도 풀지 못한 고정은 풀어야 한다
+        client = _client(ctx)
+        _unpin(ctx, client, server_id)
+    if _has_pending_plan(conn, inst, server_id):
+        client = client or _client(ctx)
+        _finalize_plan(ctx, client, server_id)
     wanted = fetchall(
         conn,
-        "SELECT id, status FROM mint.approvals WHERE instance_id = %s AND server_id = %s"
-        " AND ((status = 'active' AND valid_from <= now() AND valid_until > now())"
-        " OR (status = 'pending' AND valid_until > now()))",
+        "SELECT id, status, scope_type, scope_id FROM mint.approvals WHERE instance_id = %s"
+        " AND server_id = %s AND ((status = 'active' AND valid_from <= now()"
+        " AND valid_until > now()) OR (status = 'pending' AND valid_until > now()))",
         (inst, server_id),
     )
     if not wanted:
-        return  # 서버 승인 상태는 명시 중지로만 바뀐다. 고정 해제는 고정 단계의 일이다.
-    client = _client(ctx)
+        return  # 서버 승인 상태는 명시 중지로만 바뀐다. LiteLLM 고정은 그대로 둔다.
+    client = client or _client(ctx)
     ctx.checkpoint()
     key = f"sync_divergence:server:{server_id}"
     server = client.get_server(server_id)
@@ -299,12 +313,223 @@ def sync_server(ctx: JobContext) -> None:
     active = status == "active"
     _record_server(ctx, server_id, observed=active, approved_now=approved_now,
                    first_seen_active=active and not approved_now)
+    pinned = False
     if active:
         resolve_alert(conn, inst, key)
+        pinned = _pin_step(ctx, client, server_id)
     else:
         raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=key,
                     subject={"server_id": server_id, "reason": "not_active", "status": status})
-    _request_finalize(ctx, [str(r["id"]) for r in wanted if r["status"] == "pending"])
+    pending = [r for r in wanted if r["status"] == "pending"]
+    if pinned:
+        # 고정이 맞기 전에는 대기 승인의 키·팀 권한이 나가지 않았다. 이제 그 대상을 맞춘다.
+        for ref in sorted({target_ref(r["scope_type"], r["scope_id"]) for r in pending
+                           if r["scope_type"] in SYNC_SCOPES}):
+            enqueue_job(_actor_context(ctx), "sync_target", ref)
+    _request_finalize(ctx, [str(r["id"]) for r in pending])
+
+
+def _has_pending_plan(conn: psycopg.Connection, instance_id: str, server_id: str) -> bool:
+    return fetchone(
+        conn,
+        "SELECT 1 AS x FROM mint.contract_reapproval_plans WHERE instance_id = %s"
+        " AND server_id = %s AND status = 'pending'",
+        (instance_id, server_id),
+    ) is not None
+
+
+def _finalize_plan(ctx: JobContext, client: LiteLLMSync, server_id: str) -> None:
+    """재승인 확정: 재pin 응답이 후보와 같을 때만 승인본을 바꾼다(작업 실행기 로그인 하나로)."""
+    from mint_litellm.control.contract_pin import finalize_reapproval
+
+    key = f"sync_divergence:reapproval:{server_id}"
+    ctx.checkpoint()
+    try:
+        finalize_reapproval(ctx.conn, ctx.instance_id, server_id, client)
+    except AdminError as error:
+        if "진행 중" in error.message:
+            raise  # 다른 실행기가 같은 서버를 확정하는 중이다. 재시도로 푼다.
+        # 확정할 수 없는 계획은 취소한다. 차단 표지는 그대로 두고 운영자가 재승인을 다시 요청한다.
+        ctx.conn.execute(
+            "UPDATE mint.contract_reapproval_plans SET status = 'cancelled'"
+            " WHERE instance_id = %s AND server_id = %s AND status = 'pending'",
+            (ctx.instance_id, server_id),
+        )
+        raise_alert(ctx.conn, ctx.instance_id, kind="sync_divergence", severity="high",
+                    dedup_key=key,
+                    subject={"server_id": server_id, "reason": "reapproval_conflict",
+                             "message": error.message, "plan": "cancelled"})
+        raise PermanentFailure("reapproval_conflict") from None
+    resolve_alert(ctx.conn, ctx.instance_id, key)
+
+
+def _pin_mismatch(expected: dict[str, str], response: dict) -> list[str]:
+    """고정 응답이 승인 계약과 다른 도구(집합 차이와 해시 차이)."""
+    different = sorted(set(expected) ^ set(response))
+    for tool in sorted(set(expected) & set(response)):
+        try:
+            if pin_sha256(response[tool]) != expected[tool]:
+                different.append(tool)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            different.append(tool)
+    return different
+
+
+def _unpin(ctx: JobContext, client: LiteLLMSync, server_id: str) -> None:
+    """맞지 않는 고정을 푼다. 실패하면 경보를 내고 오류를 올려 작업을 재시도하게 한다."""
+    key = f"sync_divergence:unpin:{server_id}"
+    try:
+        client.unpin(server_id)
+    except LiteLLMHttpError as error:
+        raise_alert(ctx.conn, ctx.instance_id, kind="sync_divergence", severity="high",
+                    dedup_key=key,
+                    subject={"server_id": server_id, "reason": "unpin_failed",
+                             "status": error.status})
+        raise
+    resolve_alert(ctx.conn, ctx.instance_id, key)
+
+
+def _unpin_pending(conn: psycopg.Connection, instance_id: str, server_id: str) -> bool:
+    """이전 실행에서 풀지 못한 고정이 있는가(열린 경보 ``unpin_failed``)."""
+    return fetchone(
+        conn,
+        "SELECT 1 AS x FROM mint.alerts WHERE instance_id = %s AND dedup_key = %s"
+        " AND status <> 'resolved'",
+        (instance_id, f"sync_divergence:unpin:{server_id}"),
+    ) is not None
+
+
+def _drift_kind(approved: dict, observed: Any) -> str:
+    if observed is None:
+        return "removed"
+    if not isinstance(observed, dict):
+        return "input_schema"  # 정의가 아닌 값은 입력 정의가 바뀐 것과 같이 막는다
+    if approved.get("input_schema") != observed.get("input_schema"):
+        return "input_schema"
+    return "description"
+
+
+def _record_pin_mismatch(
+    ctx: JobContext, server_id: str, expected: dict[str, str], response: dict,
+    different: list[str],
+) -> None:
+    """맞지 않은 고정: 서버를 드리프트 표지로 막고, 다른 도구는 후보 계약(``source=pin``)과
+    ``reapproval_requested``로 남긴다(재승인 흐름이 이어받는다). 고정 행은 맞다고 적지 않는다."""
+    conn, inst = ctx.conn, ctx.instance_id
+    scope = server_scope(conn, inst, server_id)
+    with conn.transaction():
+        upsert_grant(conn, inst, "server", server_id, "pin", server_id, tools=None,
+                     preexisting=False, observed=False)
+        conn.execute(
+            "UPDATE mint.servers SET deployment_drift = true, deployment_drift_fields ="
+            " (SELECT array_agg(DISTINCT f ORDER BY f) FROM unnest("
+            "  COALESCE(deployment_drift_fields, '{}') || ARRAY['pin_reapproval']) f)"
+            " WHERE instance_id = %s AND server_id = %s",
+            (inst, server_id),
+        )
+        for tool in different:
+            value = response.get(tool)
+            approved = fetchone(
+                conn,
+                "SELECT id, canonical_text FROM mint.tool_contracts WHERE instance_id = %s"
+                " AND server_id = %s AND credential_scope = %s AND tool = %s"
+                " AND status = 'approved'",
+                (inst, server_id, scope, tool),
+            )
+            if approved is not None:
+                kind = _drift_kind(json.loads(approved["canonical_text"]), value)
+                row = fetchone(
+                    conn,
+                    "UPDATE mint.tool_contracts SET drift = %s WHERE id = %s RETURNING version",
+                    (kind, approved["id"]),
+                )
+                ledger.record(
+                    conn, inst, EventKind.CONTRACT_DRIFT_DETECTED,
+                    entity_id=str(approved["id"]), state_version=row["version"], actor=ACTOR,
+                    payload={"server_id": server_id, "tool": tool, "credential_scope": scope,
+                             "drift": kind, "version": row["version"], "source": "pin"},
+                )
+            if not isinstance(value, dict) or "input_schema" not in value:
+                continue  # 사라진 도구는 후보가 없다
+            definition = {"description": value.get("description"),
+                          "input_schema": value["input_schema"]}
+            digest = sha256(definition)
+            exists = fetchone(
+                conn,
+                "SELECT 1 AS x FROM mint.tool_contracts WHERE instance_id = %s AND server_id = %s"
+                " AND credential_scope = %s AND tool = %s AND sha256 = %s"
+                " AND status = 'candidate'",
+                (inst, server_id, scope, tool, digest),
+            )
+            if exists is not None:
+                continue
+            candidate = new_uuid7()
+            conn.execute(
+                "INSERT INTO mint.tool_contracts (id, instance_id, server_id, credential_scope,"
+                " tool, canonical_text, sha256, pin_sha256, source) VALUES"
+                " (%s, %s, %s, %s, %s, %s, %s, %s, 'pin')",
+                (candidate, inst, server_id, scope, tool, canonical_text(definition), digest,
+                 pin_sha256(definition)),
+            )
+            ledger.record(
+                conn, inst, EventKind.REAPPROVAL_REQUESTED, entity_id=str(candidate),
+                state_version=1, actor=ACTOR,
+                payload={"server_id": server_id, "version": 1, "kind": "tool", "tool": tool,
+                         "candidate_sha256": digest, "source": "pin"},
+            )
+
+
+def _pin_step(ctx: JobContext, client: LiteLLMSync, server_id: str) -> bool:
+    """계약을 관리하는 서버의 도구를 LiteLLM에 고정한다. 새로 맞췄으면 참.
+
+    응답의 도구 집합과 모든 해시가 승인 계약과 같을 때만 ``item=pin`` 행에 해시를 적는다. 다르면
+    고정을 풀고 적지 않고 경보를 낸다. 이미 맞게 고정한 서버(MINT 기록)와 드리프트 중인 서버는
+    다시 고정하지 않는다(업스트림의 현재 값으로 승인본을 덮지 않는다).
+    """
+    conn, inst = ctx.conn, ctx.instance_id
+    expected = expected_pin(conn, inst, server_id)
+    if not expected:  # 관리 서버가 아니거나 승인 계약이 없다(없으면 조건이 거짓이다)
+        return False
+    drift = fetchone(
+        conn,
+        "SELECT (s.deployment_drift OR EXISTS (SELECT 1 FROM mint.tool_contracts t"
+        " WHERE t.instance_id = s.instance_id AND t.server_id = s.server_id"
+        " AND t.status = 'approved' AND t.drift <> 'none')) AS drift"
+        " FROM mint.servers s WHERE s.instance_id = %s AND s.server_id = %s",
+        (inst, server_id),
+    )
+    if drift["drift"]:
+        return False
+    digest = sha256(expected)
+    row = fetchone(
+        conn,
+        "SELECT observed, applied_sha256 FROM mint.litellm_grants WHERE instance_id = %s"
+        " AND target_type = 'server' AND target_id = %s AND item = 'pin' AND server_id = %s",
+        (inst, server_id, server_id),
+    )
+    if row and row["observed"] is True and row["applied_sha256"] == digest:
+        return False
+    key = f"sync_divergence:pin:{server_id}"
+    response = client.pin(server_id)
+    different = _pin_mismatch(expected, response)
+    if not different:
+        with conn.transaction():
+            grant = upsert_grant(conn, inst, "server", server_id, "pin", server_id, tools=None,
+                                 preexisting=False, observed=True, applied=True,
+                                 applied_sha256=digest)
+            _event(conn, inst, EventKind.SYNC_APPLIED, grant,
+                   {"target_type": "server", "target_id": server_id, "item": "pin",
+                    "server_id": server_id, "tools": sorted(expected), "preexisting": False,
+                    "action": "grant", "applied_sha256": digest})
+    if different:
+        _record_pin_mismatch(ctx, server_id, expected, response, different)
+        raise_alert(conn, inst, kind="sync_divergence", severity="high", dedup_key=key,
+                    subject={"server_id": server_id, "reason": "pin_mismatch",
+                             "tools": different})
+        _unpin(ctx, client, server_id)
+        return False
+    resolve_alert(conn, inst, key)
+    return True
 
 
 def _record_server(
@@ -351,7 +576,7 @@ def activation_finalize(ctx: JobContext) -> None:
     """대기 승인을 활성으로 바꾼다. 조건이 안 되면 아무것도 하지 않는다.
 
     조건: 서버의 LiteLLM 승인 상태가 확인되었고, 키·팀 범위면 대상의 서버와 도구가 LiteLLM에
-    있다. 고정 조건은 ``pin_satisfied``가 들어올 자리다.
+    있다. 고정(pin)이 승인 계약과 맞아야 하며, 활성화 트랜잭션 안에서 행을 잠그고 한 번 더 확인한다.
     """
     conn, inst = ctx.conn, ctx.instance_id
     approval = fetchone(
@@ -389,6 +614,9 @@ def activation_finalize(ctx: JobContext) -> None:
     if approval["scope_type"] in SYNC_SCOPES and not _target_ready(client, approval):
         return
     with conn.transaction():
+        # 고정이 바뀌었을 수 있으므로 활성화 트랜잭션 안에서 행을 잠그고 다시 확인한다
+        if not pin_satisfied(conn, inst, server_id, lock=True):
+            return
         activated = fetchone(
             conn,
             "UPDATE mint.approvals SET status = 'active',"
@@ -505,7 +733,12 @@ def _reconcile_target(
             and not _missing(row, desired, servers, tools)
         ):
             with conn.transaction():
-                mark_observed(conn, row["id"])
+                grant = mark_observed(conn, row["id"])
+                _event(conn, inst, EventKind.SYNC_APPLIED, grant,
+                       {"target_type": kind, "target_id": target_id, "item": row["item"],
+                        "server_id": row["server_id"], "tools": row["tools"],
+                        "preexisting": row["preexisting"], "action": "grant",
+                        "late_confirmation": True})
             fixed = True
     after = load_rows(conn, inst, kind, target_id)
     plan = make_plan(servers, tools, desired, after)
@@ -524,6 +757,7 @@ def _close_allow_all_keys(
     failed_key = f"sync_divergence:allow_all_keys:{server_id}"
     if server.get("allow_all_keys") is not True:
         resolve_alert(conn, inst, failed_key)
+        resolve_alert(conn, inst, changed_key)
         return
     reason = None
     try:
