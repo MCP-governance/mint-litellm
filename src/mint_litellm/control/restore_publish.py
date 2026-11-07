@@ -11,6 +11,7 @@
 DB에서 ``pending``으로 되살아나도 다시 게시하지 않는다(최신 증거를 옛 요청이 덮지 못한다).
 """
 
+import hashlib
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,9 +60,18 @@ def _stamp() -> str:
 
 def _done_at(path: Path) -> datetime:
     try:
-        return datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
+        return datetime.fromisoformat(path.read_text(encoding="utf-8").split("\n")[0].strip())
     except (OSError, ValueError):
         return datetime.max.replace(tzinfo=UTC)  # 읽을 수 없는 표지는 가장 나중으로 본다(거부)
+
+
+def _own_latest_hash(dest: Path) -> str | None:
+    """이 요청이 쓰려고 표지에 적어 둔 새 ``latest.json``의 해시(둘째 줄)."""
+    try:
+        lines = (dest / _PUBLISHING).read_text(encoding="utf-8").strip().splitlines()
+    except OSError:
+        return None
+    return lines[1] if len(lines) > 1 else None
 
 
 def _other_restore_marker(settings, instance_id: str, request: dict[str, Any]) -> bool:
@@ -89,7 +99,8 @@ def _bound_ok(settings, instance_id: str, request: dict[str, Any]) -> bool:
         return False
     path = files.latest_path(settings.export_dir, instance_id)
     current = files.file_sha256(path)
-    return current in ("absent", request["bound_latest"])
+    own = _own_latest_hash(_dest(settings, instance_id, str(request["id"])))
+    return current in ("absent", request["bound_latest"]) or (own is not None and current == own)
 
 
 def _reject(job: JobContext, request: dict[str, Any]) -> None:
@@ -253,17 +264,28 @@ def publish(job: JobContext) -> None:
         if not publishing.exists():  # 다른 요청이 이 시점 뒤에 재개하지 못하게 먼저 남긴다
             publishing.write_text(_stamp(), encoding="utf-8")
         job.checkpoint()
-        exports.write_export(
-            conn, iid, settings, "negative_state", actor="worker", write_latest=False,
-            republish=True,
-        )
-        job.checkpoint()
-        checkpoint = exports.write_export(
-            conn, iid, settings, "checkpoint", actor="worker", write_latest=False
-        )
-        job.checkpoint()
-        # latest.json은 맨 마지막이다: 그 전에 죽으면 파일이 없어 차단이 유지된다.
-        exports.write_latest_file(settings, iid, checkpoint, force=True)
+        own = _own_latest_hash(publishing.parent)
+        if own is not None and files.file_sha256(
+            files.latest_path(settings.export_dir, iid)
+        ) == own:
+            pass  # 이 요청이 이미 latest.json까지 게시했다: 검증·확정만 마친다
+        else:
+            exports.write_export(
+                conn, iid, settings, "negative_state", actor="worker", write_latest=False,
+                republish=True,
+            )
+            job.checkpoint()
+            checkpoint = exports.write_export(
+                conn, iid, settings, "checkpoint", actor="worker", write_latest=False
+            )
+            job.checkpoint()
+            # 쓰려는 파일의 해시를 표지에 먼저 적는다(쓴 직후 죽어도 자기 파일임을 안다).
+            stamp = publishing.read_text(encoding="utf-8").splitlines()[0]
+            digest = hashlib.sha256(files.document_bytes(
+                exports.latest_document(settings, iid, checkpoint))).hexdigest()
+            publishing.write_text(f"{stamp}\n{digest}\n", encoding="utf-8")
+            # latest.json은 맨 마지막이다: 그 전에 죽으면 파일이 없어 차단이 유지된다.
+            exports.write_latest_file(settings, iid, checkpoint, force=True)
         state = judge.read_files(settings.export_dir, iid, exports.keys(settings))
         if state.error is not None or state.latest is None:
             raise exports.ExportFailed("게시한 파일을 다시 읽어 검증하지 못했습니다.")

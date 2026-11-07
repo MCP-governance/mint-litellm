@@ -91,11 +91,16 @@ def read_verified(path: Path, keys: Sequence[bytes]) -> dict[str, Any]:
     return document
 
 
+def document_bytes(document: dict[str, Any]) -> bytes:
+    """파일에 실제로 쓰는 바이트(해시를 미리 계산하는 데도 쓴다)."""
+    return json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False).encode() + b"\n"
+
+
 def atomic_write(path: Path, document: dict[str, Any]) -> None:
     """임시 파일에 쓰고 fsync한 뒤 이름을 바꾼다. 읽는 쪽은 옛 파일이나 새 파일만 본다."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    data = json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False).encode() + b"\n"
+    data = document_bytes(document)
     try:
         with open(temp, "wb") as handle:
             handle.write(data)

@@ -439,3 +439,51 @@ def test_a_request_resumes_when_latest_is_absent_or_equal_to_its_binding(world, 
     with psycopg.connect(world["restored"], autocommit=True) as conn:
         conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'")
     assert run_worker(world).state == judge.OK
+
+
+def test_a_request_that_died_right_after_writing_its_own_latest_finishes_on_rerun(
+    world, monkeypatch
+):
+    """자기 latest.json을 쓴 직후 죽음 -> 재실행: 결속값과 달라도 표지의 해시와 같으면 자기 파일로
+    보고 파일을 다시 쓰지 않고 검증·확정만 마친다."""
+    from mint_litellm.control import restore_publish
+
+    file_epoch = revoke_and_export(world)
+    overtake_epoch(world["restored"], file_epoch)
+    attest_restored(world)
+    settings = world["settings"]
+    real_latest = exports.write_latest_file
+
+    def latest_then_dies(*args, **kwargs):
+        real_latest(*args, **kwargs)
+        raise OSError("killed right after latest.json")
+
+    monkeypatch.setattr(exports, "write_latest_file", latest_then_dies)
+    run_worker(world)
+    monkeypatch.setattr(exports, "write_latest_file", real_latest)
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        request = fetchone(conn, "SELECT id, status, bound_latest FROM mint.restore_requests")
+        assert request["status"] == "pending"
+        conn.execute("UPDATE mint.jobs SET run_after = now() - interval '1 second'"
+                     " WHERE kind = 'restore_publish'")
+    dest = settings.export_dir / INSTANCE / "restored" / str(request["id"])
+    latest = files.latest_path(settings.export_dir, INSTANCE)
+    own = (dest / ".publishing").read_text(encoding="utf-8").splitlines()[1]
+    assert files.file_sha256(latest) == own != request["bound_latest"]
+    assert not (dest / ".done").exists()
+
+    class NoWrites:
+        def __getattr__(self, name):
+            return getattr(exports, name)
+
+        @staticmethod
+        def write_export(*args, **kwargs):
+            raise AssertionError("이미 게시한 요청은 파일을 다시 쓰지 않는다")
+
+        write_latest_file = write_export
+
+    monkeypatch.setattr(restore_publish, "exports", NoWrites())
+    run_worker(world)
+    with psycopg.connect(world["restored"], autocommit=True) as conn:
+        assert fetchone(conn, "SELECT status FROM mint.restore_requests")["status"] == "published"
+    assert (dest / ".done").exists()
